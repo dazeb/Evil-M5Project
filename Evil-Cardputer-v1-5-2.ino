@@ -188,6 +188,31 @@ String scanIp = "";
 #include "libssh_esp32.h"
 #include <libssh/libssh.h>
 
+struct TtFrameSeq;
+struct TtTxJob;
+struct TtTagProfile;
+struct TtImagePayload;
+struct TtBitWriter;
+struct TtMenuItem;
+void tagTinkerMenu();
+void csiRadarMenu();
+bool tt_handle_serial(const String& command);
+String tt_get_tags_json();
+void ttAddTag(const String& bc, const String& name);
+void ttDeleteTag(const String& bc);
+void ttRenameTag(const String& bc, const String& name);
+void ttAddPreset(const String& nm, const String& tx);
+void ttDeletePreset(int idx);
+String tt_get_presets_json();
+String tt_get_settings_json();
+void tt_run_online_web(const String& plugin, const String& barcode);
+extern uint8_t tt_data_repeats;
+extern uint16_t tt_wake_repeats_val;
+extern uint8_t tt_comp_mode;
+extern uint8_t tt_page;
+bool tt_nfc_to_barcode(const char* nfc10, char* out17);
+void tt_wifi_icon_on();
+void tt_wifi_icon_off_all();
 
 String ssh_user = "";
 String ssh_host = "";
@@ -317,6 +342,8 @@ static const char * const PROGMEM menuItems[] = {
   "Aircrack", 
   "Autodiscover Abuse",
   "CIW Zeroclick",
+  "TagTinker ESL",
+  "CSI Radar",
   "Settings",
 };
 
@@ -338,6 +365,10 @@ static const int   SEARCH_BAR_H     = 13;    // hauteur fixe cohérente avec 1.5
 
 static std::vector<String> ssidList;
 int numSsid = 0;
+int32_t  ssidRssi[30] = {0};
+uint8_t  ssidChan[30] = {0};
+uint8_t  ssidEnc[30]  = {0};  // wifi_auth_mode_t
+String   ssidMac[30];
 
 bool isOperationInProgress = false;
 int currentListIndex = 0;
@@ -1088,6 +1119,7 @@ inline bool kpAny() {
 // ── Unified update: keyboard + web server in one call ────────────────────────
 // Ensures the Navigator web server processes requests in every blocking loop.
 void handleDnsRequestSerial();  // forward declaration
+void ttWebSendBmp(const String& bc, const String& file, int pg);  // forward declaration
 inline void cardUpdate() {
   M5Cardputer.update();
   handleDnsRequestSerial();
@@ -2000,7 +2032,7 @@ void setup() {
   // Textes à afficher
   const char* text1 = "Evil-Cardputer";
   const char* text2 = "By 7h30th3r0n3";
-  const char* text3 = "v1.5.2 2026";
+  const char* text3 = "v1.5.4 2026";
 
   // Mesure de la largeur du texte et calcul de la position du curseur
   int text1Width = M5.Lcd.textWidth(text1);
@@ -2030,7 +2062,7 @@ void setup() {
   Serial.println(F("-------------------"));
   Serial.println(F("Evil-Cardputer"));
   Serial.println(F("By 7h30th3r0n3"));
-  Serial.println(F("v1.5.2 2026"));
+  Serial.println(F("v1.5.4 2026"));
   Serial.println(F("-------------------"));
   // Diviser randomMessage en deux lignes pour s'adapter à l'écran
   int maxCharsPerLine = screenWidth / 10;  // Estimation de 10 pixels par caractère
@@ -2139,32 +2171,34 @@ void drawImage(const char *filepath) {
 }
 
 
-void firstScanWifiNetworks() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  unsigned long startTime = millis();
-  int n;
-  while (millis() - startTime < 2000) {
-    n = WiFi.scanNetworks();
-    if (n != WIFI_SCAN_RUNNING) break;
-  }
-
-  if (n == 0) {
-    Serial.println(F("No network found ..."));
-  } else {
-    Serial.print(n);
-    Serial.println(F(" Near Wifi Networks : "));
-    Serial.println(F("-------------------"));
+String bssidToString(uint8_t* bssid); // forward declaration
+void storeScanResults(int n) {
     numSsid = min(n, 30);
     for (int i = 0; i < numSsid; i++) {
-      if ((int)ssidList.size() <= i) ssidList.resize(i+1);
-      ssidList[i] = WiFi.SSID(i);
-      Serial.print(i);
-      Serial.print(F(": "));
-      Serial.println(ssidList[i]);
+        if ((int)ssidList.size() <= i) ssidList.resize(i + 1);
+        ssidList[i] = WiFi.SSID(i);
+        ssidRssi[i] = WiFi.RSSI(i);
+        ssidChan[i] = (uint8_t)WiFi.channel(i);
+        ssidEnc[i]  = (uint8_t)WiFi.encryptionType(i);
+        ssidMac[i]  = bssidToString(WiFi.BSSID(i));
     }
-    Serial.println(F("-------------------"));
-  }
+}
+
+void firstScanWifiNetworks() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    unsigned long startTime = millis();
+    int n;
+    while (millis() - startTime < 5000) {
+        n = WiFi.scanNetworks();
+        if (n != WIFI_SCAN_RUNNING) break;
+    }
+    if (n > 0) {
+        storeScanResults(n);
+        Serial.println(String(numSsid) + F(" networks found at boot"));
+    } else {
+        Serial.println(F("[BOOT] WiFi scan returned no results"));
+    }
 }
 
 unsigned long previousMillis = 0;
@@ -2705,7 +2739,9 @@ void executeMenuItem(int index) {
     case 83: evil_wpa2_passphrase_check_menu(); break;
     case 84: autodiscoverAbuse(); break;
     case 85: ciwZeroclickMenu(); break;
-    case 86: showSettingsMenu(); break;
+    case 86: tagTinkerMenu(); break;
+    case 87: csiRadarMenu(); break;
+    case 88: showSettingsMenu(); break;
   }
   isOperationInProgress = false;
 }
@@ -3228,6 +3264,15 @@ void checkSerialCommands() {
       Serial.println(F("ciw_start - Start CIW Zeroclick broadcast"));
       Serial.println(F("ciw_stop - Stop CIW Zeroclick broadcast"));
       Serial.println(F("ciw_status - CIW Zeroclick status"));
+      Serial.println(F("--- TagTinker ESL ---"));
+      Serial.println(F("tag blink              - broadcast LED blink 1s"));
+      Serial.println(F("tag blink_alert        - broadcast slow blink 5s"));
+      Serial.println(F("tag debug              - broadcast debug screen"));
+      Serial.println(F("tag page <N>           - broadcast page flip"));
+      Serial.println(F("tag led <BARCODE> [s]  - LED on targeted tag"));
+      Serial.println(F("tag text <BARCODE> msg - push text to tag"));
+      Serial.println(F("tag rawsend N HH HH.. - send raw IR frame"));
+      Serial.println(F("tag help               - TagTinker commands"));
       Serial.println(F("-------------------"));
     } else if (command == "ciw_start") {
       ciwLoadPayloads(ciwSelectedCats);
@@ -3250,6 +3295,8 @@ void checkSerialCommands() {
       Serial.println("Devices: " + String(ciwDeviceCount));
       Serial.println("Alerts: " + String(ciwAlertCount));
       Serial.println(F("----------------"));
+    } else if (command.startsWith("tag ")) {
+      tt_handle_serial(command);
     } else {
       Serial.println(F("-------------------"));
       Serial.println("Command not recognized: " + command);
@@ -3355,10 +3402,8 @@ void scanWifiNetworks() {
   }
   Serial.println(F("-------------------"));
   Serial.println(F("Near Wifi Network : "));
-  numSsid = min(n, 30);
+  storeScanResults(n);
   for (int i = 0; i < numSsid; i++) {
-    if ((int)ssidList.size() <= i) ssidList.resize(i+1);
-    ssidList[i] = WiFi.SSID(i);
     Serial.print(i);
     Serial.print(F(": "));
     Serial.println(ssidList[i]);
@@ -3892,6 +3937,218 @@ void createCaptivePortal() {
   dnsServer.start(DNS_PORT, "*", ipAP);
   isCaptivePortalOn = true;
   
+  // --- TagTinker Web API ---
+  server.on("/tt", HTTP_GET, []() {
+      File f = SD.open("/evil/esl/webui.html");
+      if (f) { server.streamFile(f, "text/html"); f.close(); }
+      else server.send(404, "text/plain", "Upload webui.html to /evil/esl/");
+  });
+  server.on("/tt/quagga.min.js", HTTP_GET, []() {
+      File f = SD.open("/evil/esl/quagga.min.js");
+      if (f) { server.streamFile(f, "application/javascript"); f.close(); }
+      else server.send(404, "text/plain", "quagga.min.js not found on SD");
+  });
+  server.on("/tt/api/blink", HTTP_GET, []() {
+      tt_handle_serial("tag blink");
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"blink\"}");
+  });
+  server.on("/tt/api/blink_alert", HTTP_GET, []() {
+      tt_handle_serial("tag blink_alert");
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"blink_alert\"}");
+  });
+  server.on("/tt/api/debug", HTTP_GET, []() {
+      tt_handle_serial("tag debug");
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"debug\"}");
+  });
+  server.on("/tt/api/page", HTTP_GET, []() {
+      String pg = server.arg("n");
+      tt_handle_serial("tag page " + pg);
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"page\",\"n\":" + pg + "}");
+  });
+  server.on("/tt/api/led", HTTP_GET, []() {
+      String bc = server.arg("barcode");
+      String dur = server.arg("dur");
+      if (dur.length() == 0) dur = "5";
+      tt_handle_serial("tag led " + bc + " " + dur);
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"led\"}");
+  });
+  server.on("/tt/api/text", HTTP_GET, []() {
+      String bc = server.arg("barcode");
+      String txt = server.arg("text");
+      tt_handle_serial("tag text " + bc + " " + txt);
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"text\"}");
+  });
+  server.on("/tt/api/tags", HTTP_GET, []() {
+      server.send(200, "application/json", tt_get_tags_json());
+  });
+  server.on("/tt/api/rawsend", HTTP_GET, []() {
+      String hex = server.arg("hex");
+      String count = server.arg("count");
+      if (count.length() == 0) count = String(hex.length() / 3 + 1);
+      tt_handle_serial("tag rawsend " + count + " " + hex);
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"rawsend\"}");
+  });
+
+  // Upload BMP to SD then send — avoids keeping image in RAM
+  static File eslUploadFile;
+  server.on("/tt/api/image/upload", HTTP_POST, []() {
+      if (!guardAdmin()) return;
+      server.send(200, "application/json", "{\"ok\":true,\"file\":\"/evil/esl/web_image.bmp\"}");
+  }, []() {
+      if (!guardAdmin()) return;
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+          if (!SD.exists("/evil/esl")) SD.mkdir("/evil/esl");
+          eslUploadFile = SD.open("/evil/esl/web_image.bmp", FILE_WRITE);
+          Serial.printf("[TT] Upload start: %s\n", upload.filename.c_str());
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+          if (eslUploadFile) eslUploadFile.write(upload.buf, upload.currentSize);
+      } else if (upload.status == UPLOAD_FILE_END) {
+          if (eslUploadFile) { eslUploadFile.close(); Serial.printf("[TT] Upload done: %d bytes\n", (int)upload.totalSize); }
+      }
+  });
+
+  // Send BMP from SD to tag — handler registered, actual implementation calls ttWebSendBmp() defined later
+  server.on("/tt/api/image/send", HTTP_GET, []() { if (!guardAdmin()) return;
+      String bc = server.arg("barcode");
+      String file = server.arg("file");
+      int pg = server.arg("page").toInt();
+      if (file.length() == 0) file = "/evil/esl/web_image.bmp";
+      if (pg < 1) pg = 1;
+      if (bc.length() < 17) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad barcode\"}"); return; }
+      if (!SD.exists(file)) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"file not found\"}"); return; }
+      server.send(200, "application/json", "{\"ok\":true,\"sending\":true}");
+      delay(10);
+      ttWebSendBmp(bc, file, pg);
+  });
+
+  // Legacy hex image route — kept for small images, uses SD fallback for large
+  server.on("/tt/api/image", HTTP_POST, []() { if (!guardAdmin()) return;
+      String bc = server.arg("barcode");
+      int imgW = server.arg("w").toInt();
+      int imgH = server.arg("h").toInt();
+      int pg = server.arg("page").toInt();
+      Serial.printf("[TT] web image: w=%d h=%d pg=%d heap=%d\n", imgW, imgH, pg, ESP.getFreeHeap());
+      if (bc.length() < 17 || imgW < 1 || imgH < 1) {
+          server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad\"}"); return;
+      }
+      size_t pc = (size_t)imgW * imgH;
+      String hex = server.arg("plain");
+      if (hex.length() < 4) hex = server.arg("hex");
+      if ((int)hex.length() < 4) {
+          server.send(400, "application/json", "{\"ok\":false,\"err\":\"no data\"}"); return;
+      }
+      // Save hex data as raw 1-bit BMP on SD, then send from SD
+      if (!SD.exists("/evil/esl")) SD.mkdir("/evil/esl");
+      size_t packed_sz = (pc + 7) / 8;
+      uint8_t* pixels = (uint8_t*)calloc(packed_sz + 1, 1);
+      if (!pixels) { server.send(500, "application/json", "{\"ok\":false,\"err\":\"oom\"}"); return; }
+      pixels[0] = 0xFE;
+      size_t hexLen = hex.length();
+      for (size_t i = 0; i + 1 < hexLen; i += 2) {
+          char hc2[3] = {hex[i], hex[i+1], 0};
+          uint8_t bt = (uint8_t)strtol(hc2, NULL, 16);
+          for (int b = 7; b >= 0; b--) {
+              size_t px = (i/2) * 8 + (7 - b);
+              if (px < pc) {
+                  if ((bt >> b) & 1) pixels[1 + px/8] |= (1 << (7 - (px%8)));
+              }
+          }
+      }
+      hex = "";
+      server.send(200, "application/json", "{\"ok\":true,\"bytes\":" + String(hexLen/2) + "}");
+      delay(10);
+      ttWebImage(bc, imgW, imgH, pixels, pc, pg);
+  });
+
+  server.on("/tt/api/led_ctrl", HTTP_GET, []() { if (!guardAdmin()) return;
+      String bc = server.arg("barcode");
+      int dur = server.arg("dur").toInt();
+      String mode = server.arg("mode");
+      bool high = server.arg("power") == "high";
+      bool slow = server.arg("blink") == "slow";
+      uint8_t m = 0;
+      if (mode == "on") m = (slow ? 0x41 : 0x49) | (high ? 0x80 : 0x00);
+      else if (mode == "forever") m = slow ? 0xC1 : 0xC9;
+      else if (mode == "off") { m = 0x49; dur = 1; }
+      if (bc.length() == 0) {
+          String cmd = "tag rawsend 11 85 00 00 00 00 06 ";
+          char hx[4]; snprintf(hx, sizeof(hx), "%02X", m);
+          cmd += hx; cmd += " 00 00 ";
+          snprintf(hx, sizeof(hx), "%02X", (dur>>8)&0xFF); cmd += hx; cmd += " ";
+          snprintf(hx, sizeof(hx), "%02X", dur&0xFF); cmd += hx;
+          tt_handle_serial("tag rawsend 11 " + cmd.substring(15));
+      } else {
+          tt_handle_serial("tag led " + bc + " " + String(dur));
+      }
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"led\"}");
+  });
+  server.on("/tt/api/tag/add", HTTP_GET, []() { if (!guardAdmin()) return;
+      String bc = server.arg("barcode");
+      String name = server.arg("name");
+      if (bc.length() != 17) { server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad barcode\"}"); return; }
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"tag_add\"}");
+      ttAddTag(bc, name);
+  });
+  server.on("/tt/api/presets", HTTP_GET, []() { if (!guardAdmin()) return;
+      server.send(200, "application/json", tt_get_presets_json());
+  });
+  server.on("/tt/api/online", HTTP_GET, []() { if (!guardAdmin()) return;
+      String plugin = server.arg("plugin");
+      String bc = server.arg("barcode");
+      server.send(200, "application/json", "{\"ok\":true,\"plugin\":\"" + plugin + "\"}");
+      tt_run_online_web(plugin, bc);
+  });
+  server.on("/tt/api/settings", HTTP_GET, []() { if (!guardAdmin()) return;
+      if (server.hasArg("data_rep")) tt_data_repeats = constrain(server.arg("data_rep").toInt(), 1, 15);
+      if (server.hasArg("wake_rep")) tt_wake_repeats_val = constrain(server.arg("wake_rep").toInt(), 10, 999);
+      if (server.hasArg("comp")) tt_comp_mode = constrain(server.arg("comp").toInt(), 0, 2);
+      if (server.hasArg("page")) tt_page = constrain(server.arg("page").toInt(), 0, 7);
+      server.send(200, "application/json", tt_get_settings_json());
+  });
+  server.on("/tt/api/tag/delete", HTTP_GET, []() { if (!guardAdmin()) return;
+      String bc = server.arg("barcode");
+      server.send(200, "application/json", "{\"ok\":true}");
+      ttDeleteTag(bc);
+  });
+  server.on("/tt/api/tag/rename", HTTP_GET, []() { if (!guardAdmin()) return;
+      String bc = server.arg("barcode");
+      String nm = server.arg("name");
+      server.send(200, "application/json", "{\"ok\":true}");
+      ttRenameTag(bc, nm);
+  });
+  server.on("/tt/api/preset/add", HTTP_GET, []() { if (!guardAdmin()) return;
+      String nm = server.arg("name");
+      String tx = server.arg("text");
+      server.send(200, "application/json", "{\"ok\":true}");
+      ttAddPreset(nm, tx);
+  });
+  server.on("/tt/api/preset/delete", HTTP_GET, []() { if (!guardAdmin()) return;
+      int idx = server.arg("idx").toInt();
+      server.send(200, "application/json", "{\"ok\":true}");
+      ttDeletePreset(idx);
+  });
+
+  server.on("/tt/api/wifi_icon_on", HTTP_GET, []() { if (!guardAdmin()) return;
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"wifi_on\"}");
+      tt_wifi_icon_on();
+  });
+  server.on("/tt/api/wifi_icon_off", HTTP_GET, []() { if (!guardAdmin()) return;
+      server.send(200, "application/json", "{\"ok\":true,\"cmd\":\"wifi_off\"}");
+      tt_wifi_icon_off_all();
+  });
+  server.on("/tt/api/nfc_decode", HTTP_GET, []() {
+      String nfc = server.arg("code");
+      char barcode[18] = {0};
+      if (nfc.length() >= 10 && tt_nfc_to_barcode(nfc.c_str(), barcode)) {
+          uint8_t plid[4]; tt_barcode_to_plid(barcode, plid);
+          char ps[18]; snprintf(ps, sizeof(ps), "%02X:%02X:%02X:%02X", plid[0],plid[1],plid[2],plid[3]);
+          server.send(200, "application/json", "{\"ok\":true,\"barcode\":\"" + String(barcode) + "\",\"plid\":\"" + ps + "\"}");
+      } else {
+          server.send(400, "application/json", "{\"ok\":false,\"err\":\"invalid\"}");
+      }
+  });
+
   server.on("/siphon", handleCookieSiphoning);
   server.on("/logcookie", handleLogRequest);
   server.on("/wpad.dat", HTTP_GET, []() {
@@ -3941,7 +4198,7 @@ void createCaptivePortal() {
   // Unified admin dashboard (Basic Auth protected)
 server.on("/evil-menu", HTTP_GET, []() {
   if (!guardAdmin()) return;
-  static const char ADMIN_HTML[] PROGMEM = R"HTML(<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Admin</title><style>:root{--bg0:#0b1020;--bg1:#0f1a33;--card:rgba(255,255,255,.10);--card2:rgba(255,255,255,.14);--txt:#e9eefc;--mut:rgba(233,238,252,.72);--st:rgba(255,255,255,.14);--acc:#4c7dff;--r:16px;--sh:0 18px 60px rgba(0,0,0,.42)}@media(prefers-color-scheme:light){:root{--bg0:#f4f7ff;--bg1:#eef2ff;--card:rgba(255,255,255,.92);--card2:rgba(255,255,255,.98);--txt:#0e1730;--mut:rgba(14,23,48,.66);--st:rgba(14,23,48,.12);--sh:0 18px 60px rgba(14,23,48,.14)}}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:radial-gradient(1200px 600px at 15% 10%,rgba(76,125,255,.35),transparent 60%),radial-gradient(900px 500px at 85% 20%,rgba(40,215,198,.22),transparent 55%),linear-gradient(160deg,var(--bg0),var(--bg1))}.m{width:100%;max-width:520px;background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--st);border-radius:var(--r);box-shadow:var(--sh);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);overflow:hidden}.h{padding:18px 18px 12px;border-bottom:1px solid var(--st)}.t{margin:0;font-size:18px;letter-spacing:.2px}.s{margin:5px 0 0;font-size:13px;color:var(--mut)}.g{padding:12px;display:grid;gap:10px}a.i{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 12px;border-radius:14px;text-decoration:none;color:var(--txt);background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);transition:transform .10s ease,background .15s ease,border-color .15s ease,box-shadow .15s ease;outline:none}a.i:after{content:"›";font-size:20px;opacity:.7;line-height:1}a.i:hover{transform:translateY(-1px);background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.18);box-shadow:0 10px 22px rgba(0,0,0,.22)}a.i:active{transform:translateY(0) scale(.995)}a.i:focus-visible{box-shadow:0 0 0 3px rgba(76,125,255,.35),0 10px 22px rgba(0,0,0,.22);border-color:rgba(76,125,255,.55)}.k{display:flex;flex-direction:column;min-width:0}.l{font-weight:650;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.p{font-size:12px;color:var(--mut);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.f{padding:10px 12px 14px;border-top:1px solid var(--st);color:var(--mut);font-size:12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}@media(max-width:420px){body{padding:16px}.g{padding:10px}.p{display:none}}</style><body><div class=m><div class=h><h2 class=t>Evil Admin Console</h2><p class=s>Quick actions and monitoring</p></div><div class=g><a class=i href=/credentials><span class=k><span class=l>Credentials</span><span class=p>View and manage stored credentials</span></span></a><a class=i href=/uploadhtmlfile><span class=k><span class=l>Upload to SD</span><span class=p>Upload files to the SD card</span></span></a><a class=i href=/check-sd-file><span class=k><span class=l>Browse SD</span><span class=p>List, open, and verify SD contents</span></span></a><a class=i href=/setup-portal><span class=k><span class=l>Setup Portal</span><span class=p>Configure portal settings</span></span></a><a class=i href=/list-badusb-scripts><span class=k><span class=l>Run Script</span><span class=p>List and execute an existing script</span></span></a><a class=i href=/scan-network><span class=k><span class=l>Scan Network</span><span class=p>Fast discovery and inventory</span></span></a><a class=i href=/monitor-status><span class=k><span class=l>Monitor Status</span><span class=p>Resources, uptime, and events</span></span></a><a class=i href=/navigator><span class=k><span class=l>Navigator</span><span class=p>Live screen view and remote control</span></span></a><a class=i href=/ciw><span class=k><span class=l>CIW Zeroclick</span><span class=p>SSID injection testing framework</span></span></a></div><div class=f><span>WebUI v2</span><span>Responsive • Dark mode • Accessible</span></div></div></html>)HTML";
+  static const char ADMIN_HTML[] PROGMEM = R"HTML(<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Admin</title><style>:root{--bg0:#0b1020;--bg1:#0f1a33;--card:rgba(255,255,255,.10);--card2:rgba(255,255,255,.14);--txt:#e9eefc;--mut:rgba(233,238,252,.72);--st:rgba(255,255,255,.14);--acc:#4c7dff;--r:16px;--sh:0 18px 60px rgba(0,0,0,.42)}@media(prefers-color-scheme:light){:root{--bg0:#f4f7ff;--bg1:#eef2ff;--card:rgba(255,255,255,.92);--card2:rgba(255,255,255,.98);--txt:#0e1730;--mut:rgba(14,23,48,.66);--st:rgba(14,23,48,.12);--sh:0 18px 60px rgba(14,23,48,.14)}}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:radial-gradient(1200px 600px at 15% 10%,rgba(76,125,255,.35),transparent 60%),radial-gradient(900px 500px at 85% 20%,rgba(40,215,198,.22),transparent 55%),linear-gradient(160deg,var(--bg0),var(--bg1))}.m{width:100%;max-width:520px;background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--st);border-radius:var(--r);box-shadow:var(--sh);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);overflow:hidden}.h{padding:18px 18px 12px;border-bottom:1px solid var(--st)}.t{margin:0;font-size:18px;letter-spacing:.2px}.s{margin:5px 0 0;font-size:13px;color:var(--mut)}.g{padding:12px;display:grid;gap:10px}a.i{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 12px;border-radius:14px;text-decoration:none;color:var(--txt);background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);transition:transform .10s ease,background .15s ease,border-color .15s ease,box-shadow .15s ease;outline:none}a.i:after{content:"›";font-size:20px;opacity:.7;line-height:1}a.i:hover{transform:translateY(-1px);background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.18);box-shadow:0 10px 22px rgba(0,0,0,.22)}a.i:active{transform:translateY(0) scale(.995)}a.i:focus-visible{box-shadow:0 0 0 3px rgba(76,125,255,.35),0 10px 22px rgba(0,0,0,.22);border-color:rgba(76,125,255,.55)}.k{display:flex;flex-direction:column;min-width:0}.l{font-weight:650;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.p{font-size:12px;color:var(--mut);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.f{padding:10px 12px 14px;border-top:1px solid var(--st);color:var(--mut);font-size:12px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}@media(max-width:420px){body{padding:16px}.g{padding:10px}.p{display:none}}</style><body><div class=m><div class=h><h2 class=t>Evil Admin Console</h2><p class=s>Quick actions and monitoring</p></div><div class=g><a class=i href=/credentials><span class=k><span class=l>Credentials</span><span class=p>View and manage stored credentials</span></span></a><a class=i href=/uploadhtmlfile><span class=k><span class=l>Upload to SD</span><span class=p>Upload files to the SD card</span></span></a><a class=i href=/check-sd-file><span class=k><span class=l>Browse SD</span><span class=p>List, open, and verify SD contents</span></span></a><a class=i href=/setup-portal><span class=k><span class=l>Setup Portal</span><span class=p>Configure portal settings</span></span></a><a class=i href=/list-badusb-scripts><span class=k><span class=l>Run Script</span><span class=p>List and execute an existing script</span></span></a><a class=i href=/scan-network><span class=k><span class=l>Scan Network</span><span class=p>Fast discovery and inventory</span></span></a><a class=i href=/monitor-status><span class=k><span class=l>Monitor Status</span><span class=p>Resources, uptime, and events</span></span></a><a class=i href=/navigator><span class=k><span class=l>Navigator</span><span class=p>Live screen view and remote control</span></span></a><a class=i href=/ciw><span class=k><span class=l>CIW Zeroclick</span><span class=p>SSID injection testing framework</span></span></a><a class=i href=/tt><span class=k><span class=l>TagTinker ESL</span><span class=p>IR shelf label control and image prep</span></span></a></div><div class=f><span>WebUI v2</span><span>Responsive • Dark mode • Accessible</span></div></div></html>)HTML";
   server.send_P(200, "text/html", ADMIN_HTML);
 });
 
@@ -9615,9 +9872,9 @@ Wardriving
 
 String createPreHeader() {
   String preHeader = "WigleWifi-1.4";
-  preHeader += ",appRelease=v1.5.2"; // Remplacez [version] par la version de votre application
+  preHeader += ",appRelease=v1.5.4"; // Remplacez [version] par la version de votre application
   preHeader += ",model=Cardputer";
-  preHeader += ",release=v1.5.2"; // Remplacez [release] par la version de l'OS de l'appareil
+  preHeader += ",release=v1.5.4"; // Remplacez [release] par la version de l'OS de l'appareil
   preHeader += ",device=Evil-Cardputer"; // Remplacez [device name] par un nom de périphérique, si souhaité
   preHeader += ",display=7h30th3r0n3"; // Ajoutez les caractéristiques d'affichage, si pertinent
   preHeader += ",board=M5Cardputer";
@@ -14790,7 +15047,7 @@ unsigned long lastLog = 0;
 int currentScreen   = 1;  // 1=GeneralInfo, 2=ReceivedData
 
 const String wigleHeaderFileFormat =
-  "WigleWifi-1.4,appRelease=v1.5.2,model=Cardputer,release=v1.5.2,"
+  "WigleWifi-1.4,appRelease=v1.5.4,model=Cardputer,release=v1.5.4,"
   "device=Evil-Cardputer,display=7h30th3r0n3,board=M5Cardputer,brand=M5Stack";
 
 char* log_col_names[LOG_COLUMN_COUNT] = {
@@ -24908,7 +25165,7 @@ void scanCCTVCamerasFromFile() {
 
 
 #include <M5GFX.h>
-#include <LittleFS.h>
+#include <SPIFFS.h>
 #include <stdarg.h>
 
 // chemin du fichier liste
@@ -24935,8 +25192,8 @@ static const size_t   IO_CHUNK = 3840;
 static const char* SD_TMP_DIR      = "/evil/tmp";
 static const char* SD_FILE_A       = "/evil/tmp/mjpeg_a.jpg";
 static const char* SD_FILE_B       = "/evil/tmp/mjpeg_b.jpg";
-static const char* LittleFS_FILE_A   = "/a.jpg";
-static const char* LittleFS_FILE_B   = "/b.jpg";
+static const char* SPIFFS_FILE_A   = "/a.jpg";
+static const char* SPIFFS_FILE_B   = "/b.jpg";
 
 // écran Cardputer
 static const int SCREEN_W = 240;
@@ -25748,11 +26005,11 @@ void runCCTV_MJPEGViewer() {
   enterDebounce();
   M5.Display.setTextSize(1);
 
-  bool LittleFS_ok = false;
+  bool spiffs_ok = false;
   bool sd_ok = true;
-  if (!sd_ok) LittleFS_ok = LittleFS.begin(true);
-  if (!sd_ok && !LittleFS_ok) {
-    uiText(2, 2, "No SD/LittleFS. Aborting.", TFT_RED);
+  if (!sd_ok) spiffs_ok = SPIFFS.begin(true);
+  if (!sd_ok && !spiffs_ok) {
+    uiText(2, 2, "No SD/SPIFFS. Aborting.", TFT_RED);
     while (1) delay(1000);
   }
   if (sd_ok && !SD.exists(SD_TMP_DIR)) SD.mkdir(SD_TMP_DIR);
@@ -25762,9 +26019,9 @@ void runCCTV_MJPEGViewer() {
     loadFallbackStreams();
   }
 
-  fs::FS* pfs = sd_ok ? (fs::FS*)&SD : (fs::FS*)&LittleFS;
-  const char* fileA = sd_ok ? SD_FILE_A : LittleFS_FILE_A;
-  const char* fileB = sd_ok ? SD_FILE_B : LittleFS_FILE_B;
+  fs::FS* pfs = sd_ok ? (fs::FS*)&SD : (fs::FS*)&SPIFFS;
+  const char* fileA = sd_ok ? SD_FILE_A : SPIFFS_FILE_A;
+  const char* fileB = sd_ok ? SD_FILE_B : SPIFFS_FILE_B;
 
   // Boucle globale : on reste ici tant que l'utilisateur ne remonte pas au menu parent
   while (!kp('`')) {
@@ -38219,3 +38476,5816 @@ void handleCiwAlertsApi() {
   json += "]";
   server.send(200, "application/json", json);
 }
+
+// =====================================================================
+// ========================= CSI RADAR =================================
+// =====================================================================
+// WiFi CSI presence/motion detection using the REAL algorithm:
+//   Spatial turbulence + Hampel filter + moving variance.
+// Based on Espressif esp-csi and ESPectre research.
+// Single antenna = no direction, but reliable motion/presence detection.
+// =====================================================================
+
+// ── ESPectre-style CSI algorithm ──
+// Pipeline: CV-normalized turbulence → Hampel → Butterworth lowpass → Moving variance
+// Calibration: P95 threshold from 200-frame empty-room baseline
+#define CSI_NUM_SUB         64
+#define CSI_MAX_BEACONS      8
+#define CSI_SELECTED_COUNT  12
+#define CSI_TURB_HISTORY   200
+#define CSI_HAMPEL_WIN       7
+#define CSI_HAMPEL_THRESH    5.0f
+#define CSI_MAD_SCALE        1.4826f
+#define CSI_CAL_FRAMES     200
+#define CSI_MV_WIN          50
+#define CSI_LP_CUTOFF       11.0f
+#define CSI_LP_SRATE       100.0f
+
+// ESPectre default subcarriers (12 stable, non-adjacent, excluding guard+DC)
+static const int CSI_SELECTED_SC[CSI_SELECTED_COUNT] = {12,14,16,18,20,24,28,36,40,44,48,52};
+
+static volatile float    csi_amplitudes[CSI_NUM_SUB];
+static volatile bool     csi_data_ready = false;
+static volatile uint32_t csi_frame_count = 0;
+static volatile uint8_t  csi_last_mac[6];
+static volatile bool     csi_filter_beacons = false;
+
+static uint8_t  csi_known_macs[CSI_MAX_BEACONS][6];
+static volatile int csi_known_count = 0;
+
+static float csi_turb_history[CSI_TURB_HISTORY];
+static int   csi_turb_idx = 0, csi_turb_count = 0;
+static float csi_sensitivity = 1.0f;
+static float csi_threshold = 0.0f;
+static bool  csi_calibrated = false;
+static int   csi_cal_count = 0;
+static float csi_cal_values[CSI_CAL_FRAMES];
+
+// Hampel circular buffer
+static float csi_hampel_buf[CSI_HAMPEL_WIN];
+static int   csi_hampel_idx = 0, csi_hampel_count = 0;
+
+// Butterworth lowpass state
+static float csi_lp_b0 = 0, csi_lp_a1 = 0;
+static float csi_lp_x_prev = 0, csi_lp_y_prev = 0;
+
+// Moving variance buffer
+static float csi_mv_buf[CSI_MV_WIN];
+static int   csi_mv_idx = 0, csi_mv_count = 0;
+
+// ── Breathing detection (bandpass 0.1–0.5Hz + autocorrelation) ──
+#define CSI_BREATH_BUF 512
+static float csi_breath_filtered[CSI_BREATH_BUF];
+static int   csi_breath_idx = 0, csi_breath_count = 0;
+static float csi_bpm = 0;
+static unsigned long csi_breath_last_update = 0;
+
+// Biquad filter states: [x1, x2, y1, y2]
+static float csi_hp_state[4] = {0,0,0,0};
+static float csi_lp_breath_state[4] = {0,0,0,0};
+static float csi_hp_b[3], csi_hp_a[3];
+static float csi_lp_br_b[3], csi_lp_br_a[3];
+
+static M5Canvas* csi_sprite = nullptr;
+
+// ── Helpers ──
+
+bool csi_is_known_beacon(const uint8_t* a) {
+    for (int i = 0; i < csi_known_count; i++)
+        if (memcmp(csi_known_macs[i], a, 6) == 0) return true;
+    return false;
+}
+
+void csi_espnow_recv(const uint8_t* sender, const uint8_t* data, int len) {
+    if (len < 2 || data[0] != 0xC5 || data[1] != 0x1B) return;
+    if (csi_is_known_beacon(sender)) return;
+    if (csi_known_count < CSI_MAX_BEACONS) {
+        memcpy(csi_known_macs[csi_known_count], sender, 6);
+        csi_known_count++;
+    }
+}
+
+// ── CSI Callback (IRAM) ──
+
+static void IRAM_ATTR csi_rx_callback(void* ctx, wifi_csi_info_t* info) {
+    if (!info || !info->buf || info->len < 2) return;
+    const uint8_t* src_addr = (const uint8_t*)&(info->mac);
+    if (csi_filter_beacons && csi_known_count > 0) {
+        bool match = false;
+        for (int k = 0; k < csi_known_count; k++) {
+            if (src_addr[0] == csi_known_macs[k][0] && src_addr[1] == csi_known_macs[k][1] &&
+                src_addr[2] == csi_known_macs[k][2] && src_addr[3] == csi_known_macs[k][3] &&
+                src_addr[4] == csi_known_macs[k][4] && src_addr[5] == csi_known_macs[k][5]) {
+                match = true; break;
+            }
+        }
+        if (!match) return;
+    }
+    int pairs = info->len / 2;
+    if (pairs > CSI_NUM_SUB) pairs = CSI_NUM_SUB;
+    const int8_t* buf = (const int8_t*)info->buf;
+    for (int i = 0; i < pairs; i++) {
+        float q = (float)buf[i * 2];
+        float ii = (float)buf[i * 2 + 1];
+        csi_amplitudes[i] = sqrtf(q * q + ii * ii);
+    }
+    memcpy((void*)csi_last_mac, src_addr, 6);
+    csi_frame_count++;
+    csi_data_ready = true;
+}
+
+// ── 1. Spatial Turbulence with CV normalization (gain-invariant) ──
+
+float csi_compute_turbulence(const volatile float* amps) {
+    float sum = 0, sq_sum = 0;
+    int n = 0;
+    for (int i = 0; i < CSI_SELECTED_COUNT; i++) {
+        int sc = CSI_SELECTED_SC[i];
+        if (sc < CSI_NUM_SUB) {
+            float v = amps[sc];
+            sum += v;
+            sq_sum += v * v;
+            n++;
+        }
+    }
+    if (n < 2) return 0;
+    float mean = sum / n;
+    float var = (sq_sum / n) - (mean * mean);
+    float std_val = (var > 0) ? sqrtf(var) : 0;
+    return (mean > 0.1f) ? (std_val / mean) : std_val;
+}
+
+// ── 2. Hampel Filter (MAD-based outlier removal) ──
+
+float csi_hampel_filter(float value) {
+    csi_hampel_buf[csi_hampel_idx] = value;
+    csi_hampel_idx = (csi_hampel_idx + 1) % CSI_HAMPEL_WIN;
+    if (csi_hampel_count < CSI_HAMPEL_WIN) csi_hampel_count++;
+
+    float sorted[CSI_HAMPEL_WIN];
+    memcpy(sorted, csi_hampel_buf, csi_hampel_count * sizeof(float));
+    for (int i = 1; i < csi_hampel_count; i++) {
+        float key = sorted[i]; int j = i - 1;
+        while (j >= 0 && sorted[j] > key) { sorted[j + 1] = sorted[j]; j--; }
+        sorted[j + 1] = key;
+    }
+    float median = sorted[csi_hampel_count / 2];
+
+    float diffs[CSI_HAMPEL_WIN];
+    for (int i = 0; i < csi_hampel_count; i++)
+        diffs[i] = fabsf(csi_hampel_buf[i] - median);
+    for (int i = 1; i < csi_hampel_count; i++) {
+        float key = diffs[i]; int j = i - 1;
+        while (j >= 0 && diffs[j] > key) { diffs[j + 1] = diffs[j]; j--; }
+        diffs[j + 1] = key;
+    }
+    float mad = diffs[csi_hampel_count / 2] * CSI_MAD_SCALE;
+
+    if (mad > 0 && fabsf(value - median) > CSI_HAMPEL_THRESH * mad)
+        return median;
+    return value;
+}
+
+// ── 3. Butterworth 1st-order Lowpass IIR ──
+
+void csi_lowpass_init() {
+    float wc = tanf(PI * CSI_LP_CUTOFF / CSI_LP_SRATE);
+    float k = 1.0f + wc;
+    csi_lp_b0 = wc / k;
+    csi_lp_a1 = (wc - 1.0f) / k;
+    csi_lp_x_prev = 0;
+    csi_lp_y_prev = 0;
+}
+
+float csi_lowpass_apply(float x) {
+    float y = csi_lp_b0 * x + csi_lp_b0 * csi_lp_x_prev - csi_lp_a1 * csi_lp_y_prev;
+    csi_lp_x_prev = x;
+    csi_lp_y_prev = y;
+    return y;
+}
+
+// ── 4. Moving Variance ──
+
+float csi_moving_variance(float value) {
+    csi_mv_buf[csi_mv_idx] = value;
+    csi_mv_idx = (csi_mv_idx + 1) % CSI_MV_WIN;
+    if (csi_mv_count < CSI_MV_WIN) csi_mv_count++;
+    float sum = 0, sq = 0;
+    for (int i = 0; i < csi_mv_count; i++) {
+        sum += csi_mv_buf[i];
+        sq += csi_mv_buf[i] * csi_mv_buf[i];
+    }
+    float mean = sum / csi_mv_count;
+    return (sq / csi_mv_count) - (mean * mean);
+}
+
+// ── 5. Percentile (for P95 threshold) ──
+
+float csi_percentile(float* arr, int n, float pct) {
+    float* s = (float*)malloc(n * sizeof(float));
+    if (!s) return arr[0];
+    memcpy(s, arr, n * sizeof(float));
+    for (int i = 1; i < n; i++) {
+        float key = s[i]; int j = i - 1;
+        while (j >= 0 && s[j] > key) { s[j + 1] = s[j]; j--; }
+        s[j + 1] = key;
+    }
+    int idx = (int)(pct / 100.0f * (n - 1));
+    if (idx >= n) idx = n - 1;
+    float val = s[idx];
+    free(s);
+    return val;
+}
+
+// ── Breathing detection functions ──
+
+float csi_biquad_apply(float s[4], const float b[3], const float a[3], float x) {
+    float y = b[0]*x + b[1]*s[0] + b[2]*s[1] - a[1]*s[2] - a[2]*s[3];
+    s[1] = s[0]; s[0] = x;   // x2=x1, x1=x
+    s[3] = s[2]; s[2] = y;   // y2=y1, y1=y
+    return y;
+}
+
+void csi_breath_init() {
+    memset(csi_breath_filtered, 0, sizeof(csi_breath_filtered));
+    csi_breath_idx = 0; csi_breath_count = 0;
+    csi_bpm = 0; csi_breath_last_update = 0;
+    memset(csi_hp_state, 0, sizeof(csi_hp_state));
+    memset(csi_lp_breath_state, 0, sizeof(csi_lp_breath_state));
+    // Highpass 0.1Hz @ 100Hz (2nd order Butterworth)
+    float wc = tanf(PI * 0.1f / 100.0f);
+    float k = 1.0f + 1.41421f * wc + wc * wc;
+    csi_hp_b[0] = 1.0f/k; csi_hp_b[1] = -2.0f/k; csi_hp_b[2] = 1.0f/k;
+    csi_hp_a[1] = 2.0f*(wc*wc - 1.0f)/k; csi_hp_a[2] = (1.0f - 1.41421f*wc + wc*wc)/k;
+    // Lowpass 0.5Hz @ 100Hz (2nd order Butterworth)
+    wc = tanf(PI * 0.5f / 100.0f);
+    k = 1.0f + 1.41421f * wc + wc * wc;
+    csi_lp_br_b[0] = wc*wc/k; csi_lp_br_b[1] = 2.0f*wc*wc/k; csi_lp_br_b[2] = wc*wc/k;
+    csi_lp_br_a[1] = 2.0f*(wc*wc - 1.0f)/k; csi_lp_br_a[2] = (1.0f - 1.41421f*wc + wc*wc)/k;
+}
+
+float csi_breathing_detect(float* buf, int len) {
+    float max_corr = -1e9f;
+    int best_lag = 0;
+    int max_lag = (len / 2 < 500) ? len / 2 : 500;
+    for (int lag = 20; lag < max_lag; lag++) {
+        float sum = 0;
+        for (int i = 0; i < len - lag; i++)
+            sum += buf[i] * buf[i + lag];
+        float corr = sum / (float)(len - lag);
+        if (corr > max_corr) { max_corr = corr; best_lag = lag; }
+    }
+    if (best_lag < 20) return 0;
+    float period_s = (float)best_lag / CSI_LP_SRATE;
+    float bpm = 60.0f / period_s;
+    if (bpm < 6.0f || bpm > 30.0f) return 0;
+    return bpm;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Oscilloscope display + ESPectre pipeline
+// ═══════════════════════════════════════════════════════════════
+
+void csiRadarLoop(const char* mode_label, bool multi_beacon) {
+    const int W = 240, H = 135;
+    const int TOP_H = 12;
+    const int BOT_H = 18;
+    const int SCOPE_X = 2, SCOPE_Y = TOP_H + 1;
+    const int SCOPE_W = 215, SCOPE_H = H - TOP_H - BOT_H - 2;
+    const int METER_X = 222, METER_W = 16;
+
+    // Reset ALL state
+    memset((void*)csi_amplitudes, 0, sizeof(csi_amplitudes));
+    memset(csi_turb_history, 0, sizeof(csi_turb_history));
+    memset(csi_hampel_buf, 0, sizeof(csi_hampel_buf));
+    memset(csi_mv_buf, 0, sizeof(csi_mv_buf));
+    memset(csi_cal_values, 0, sizeof(csi_cal_values));
+    csi_data_ready = false;
+    csi_frame_count = 0;
+    csi_turb_idx = 0;
+    csi_turb_count = 0;
+    csi_hampel_idx = 0;
+    csi_hampel_count = 0;
+    csi_mv_idx = 0;
+    csi_mv_count = 0;
+    csi_sensitivity = 1.0f;
+    csi_threshold = 0.0f;
+    csi_calibrated = false;
+    csi_cal_count = 0;
+    csi_lowpass_init();
+    csi_breath_init();
+
+    // Sprite for flicker-free rendering
+    if (csi_sprite) { csi_sprite->deleteSprite(); delete csi_sprite; csi_sprite = nullptr; }
+    csi_sprite = new (std::nothrow) M5Canvas(&M5.Display);
+    bool use_sprite = false;
+    if (csi_sprite) {
+        csi_sprite->setColorDepth(8);
+        use_sprite = csi_sprite->createSprite(W, H);
+        if (!use_sprite) { delete csi_sprite; csi_sprite = nullptr; }
+    }
+
+    IPAddress gateway = WiFi.gatewayIP();
+    unsigned long last_draw = 0;
+    unsigned long last_ping = 0;
+    unsigned long last_key_time = 0;
+    const unsigned long draw_interval = 50;
+    const unsigned long ping_interval = 80;
+    bool has_signal = false;
+    float current_turb = 0.0f;
+    float current_var = 0.0f;
+    const char* status_text = "CALIBRATING";
+    float turb_max_display = 1.0f;
+
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.display();
+
+    while (true) {
+        M5.update();
+        cardUpdate();
+        unsigned long now = millis();
+
+        if (kp(KEY_BACKSPACE)) break;
+        if (now - last_key_time > 200) {
+            if (kp('+') || kp('=')) { csi_sensitivity += 0.2f; if (csi_sensitivity > 5.0f) csi_sensitivity = 5.0f; last_key_time = now; }
+            if (kp('-') || kp('_')) { csi_sensitivity -= 0.2f; if (csi_sensitivity < 0.2f) csi_sensitivity = 0.2f; last_key_time = now; }
+            if (kp('r') || kp('R')) {
+                csi_calibrated = false; csi_cal_count = 0;
+                csi_hampel_idx = 0; csi_hampel_count = 0;
+                csi_mv_idx = 0; csi_mv_count = 0;
+                csi_lowpass_init();
+                csi_threshold = 0; status_text = "CALIBRATING"; last_key_time = now;
+            }
+        }
+
+        // Active ping (single-beacon STA mode)
+        if (!multi_beacon && now - last_ping >= ping_interval && WiFi.status() == WL_CONNECTED) {
+            last_ping = now;
+            WiFiUDP pudp;
+            pudp.beginPacket(gateway, 55555);
+            pudp.write((uint8_t)0x42);
+            pudp.endPacket();
+            pudp.stop();
+        }
+
+        // ── ESPectre pipeline ──
+        if (csi_data_ready) {
+            csi_data_ready = false;
+            has_signal = true;
+
+            // 1. CV-normalized spatial turbulence
+            float raw_turb = csi_compute_turbulence(csi_amplitudes);
+
+            // 2. Hampel outlier removal
+            float filtered = csi_hampel_filter(raw_turb);
+
+            // 3. Butterworth lowpass smoothing
+            float smoothed = csi_lowpass_apply(filtered);
+            current_turb = smoothed;
+
+            // Store smoothed value for oscilloscope display
+            csi_turb_history[csi_turb_idx] = smoothed;
+            csi_turb_idx = (csi_turb_idx + 1) % CSI_TURB_HISTORY;
+            if (csi_turb_count < CSI_TURB_HISTORY) csi_turb_count++;
+
+            // 4. Moving variance
+            current_var = csi_moving_variance(smoothed);
+
+            // 5. Calibration (P95 threshold from 200 empty-room frames)
+            if (!csi_calibrated) {
+                if (csi_cal_count < CSI_CAL_FRAMES) {
+                    csi_cal_values[csi_cal_count++] = current_var;
+                }
+                if (csi_cal_count >= CSI_CAL_FRAMES) {
+                    csi_threshold = csi_percentile(csi_cal_values, csi_cal_count, 95.0f) * 1.1f;
+                    if (csi_threshold < 1e-6f) csi_threshold = 1e-6f;
+                    csi_calibrated = true;
+                }
+                status_text = "CALIBRATING";
+            } else {
+                float thr = csi_threshold * csi_sensitivity;
+                if (current_var > thr * 3.0f) status_text = "PRESENCE";
+                else if (current_var > thr) status_text = "MOTION";
+                else status_text = "IDLE";
+            }
+
+            // Auto-scale display
+            if (current_turb > turb_max_display * 0.8f)
+                turb_max_display = current_turb * 1.3f;
+            if (turb_max_display < 0.1f) turb_max_display = 0.1f;
+            turb_max_display = turb_max_display * 0.998f + 0.5f * 0.002f;
+
+            // 6. Breathing detection: bandpass 0.1–0.5Hz + autocorrelation
+            float bp = csi_biquad_apply(csi_hp_state, csi_hp_b, csi_hp_a, smoothed);
+            bp = csi_biquad_apply(csi_lp_breath_state, csi_lp_br_b, csi_lp_br_a, bp);
+            csi_breath_filtered[csi_breath_idx] = bp;
+            csi_breath_idx = (csi_breath_idx + 1) % CSI_BREATH_BUF;
+            if (csi_breath_count < CSI_BREATH_BUF) csi_breath_count++;
+
+            if (csi_breath_count > CSI_BREATH_BUF * 4 / 5 && now - csi_breath_last_update > 2000) {
+                if (strcmp(status_text, "IDLE") == 0) {
+                    float lin[CSI_BREATH_BUF];
+                    for (int i = 0; i < csi_breath_count; i++) {
+                        int ri = (csi_breath_idx - csi_breath_count + i + CSI_BREATH_BUF) % CSI_BREATH_BUF;
+                        lin[i] = csi_breath_filtered[ri];
+                    }
+                    csi_bpm = csi_breathing_detect(lin, csi_breath_count);
+                } else {
+                    csi_bpm = 0;
+                }
+                csi_breath_last_update = now;
+            }
+        }
+
+        if (now - last_draw < draw_interval) { delay(1); continue; }
+        last_draw = now;
+
+        // ── Draw ──
+        auto& sp = use_sprite ? (LovyanGFX&)*csi_sprite : (LovyanGFX&)M5.Display;
+        if (use_sprite) csi_sprite->fillSprite(TFT_BLACK);
+        else sp.fillScreen(TFT_BLACK);
+
+        // Top bar
+        sp.setTextSize(1);
+        sp.setTextFont(1);
+        sp.setTextColor(TFT_GREEN, TFT_BLACK);
+        sp.setCursor(2, 2);
+        sp.printf("CSI [%s] CV", mode_label);
+        sp.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+        sp.setCursor(W - 50, 2);
+        sp.printf("F:%lu", csi_frame_count);
+
+        // Mini breathing waveform (top right, cyan)
+        if (csi_bpm > 0 && csi_breath_count > 60) {
+            int bw_x = 100, bw_y = 1, bw_h = 10;
+            float bmax = 0.001f;
+            for (int i = 0; i < 60; i++) {
+                int ri = (csi_breath_idx - 60 + i + CSI_BREATH_BUF) % CSI_BREATH_BUF;
+                float av = fabsf(csi_breath_filtered[ri]);
+                if (av > bmax) bmax = av;
+            }
+            for (int i = 1; i < 60; i++) {
+                int ri0 = (csi_breath_idx - 60 + i - 1 + CSI_BREATH_BUF) % CSI_BREATH_BUF;
+                int ri1 = (csi_breath_idx - 60 + i + CSI_BREATH_BUF) % CSI_BREATH_BUF;
+                int y0 = bw_y + bw_h/2 - (int)(csi_breath_filtered[ri0] / bmax * bw_h / 2);
+                int y1 = bw_y + bw_h/2 - (int)(csi_breath_filtered[ri1] / bmax * bw_h / 2);
+                sp.drawLine(bw_x + i - 1, y0, bw_x + i, y1, TFT_CYAN);
+            }
+        }
+
+        // ── Oscilloscope ──
+        uint16_t grid_col = sp.color565(0, 25, 0);
+        sp.drawRect(SCOPE_X, SCOPE_Y, SCOPE_W, SCOPE_H, grid_col);
+        for (int g = 1; g < 4; g++) {
+            int gy = SCOPE_Y + (SCOPE_H * g) / 4;
+            for (int gx = SCOPE_X + 2; gx < SCOPE_X + SCOPE_W - 2; gx += 4)
+                sp.drawPixel(gx, gy, grid_col);
+        }
+        for (int g = 1; g < 4; g++) {
+            int gx2 = SCOPE_X + (SCOPE_W * g) / 4;
+            for (int gy2 = SCOPE_Y + 2; gy2 < SCOPE_Y + SCOPE_H - 2; gy2 += 4)
+                sp.drawPixel(gx2, gy2, grid_col);
+        }
+
+        // Threshold line (mapped from MV space to turbulence display)
+        if (csi_calibrated) {
+            float thr = csi_threshold * csi_sensitivity;
+            float thr_turb = (thr > 0) ? sqrtf(thr) : 0;
+            int thr_y = SCOPE_Y + SCOPE_H - 1 - (int)((thr_turb / turb_max_display) * (SCOPE_H - 2));
+            if (thr_y > SCOPE_Y && thr_y < SCOPE_Y + SCOPE_H - 1) {
+                for (int tx = SCOPE_X + 1; tx < SCOPE_X + SCOPE_W - 1; tx += 3)
+                    sp.drawPixel(tx, thr_y, TFT_RED);
+            }
+        }
+
+        // Waveform (smoothed turbulence after lowpass)
+        int num_pts = (csi_turb_count < SCOPE_W - 2) ? csi_turb_count : SCOPE_W - 2;
+        int prev_y = -1;
+        for (int px = 0; px < num_pts; px++) {
+            int hi = (csi_turb_idx - num_pts + px + CSI_TURB_HISTORY) % CSI_TURB_HISTORY;
+            float val = csi_turb_history[hi];
+            float norm = val / turb_max_display;
+            if (norm > 1.0f) norm = 1.0f;
+            int y = SCOPE_Y + SCOPE_H - 1 - (int)(norm * (SCOPE_H - 2));
+            int x = SCOPE_X + 1 + px;
+
+            bool above = false;
+            if (csi_calibrated) {
+                float thr_turb = sqrtf(csi_threshold * csi_sensitivity);
+                above = (val > thr_turb);
+            }
+            uint16_t lc = above ? TFT_YELLOW : sp.color565(0, 200, 0);
+            if (above && csi_calibrated && val > sqrtf(csi_threshold * csi_sensitivity * 3.0f))
+                lc = TFT_RED;
+
+            if (prev_y >= 0)
+                sp.drawLine(x - 1, prev_y, x, y, lc);
+            prev_y = y;
+        }
+
+        // ── Vertical meter ──
+        sp.drawRect(METER_X, SCOPE_Y, METER_W, SCOPE_H, grid_col);
+        if (has_signal) {
+            float norm = current_turb / turb_max_display;
+            if (norm > 1.0f) norm = 1.0f;
+            int bar_h = (int)(norm * (SCOPE_H - 2));
+            for (int by = 0; by < bar_h; by++) {
+                float frac = (float)by / (SCOPE_H - 2);
+                uint8_t rr = (uint8_t)(frac * 255);
+                uint8_t gg = (uint8_t)((1.0f - frac) * 255);
+                uint16_t bc = sp.color565(rr, gg, 0);
+                sp.drawFastHLine(METER_X + 1, SCOPE_Y + SCOPE_H - 1 - by, METER_W - 2, bc);
+            }
+        }
+
+        // ── Bottom bar ──
+        uint16_t bar_bg = sp.color565(0, 12, 0);
+        sp.fillRect(0, H - BOT_H, W, BOT_H, bar_bg);
+        sp.setCursor(3, H - BOT_H + 2);
+        if (!has_signal) {
+            sp.setTextColor(TFT_YELLOW, bar_bg);
+            sp.print("WAITING");
+        } else {
+            uint16_t sc = TFT_GREEN;
+            if (strcmp(status_text, "MOTION") == 0) sc = TFT_YELLOW;
+            else if (strcmp(status_text, "PRESENCE") == 0) sc = TFT_RED;
+            else if (strcmp(status_text, "CALIBRATING") == 0) sc = TFT_CYAN;
+            sp.setTextColor(sc, bar_bg);
+            sp.print(status_text);
+        }
+        sp.setTextColor(TFT_GREEN, bar_bg);
+        sp.setCursor(80, H - BOT_H + 2);
+        sp.printf("T:%.2f", current_turb);
+        sp.setTextColor(TFT_DARKGREEN, bar_bg);
+        sp.setCursor(130, H - BOT_H + 2);
+        sp.printf("S:%.1f", csi_sensitivity);
+        if (csi_bpm > 0) {
+            sp.setTextColor(TFT_CYAN, bar_bg);
+            sp.setCursor(175, H - BOT_H + 2);
+            sp.printf("BPM:%.0f", csi_bpm);
+        }
+        sp.setCursor(3, H - BOT_H + 10);
+        sp.setTextColor(sp.color565(0, 60, 0), bar_bg);
+        sp.print("+/-=sens R=cal BACK=exit");
+
+        if (use_sprite) csi_sprite->pushSprite(0, 0);
+        else { M5.Display.endWrite(); M5.Display.display(); }
+    }
+
+    // Cleanup
+    if (csi_sprite) { csi_sprite->deleteSprite(); delete csi_sprite; csi_sprite = nullptr; }
+    esp_wifi_set_csi(false);
+    esp_wifi_set_csi_rx_cb(NULL, NULL);
+    if (multi_beacon) esp_now_deinit();
+    esp_wifi_set_promiscuous(false);
+    WiFi.disconnect();
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+}
+
+void csiRadarMenu() {
+    enterDebounce();
+    const int W = 240, H = 135;
+
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextFont(1);
+    M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+    M5.Display.setCursor(55, 4);
+    M5.Display.print("CSI RADAR - Select Mode");
+    M5.Display.drawLine(0, 16, W, 16, M5.Display.color565(0, 40, 0));
+
+    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+    M5.Display.setCursor(8, 28);
+    M5.Display.print("1. Single Beacon");
+    M5.Display.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+    M5.Display.setCursor(16, 40);
+    M5.Display.print("1 ESP32 as CSI-Beacon AP");
+
+    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+    M5.Display.setCursor(8, 60);
+    M5.Display.print("2. Multi Beacons");
+    M5.Display.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+    M5.Display.setCursor(16, 72);
+    M5.Display.print("2+ ESP32 beacons, better");
+
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.setCursor(8, 100);
+    M5.Display.print("Press 1 or 2  |  BACK=exit");
+    M5.Display.display();
+
+    int mode = 0;
+    while (mode == 0) {
+        M5.update(); cardUpdate();
+        if (kp(KEY_BACKSPACE)) { inMenu = true; return; }
+        if (kp('1')) mode = 1;
+        if (kp('2')) mode = 2;
+        delay(10);
+    }
+    enterDebounce();
+
+    if (mode == 2) {
+        // Multi ESP-NOW mode (Espressif style): all STA, promiscuous, filter by MAC
+        M5.Display.clear(TFT_BLACK);
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.setCursor(10, 20);
+        M5.Display.print("Multi-Beacon ESP-NOW mode");
+        M5.Display.setCursor(10, 40);
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.print("Discovering beacons...");
+        M5.Display.display();
+
+        // Espressif exact config: STA, HT40, ch11, no power save
+        WiFi.mode(WIFI_STA);
+        esp_wifi_set_storage(WIFI_STORAGE_RAM);
+        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        esp_wifi_set_channel(11, WIFI_SECOND_CHAN_BELOW);
+        delay(50);
+
+        if (esp_now_init() != ESP_OK) {
+            M5.Display.setCursor(10, 60);
+            M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+            M5.Display.print("ESP-NOW init failed!");
+            M5.Display.display(); delay(2000);
+            WiFi.mode(WIFI_OFF); inMenu = true; return;
+        }
+
+        // Discover beacons via ESP-NOW, use their MAC for CSI filtering
+        csi_known_count = 0;
+        csi_filter_beacons = true;
+
+        esp_now_register_recv_cb([](const uint8_t* sender_mac, const uint8_t* data, int len) {
+            (void)data; (void)len;
+            // Register each unique beacon MAC for CSI filtering
+            for (int i = 0; i < csi_known_count; i++)
+                if (memcmp(csi_known_macs[i], sender_mac, 6) == 0) return;
+            if (csi_known_count < CSI_MAX_BEACONS)
+                memcpy(csi_known_macs[csi_known_count++], sender_mac, 6);
+        });
+
+        // Espressif exact CSI config
+        wifi_csi_config_t csi_cfg = {};
+        csi_cfg.lltf_en = true;
+        csi_cfg.htltf_en = true;
+        csi_cfg.stbc_htltf2_en = true;
+        csi_cfg.ltf_merge_en = true;
+        csi_cfg.channel_filter_en = true;  // Espressif uses true
+        csi_cfg.manu_scale = false;
+        csi_cfg.shift = false;
+        esp_wifi_set_csi_config(&csi_cfg);
+        esp_wifi_set_csi_rx_cb(csi_rx_callback, NULL);
+        esp_wifi_set_csi(true);
+        esp_wifi_set_promiscuous(true);
+
+        // Wait up to 8s for beacons
+        unsigned long disc_start = millis();
+        while (millis() - disc_start < 8000) {
+            M5.update(); cardUpdate();
+            if (kp(KEY_BACKSPACE)) {
+                esp_now_deinit(); esp_wifi_set_csi(false);
+                esp_wifi_set_promiscuous(false);
+                WiFi.mode(WIFI_OFF); inMenu = true; return;
+            }
+            M5.Display.fillRect(10, 55, 220, 30, TFT_BLACK);
+            M5.Display.setTextColor(csi_known_count > 0 ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+            M5.Display.setCursor(10, 55);
+            M5.Display.printf("Beacons found: %d  F:%lu", csi_known_count, csi_frame_count);
+            M5.Display.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+            M5.Display.setCursor(10, 70);
+            M5.Display.print("ENTER=start  BACK=exit");
+            M5.Display.display();
+            if (kp(KEY_ENTER) && csi_known_count > 0) break;
+            delay(200);
+        }
+
+        if (csi_known_count == 0) {
+            M5.Display.fillRect(10, 85, 220, 12, TFT_BLACK);
+            M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+            M5.Display.setCursor(10, 85);
+            M5.Display.print("No beacons! Flash CSI-Beacon");
+            M5.Display.display(); delay(2000);
+            esp_now_deinit(); esp_wifi_set_csi(false);
+            esp_wifi_set_promiscuous(false);
+            WiFi.mode(WIFI_OFF); inMenu = true; return;
+        }
+
+        M5.Display.clear(TFT_BLACK);
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.setCursor(10, 50);
+        M5.Display.printf("%d beacon(s) found, starting...", csi_known_count);
+        M5.Display.display();
+        delay(500);
+
+        csiRadarLoop("MULTI", true);
+
+        esp_now_deinit();
+        esp_wifi_set_promiscuous(false);
+
+    } else if (mode == 1) {
+        // Single beacon: scan for CSI-Beacon APs, connect to first
+        M5.Display.clear(TFT_BLACK);
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.setCursor(10, 20);
+        M5.Display.print("Scanning for CSI-Beacon...");
+        M5.Display.display();
+
+        WiFi.mode(WIFI_STA);
+        int n = WiFi.scanNetworks();
+        int beacon_found = 0;
+        String beaconSSID = "";
+        for (int i = 0; i < n; i++) {
+            if (WiFi.SSID(i).startsWith("CSI-Beacon")) {
+                beacon_found++;
+                if (beaconSSID.length() == 0) beaconSSID = WiFi.SSID(i);
+            }
+        }
+        WiFi.scanDelete();
+
+        if (beacon_found == 0) {
+            M5.Display.setCursor(10, 40);
+            M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+            M5.Display.print("No CSI-Beacon found!");
+            M5.Display.setCursor(10, 58);
+            M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+            M5.Display.print("Flash CSI-Beacon firmware");
+            M5.Display.setCursor(10, 70);
+            M5.Display.print("on any ESP32 (C3/C6/S3)");
+            M5.Display.setCursor(10, 90);
+            M5.Display.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+            M5.Display.print("BACK=exit  ENTER=retry");
+            M5.Display.display();
+            while (true) {
+                M5.update(); cardUpdate();
+                if (kp(KEY_BACKSPACE)) { WiFi.mode(WIFI_OFF); inMenu = true; return; }
+                if (kp(KEY_ENTER)) break;
+                delay(10);
+            }
+            n = WiFi.scanNetworks();
+            for (int i = 0; i < n; i++) {
+                if (WiFi.SSID(i).startsWith("CSI-Beacon")) {
+                    beacon_found++;
+                    if (beaconSSID.length() == 0) beaconSSID = WiFi.SSID(i);
+                }
+            }
+            WiFi.scanDelete();
+            if (beacon_found == 0) { WiFi.mode(WIFI_OFF); inMenu = true; return; }
+        }
+
+        M5.Display.clear(TFT_BLACK);
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.setCursor(10, 30);
+        M5.Display.printf("Found %d beacon(s)", beacon_found);
+        M5.Display.setCursor(10, 50);
+        M5.Display.printf("Connecting: %s", beaconSSID.c_str());
+        M5.Display.display();
+
+        WiFi.begin(beaconSSID.c_str());
+        unsigned long t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+            delay(100); M5.update(); cardUpdate();
+            if (kp(KEY_BACKSPACE)) { WiFi.disconnect(); WiFi.mode(WIFI_OFF); inMenu = true; return; }
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+            M5.Display.setCursor(10, 70);
+            M5.Display.print("Connection FAILED!");
+            M5.Display.display(); delay(2000);
+            WiFi.disconnect(); WiFi.mode(WIFI_OFF); inMenu = true; return;
+        }
+
+        M5.Display.setCursor(10, 70);
+        M5.Display.printf("Connected! IP:%s", WiFi.localIP().toString().c_str());
+        M5.Display.display();
+        delay(500);
+
+        wifi_csi_config_t csi_cfg = {};
+        csi_cfg.lltf_en = true;
+        csi_cfg.htltf_en = true;
+        csi_cfg.stbc_htltf2_en = true;
+        csi_cfg.ltf_merge_en = true;
+        csi_cfg.channel_filter_en = false;
+        csi_cfg.manu_scale = false;
+        csi_cfg.shift = false;
+        esp_wifi_set_csi_config(&csi_cfg);
+        esp_wifi_set_csi_rx_cb(csi_rx_callback, NULL);
+        esp_wifi_set_csi(true);
+
+        csiRadarLoop(mode == 2 ? "MULTI" : "BEACON", false);
+    }
+
+    M5.Display.clear(menuBackgroundColor);
+    inMenu = true;
+}
+
+// =====================================================================
+// ========================= TAGTINKER ESL IR ==========================
+// =====================================================================
+// Port of TagTinker ESL (Electronic Shelf Label) protocol for ESP32-S3.
+// Uses LEDC to generate ~1.25 MHz carrier on GPIO 44 (built-in IR LED).
+// Based on Pricer ESL protocol research by furrtek (PrecIR).
+// =====================================================================
+
+// ---------- TagTinker constants & types ----------
+
+#define TT_IR_PIN         44
+#define TT_PROTO_DM       0x85
+#define TT_PROTO_SEG      0x84
+#define TT_MAX_FRAME_SIZE 96
+#define TT_BC_LEN         17
+#define TT_MAX_TARGETS    50
+#define TT_DATA_BYTES_PER_FRAME 20
+#define TT_DATA_BITS_PER_FRAME  (TT_DATA_BYTES_PER_FRAME * 8)
+
+#define TT_LEDC_CHANNEL   7
+#define TT_LEDC_FREQ      1250000
+#define TT_LEDC_RESOLUTION 1
+
+#define TT_CPU_MHZ        240
+#define TT_FLIPPER_MHZ    64
+#define TT_SCALE(x)       ((uint32_t)((uint64_t)(x) * TT_CPU_MHZ / TT_FLIPPER_MHZ))
+
+#define TT_PP4_BURST      TT_SCALE(2581)
+#define TT_PP16_BURST     TT_SCALE(1344)
+
+const uint32_t tt_pp4_gaps[4] = {
+    TT_SCALE(3871), TT_SCALE(15483), TT_SCALE(7741), TT_SCALE(11612)
+};
+
+const uint32_t tt_pp16_gaps[16] = {
+    TT_SCALE(1728), TT_SCALE(3264), TT_SCALE(2240), TT_SCALE(2752),
+    TT_SCALE(9408), TT_SCALE(7872), TT_SCALE(8896), TT_SCALE(8384),
+    TT_SCALE(5312), TT_SCALE(3776), TT_SCALE(4800), TT_SCALE(4288),
+    TT_SCALE(5824), TT_SCALE(7360), TT_SCALE(6336), TT_SCALE(6848)
+};
+
+enum TtTagKind   { TT_KIND_UNKNOWN = 0, TT_KIND_DOTMATRIX, TT_KIND_SEGMENT };
+enum TtTagColor  { TT_COLOR_MONO = 0, TT_COLOR_RED, TT_COLOR_YELLOW };
+enum TtCompMode  { TT_COMP_AUTO = 0, TT_COMP_RAW, TT_COMP_RLE };
+
+struct TtTagProfile {
+    uint16_t type_code;
+    uint16_t width;
+    uint16_t height;
+    uint8_t  kind;
+    uint8_t  color;
+    const char* model_name;
+    uint8_t  pl_bit_def;
+    bool     known;
+};
+
+struct TtImagePayload {
+    uint8_t* data;
+    size_t   byte_count;
+    uint8_t  comp_type;
+};
+
+struct TtProfileEntry {
+    uint16_t type_code;
+    uint16_t width;
+    uint16_t height;
+    uint8_t  kind;
+    uint8_t  color;
+    const char* model_name;
+    uint8_t  pl_bit_def;
+};
+
+const TtProfileEntry tt_profile_table[] = {
+    {1206, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E2 HCS", 0},
+    {1207, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E2 HCN", 4},
+    {1217, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E5 HCS", 2},
+    {1219, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E5 HCN", 1},
+    {1240, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E4 HCS", 3},
+    {1241, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E4 HCN", 0},
+    {1242, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E4 HCN FZ", 0},
+    {1243, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E4 HCW", 0},
+    {1265, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "Continuum E5 HCS", 2},
+    {1275, 320, 192, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "DM110", 0},
+    {1276, 320, 140, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "DM90", 0},
+    {1291, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "FVL Promoline 3-16", 0},
+    {1300, 172, 72,  TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "DM3370", 0},
+    {1314, 400, 300, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD110", 0},
+    {1315, 296, 128, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD L", 0},
+    {1317, 152, 152, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD S", 0},
+    {1318, 208, 112, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD M", 0},
+    {1319, 800, 480, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD200", 0},
+    {1322, 152, 152, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD S", 0},
+    {1324, 208, 112, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD M FZ", 0},
+    {1327, 208, 112, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD M Red", 0},
+    {1328, 296, 128, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD L Red", 0},
+    {1336, 400, 300, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD110 Red", 0},
+    {1339, 152, 152, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD S Red", 0},
+    {1340, 800, 480, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD200 Red", 0},
+    {1344, 296, 128, TT_KIND_DOTMATRIX, TT_COLOR_YELLOW, "SmartTag HD L Yellow", 0},
+    {1346, 800, 480, TT_KIND_DOTMATRIX, TT_COLOR_YELLOW, "SmartTag HD200 Yellow", 0},
+    {1348, 264, 176, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD T Red", 0},
+    {1349, 264, 176, TT_KIND_DOTMATRIX, TT_COLOR_YELLOW, "SmartTag HD T Yellow", 0},
+    {1351, 648, 480, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD150", 0},
+    {1353, 648, 480, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD150 Red", 0},
+    {1354, 648, 480, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD150 Red", 0},
+    {1370, 296, 128, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD L Red (2021)", 0},
+    {1371, 648, 480, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD150 Red (2021)", 0},
+    {1510, 0,   0,   TT_KIND_SEGMENT,   TT_COLOR_MONO,   "SmartTag E5 M", 1},
+    {1627, 296, 128, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD L Red", 0},
+    {1628, 296, 128, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD L Red", 0},
+    {1639, 152, 152, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD S Red", 0},
+    {3145, 400, 300, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD110", 0},
+    {3547, 648, 480, TT_KIND_DOTMATRIX, TT_COLOR_RED,    "SmartTag HD150 Red", 0},
+    {6275, 296, 128, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD L", 0},
+    {3220, 152, 152, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD S", 0},
+    {3227, 152, 152, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD S", 0},
+    {3229, 152, 152, TT_KIND_DOTMATRIX, TT_COLOR_MONO,   "SmartTag HD S", 0},
+};
+const size_t tt_profile_count = sizeof(tt_profile_table) / sizeof(tt_profile_table[0]);
+
+// ---------- TagTinker state ----------
+
+bool     tt_ir_initialized = false;
+volatile bool tt_ir_stop_requested = false;
+volatile bool tt_tx_running = false;
+bool tt_use_pp16 = true;
+uint8_t  tt_comp_mode = TT_COMP_AUTO;
+uint8_t  tt_data_repeats = 3;
+uint16_t tt_wake_repeats_val = 250;
+uint16_t tt_store_key = 0x0000;
+String   tt_last_barcode = "";
+
+#define TT_MAX_SAVED_TARGETS 50
+#define TT_TARGETS_PATH "/evil/esl/targets.txt"
+
+struct TtSavedTarget {
+    char barcode[18];
+    char name[32];
+};
+
+TtSavedTarget tt_targets[TT_MAX_SAVED_TARGETS];
+uint8_t tt_target_count = 0;
+
+void tt_targets_load() {
+    tt_target_count = 0;
+    File f = SD.open(TT_TARGETS_PATH, FILE_READ);
+    if (!f) return;
+    while (f.available() && tt_target_count < TT_MAX_SAVED_TARGETS) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        int sep = line.indexOf('|');
+        if (sep < 0 || sep < TT_BC_LEN) continue;
+        TtSavedTarget& t = tt_targets[tt_target_count];
+        strncpy(t.barcode, line.substring(0, TT_BC_LEN).c_str(), 17);
+        t.barcode[17] = 0;
+        String nm = (sep + 1 < (int)line.length()) ? line.substring(sep + 1) : "";
+        nm.trim();
+        strncpy(t.name, nm.c_str(), 31);
+        t.name[31] = 0;
+        tt_target_count++;
+    }
+    f.close();
+}
+
+void tt_targets_save() {
+    SD.mkdir("/evil");
+    SD.mkdir("/evil/esl");
+    File f = SD.open(TT_TARGETS_PATH, FILE_WRITE);
+    if (!f) return;
+    for (uint8_t i = 0; i < tt_target_count; i++) {
+        f.printf("%s|%s\n", tt_targets[i].barcode, tt_targets[i].name);
+    }
+    f.close();
+}
+
+bool tt_target_add(const char* barcode, const char* name) {
+    tt_targets_load();
+    for (uint8_t i = 0; i < tt_target_count; i++) {
+        if (strcmp(tt_targets[i].barcode, barcode) == 0) {
+            strncpy(tt_targets[i].name, name, 31);
+            tt_targets[i].name[31] = 0;
+            tt_targets_save();
+            return true;
+        }
+    }
+    if (tt_target_count >= TT_MAX_SAVED_TARGETS) return false;
+    TtSavedTarget& t = tt_targets[tt_target_count];
+    strncpy(t.barcode, barcode, 17); t.barcode[17] = 0;
+    strncpy(t.name, name, 31); t.name[31] = 0;
+    tt_target_count++;
+    tt_targets_save();
+    return true;
+}
+
+void tt_target_delete(uint8_t idx) {
+    tt_targets_load();
+    if (idx >= tt_target_count) return;
+    for (uint8_t i = idx; i < tt_target_count - 1; i++)
+        tt_targets[i] = tt_targets[i + 1];
+    tt_target_count--;
+    tt_targets_save();
+}
+
+// ---------- Text presets ----------
+
+#define TT_MAX_PRESETS 16
+#define TT_PRESETS_PATH "/evil/esl/presets.txt"
+
+struct TtPreset {
+    char name[24];
+    char text[513];
+};
+
+TtPreset tt_presets[TT_MAX_PRESETS];
+uint8_t tt_preset_count = 0;
+
+void tt_presets_load() {
+    tt_preset_count = 0;
+    File f = SD.open(TT_PRESETS_PATH, FILE_READ);
+    if (!f) return;
+    while (f.available() && tt_preset_count < TT_MAX_PRESETS) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        int sep = line.indexOf('|');
+        if (sep < 1) continue;
+        TtPreset& p = tt_presets[tt_preset_count];
+        strncpy(p.name, line.substring(0, sep).c_str(), 23); p.name[23] = 0;
+        strncpy(p.text, line.substring(sep + 1).c_str(), 512); p.text[512] = 0;
+        tt_preset_count++;
+    }
+    f.close();
+}
+
+void tt_presets_save() {
+    SD.mkdir("/evil");
+    SD.mkdir("/evil/esl");
+    File f = SD.open(TT_PRESETS_PATH, FILE_WRITE);
+    if (!f) return;
+    for (uint8_t i = 0; i < tt_preset_count; i++)
+        f.printf("%s|%s\n", tt_presets[i].name, tt_presets[i].text);
+    f.close();
+}
+
+bool tt_preset_add(const char* name, const char* text) {
+    if (tt_preset_count >= TT_MAX_PRESETS) return false;
+    TtPreset& p = tt_presets[tt_preset_count];
+    strncpy(p.name, name, 23); p.name[23] = 0;
+    strncpy(p.text, text, 512); p.text[512] = 0;
+    tt_preset_count++;
+    tt_presets_save();
+    return true;
+}
+
+void tt_preset_delete(uint8_t idx) {
+    if (idx >= tt_preset_count) return;
+    for (uint8_t i = idx; i < tt_preset_count - 1; i++)
+        tt_presets[i] = tt_presets[i + 1];
+    tt_preset_count--;
+    tt_presets_save();
+}
+
+// ---------- TagTinker CRC16 ----------
+
+uint16_t tt_crc16(const uint8_t* data, size_t len) {
+    uint16_t crc = 0x8408;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : crc >> 1;
+    }
+    return crc;
+}
+
+// ---------- Barcode parsing ----------
+
+bool tt_is_barcode_valid(const char* barcode) {
+    if (!barcode || strlen(barcode) != TT_BC_LEN) return false;
+    for (int i = 2; i < 17; i++)
+        if (barcode[i] < '0' || barcode[i] > '9') return false;
+    return true;
+}
+
+bool tt_barcode_to_plid(const char* barcode, uint8_t plid[4]) {
+    if (!barcode || strlen(barcode) != TT_BC_LEN) return false;
+
+    uint64_t a = 0, b = 0;
+    for (int i = 2; i < 7; i++)  a = a * 10 + (barcode[i] - '0');
+    for (int i = 7; i < 12; i++) b = b * 10 + (barcode[i] - '0');
+
+    uint64_t id = (a << 16) | b;
+    plid[0] = id & 0xFF;
+    plid[1] = (id >> 8)  & 0xFF;
+    plid[2] = (id >> 16) & 0xFF;
+    plid[3] = (id >> 24) & 0xFF;
+    return true;
+}
+
+bool tt_barcode_to_type(const char* barcode, uint16_t* type_code) {
+    if (!barcode || strlen(barcode) != TT_BC_LEN || !type_code) return false;
+    uint16_t t = 0;
+    for (int i = 12; i < 16; i++) {
+        if (barcode[i] < '0' || barcode[i] > '9') return false;
+        t = (uint16_t)(t * 10 + (barcode[i] - '0'));
+    }
+    *type_code = t;
+    return true;
+}
+
+bool tt_barcode_to_profile(const char* barcode, TtTagProfile* profile) {
+    if (!profile) return false;
+    memset(profile, 0, sizeof(*profile));
+
+    uint16_t type_code = 0;
+    if (!tt_barcode_to_type(barcode, &type_code)) return false;
+
+    profile->type_code = type_code;
+    for (size_t i = 0; i < tt_profile_count; i++) {
+        if (tt_profile_table[i].type_code == type_code) {
+            profile->width      = tt_profile_table[i].width;
+            profile->height     = tt_profile_table[i].height;
+            profile->kind       = tt_profile_table[i].kind;
+            profile->color      = tt_profile_table[i].color;
+            profile->model_name = tt_profile_table[i].model_name;
+            profile->pl_bit_def = tt_profile_table[i].pl_bit_def;
+            profile->known      = true;
+            return true;
+        }
+    }
+    return true;
+}
+
+// ---------- Frame building ----------
+
+void tt_append_word(uint8_t* buf, size_t* pos, uint16_t value) {
+    buf[(*pos)++] = (value >> 8) & 0xFF;
+    buf[(*pos)++] = value & 0xFF;
+}
+
+size_t tt_terminate(uint8_t* buf, size_t len) {
+    uint16_t crc = tt_crc16(buf, len);
+    buf[len]     = crc & 0xFF;
+    buf[len + 1] = (crc >> 8) & 0xFF;
+    return len + 2;
+}
+
+size_t tt_raw_frame(uint8_t* buf, uint8_t proto,
+                           const uint8_t plid[4], uint8_t cmd) {
+    buf[0] = proto;
+    memcpy(&buf[1], plid, 4);
+    buf[5] = cmd;
+    return 6;
+}
+
+size_t tt_mcu_frame(uint8_t* buf, const uint8_t plid[4], uint8_t cmd) {
+    size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, 0x34);
+    buf[p++] = 0x00;
+    buf[p++] = 0x00;
+    buf[p++] = 0x00;
+    buf[p++] = cmd;
+    return p;
+}
+
+size_t tt_make_broadcast_page_frame(
+    uint8_t* buf, uint8_t page, bool forever, uint16_t duration) {
+    const uint8_t plid[4] = {0};
+    size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, 0x06);
+    buf[p++] = (((page + 1) & 7) << 3) | 0x01 | (forever ? 0x80 : 0x00);
+    buf[p++] = 0x00;
+    buf[p++] = 0x00;
+    buf[p++] = (duration >> 8) & 0xFF;
+    buf[p++] = duration & 0xFF;
+    return tt_terminate(buf, p);
+}
+
+size_t tt_make_broadcast_debug_frame(uint8_t* buf) {
+    const uint8_t plid[4] = {0};
+    size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, 0x06);
+    buf[p++] = 0xF1;
+    buf[p++] = 0x00;
+    buf[p++] = 0x00;
+    buf[p++] = 0x00;
+    buf[p++] = 0x0A;
+    return tt_terminate(buf, p);
+}
+
+size_t tt_make_addressed_frame(uint8_t* buf, const uint8_t plid[4], const uint8_t* payload, size_t payload_len) {
+    size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, payload[0]);
+    memcpy(&buf[p], payload + 1, payload_len - 1);
+    p += payload_len - 1;
+    return tt_terminate(buf, p);
+}
+
+size_t tt_make_ping_frame(uint8_t* buf, const uint8_t plid[4]) {
+    size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, 0x97);
+    buf[p++] = 0x01;
+    buf[p++] = 0x00;
+    buf[p++] = 0x00;
+    buf[p++] = 0x00;
+    for (int i = 0; i < 20; i++) buf[p++] = 0x01;
+    return tt_terminate(buf, p);
+}
+
+size_t tt_make_refresh_frame(uint8_t* buf, const uint8_t plid[4]) {
+    size_t p = tt_mcu_frame(buf, plid, 0x01);
+    for (int i = 0; i < 18; i++) buf[p++] = 0x00;
+    return tt_terminate(buf, p);
+}
+
+size_t tt_make_image_param_frame(
+    uint8_t* buf, const uint8_t plid[4],
+    uint16_t byte_count, uint8_t comp_type, uint8_t page,
+    uint16_t width, uint16_t height,
+    uint16_t pos_x, uint16_t pos_y) {
+    size_t p = tt_mcu_frame(buf, plid, 0x05);
+    tt_append_word(buf, &p, byte_count);
+    buf[p++] = 0x00;
+    buf[p++] = comp_type;
+    buf[p++] = page;
+    tt_append_word(buf, &p, width);
+    tt_append_word(buf, &p, height);
+    tt_append_word(buf, &p, pos_x);
+    tt_append_word(buf, &p, pos_y);
+    tt_append_word(buf, &p, 0x0000);
+    buf[p++] = 0x88;
+    tt_append_word(buf, &p, 0x0000);
+    for (int i = 0; i < 4; i++) buf[p++] = 0x00;
+    return tt_terminate(buf, p);
+}
+
+size_t tt_make_image_data_frame(
+    uint8_t* buf, const uint8_t plid[4],
+    uint16_t frame_index, const uint8_t data_bytes[20]) {
+    size_t p = tt_mcu_frame(buf, plid, 0x20);
+    tt_append_word(buf, &p, frame_index);
+    memcpy(&buf[p], data_bytes, TT_DATA_BYTES_PER_FRAME);
+    p += TT_DATA_BYTES_PER_FRAME;
+    return tt_terminate(buf, p);
+}
+
+// ---------- RLE compression ----------
+
+void tt_record_run(uint8_t* out, size_t* pos, size_t cap, uint32_t run_count) {
+    uint8_t bits[32];
+    int n = 0;
+    uint32_t v = run_count;
+    while (v) { bits[n++] = v & 1; v >>= 1; }
+    for (int i = 0; i < n / 2; i++) {
+        uint8_t t = bits[i]; bits[i] = bits[n - 1 - i]; bits[n - 1 - i] = t;
+    }
+    for (int i = 1; i < n; i++)
+        if (*pos < cap) out[(*pos)++] = 0;
+    for (int i = 0; i < n; i++)
+        if (*pos < cap) out[(*pos)++] = bits[i];
+}
+
+size_t tt_rle_compress(
+    const uint8_t* pixels, size_t count,
+    uint8_t* out, size_t out_cap, uint8_t* comp_type) {
+    if (count == 0) { *comp_type = 0; return 0; }
+
+    size_t pos = 0;
+    if (pos < out_cap) out[pos++] = pixels[0];
+
+    uint8_t run_pixel = pixels[0];
+    uint32_t run_count = 1;
+
+    for (size_t i = 1; i < count; i++) {
+        if (pixels[i] == run_pixel) {
+            run_count++;
+        } else {
+            tt_record_run(out, &pos, out_cap, run_count);
+            run_pixel = pixels[i];
+            run_count = 1;
+        }
+    }
+    if (run_count > 1) tt_record_run(out, &pos, out_cap, run_count);
+
+    if (pos < count) {
+        *comp_type = 2;
+        return pos;
+    }
+
+    memcpy(out, pixels, count < out_cap ? count : out_cap);
+    *comp_type = 0;
+    return count < out_cap ? count : out_cap;
+}
+
+// ---------- Bit writer for plane encoding ----------
+
+struct TtBitWriter {
+    uint8_t* data;
+    size_t   bit_pos;
+};
+
+inline void tt_bw_append(TtBitWriter* w, uint8_t bit) {
+    size_t byte_idx = w->bit_pos / 8U;
+    size_t bit_idx  = 7U - (w->bit_pos % 8U);
+    if (bit) w->data[byte_idx] |= (uint8_t)(1U << bit_idx);
+    w->bit_pos++;
+}
+
+inline uint8_t tt_plane_pixel(
+    const uint8_t* primary, const uint8_t* secondary,
+    size_t pixel_count, size_t index) {
+    if (index < pixel_count) return primary[index];
+    return secondary[index - pixel_count];
+}
+
+// Read pixel from pre-packed 1-bit buffer (for large tags without unpack)
+inline uint8_t tt_packed_plane_pixel(
+    const uint8_t* packed, size_t pixel_count, bool color_clear, size_t index) {
+    if (index < pixel_count) {
+        return (packed[index / 8] >> (7 - (index % 8))) & 1;
+    }
+    return 1; // secondary = all 1s (color_clear = no color)
+}
+
+// Read pixel from dual-plane packed buffer (0xFD: [primary][secondary])
+inline uint8_t tt_packed_dual_pixel(
+    const uint8_t* p1, const uint8_t* p2, size_t pixel_count, size_t index) {
+    if (index < pixel_count) {
+        return (p1[index / 8] >> (7 - (index % 8))) & 1;
+    }
+    return (p2[(index - pixel_count) / 8] >> (7 - ((index - pixel_count) % 8))) & 1;
+}
+
+size_t tt_rle_planes_bit_length(
+    const uint8_t* primary, const uint8_t* secondary, size_t pixel_count) {
+    if (!primary) return 0;
+    size_t total = secondary ? (pixel_count * 2U) : pixel_count;
+    if (total == 0) return 0;
+
+    size_t bit_len = 1U;
+    uint8_t run_pixel = tt_plane_pixel(primary, secondary, pixel_count, 0);
+    uint32_t run_count = 1;
+
+    for (size_t i = 1; i < total; i++) {
+        uint8_t px = tt_plane_pixel(primary, secondary, pixel_count, i);
+        if (px == run_pixel) {
+            run_count++;
+        } else {
+            uint32_t v = run_count; size_t bc = 0;
+            do { bc++; v >>= 1; } while (v);
+            bit_len += (bc * 2U) - 1U;
+            run_pixel = px;
+            run_count = 1;
+        }
+    }
+    if (run_count > 1U) {
+        uint32_t v = run_count; size_t bc = 0;
+        do { bc++; v >>= 1; } while (v);
+        bit_len += (bc * 2U) - 1U;
+    }
+    return bit_len;
+}
+
+void tt_bw_append_run(TtBitWriter* w, uint32_t run_count) {
+    uint8_t bits[32];
+    int n = 0;
+    uint32_t v = run_count;
+    while (v) { bits[n++] = v & 1U; v >>= 1; }
+    for (int i = 0; i < n / 2; i++) {
+        uint8_t t = bits[i]; bits[i] = bits[n - 1 - i]; bits[n - 1 - i] = t;
+    }
+    for (int i = 1; i < n; i++) tt_bw_append(w, 0U);
+    for (int i = 0; i < n; i++) tt_bw_append(w, bits[i]);
+}
+
+// === Packed variants (read bits directly, no unpack needed) ===
+
+size_t tt_rle_packed_bit_length(const uint8_t* packed, size_t pixel_count, bool color_clear) {
+    size_t total = color_clear ? (pixel_count * 2U) : pixel_count;
+    if (total == 0) return 0;
+    size_t bit_len = 1U;
+    uint8_t run_pixel = tt_packed_plane_pixel(packed, pixel_count, color_clear, 0);
+    uint32_t run_count = 1;
+    for (size_t i = 1; i < total; i++) {
+        uint8_t px = tt_packed_plane_pixel(packed, pixel_count, color_clear, i);
+        if (px == run_pixel) { run_count++; }
+        else {
+            uint32_t v = run_count; size_t bc = 0;
+            do { bc++; v >>= 1; } while (v);
+            bit_len += (bc * 2U) - 1U;
+            run_pixel = px; run_count = 1;
+        }
+    }
+    if (run_count > 1U) {
+        uint32_t v = run_count; size_t bc = 0;
+        do { bc++; v >>= 1; } while (v);
+        bit_len += (bc * 2U) - 1U;
+    }
+    return bit_len;
+}
+
+void tt_pack_packed_rle(const uint8_t* packed, size_t pixel_count, bool color_clear, uint8_t* out) {
+    size_t total = color_clear ? (pixel_count * 2U) : pixel_count;
+    if (total == 0) return;
+    TtBitWriter w = {out, 0};
+    uint8_t run_pixel = tt_packed_plane_pixel(packed, pixel_count, color_clear, 0);
+    uint32_t run_count = 1;
+    tt_bw_append(&w, run_pixel);
+    for (size_t i = 1; i < total; i++) {
+        uint8_t px = tt_packed_plane_pixel(packed, pixel_count, color_clear, i);
+        if (px == run_pixel) { run_count++; }
+        else { tt_bw_append_run(&w, run_count); run_pixel = px; run_count = 1; }
+    }
+    if (run_count > 1U) tt_bw_append_run(&w, run_count);
+}
+
+void tt_pack_packed_raw(const uint8_t* packed, size_t pixel_count, bool color_clear, uint8_t* out) {
+    size_t total = color_clear ? (pixel_count * 2U) : pixel_count;
+    TtBitWriter w = {out, 0};
+    for (size_t i = 0; i < total; i++)
+        tt_bw_append(&w, tt_packed_plane_pixel(packed, pixel_count, color_clear, i));
+}
+
+// Dual-plane packed variants (read from two packed arrays)
+size_t tt_rle_dual_packed_bit_length(const uint8_t* p1, const uint8_t* p2, size_t pixel_count) {
+    size_t total = pixel_count * 2U;
+    if (total == 0) return 0;
+    size_t bit_len = 1U;
+    uint8_t run_pixel = tt_packed_dual_pixel(p1, p2, pixel_count, 0);
+    uint32_t run_count = 1;
+    for (size_t i = 1; i < total; i++) {
+        uint8_t px = tt_packed_dual_pixel(p1, p2, pixel_count, i);
+        if (px == run_pixel) { run_count++; }
+        else {
+            uint32_t v = run_count; size_t bc = 0;
+            do { bc++; v >>= 1; } while (v);
+            bit_len += (bc * 2U) - 1U;
+            run_pixel = px; run_count = 1;
+        }
+    }
+    if (run_count > 1U) {
+        uint32_t v = run_count; size_t bc = 0;
+        do { bc++; v >>= 1; } while (v);
+        bit_len += (bc * 2U) - 1U;
+    }
+    return bit_len;
+}
+
+void tt_pack_dual_packed_rle(const uint8_t* p1, const uint8_t* p2, size_t pixel_count, uint8_t* out) {
+    size_t total = pixel_count * 2U;
+    if (total == 0) return;
+    TtBitWriter w = {out, 0};
+    uint8_t run_pixel = tt_packed_dual_pixel(p1, p2, pixel_count, 0);
+    uint32_t run_count = 1;
+    tt_bw_append(&w, run_pixel);
+    for (size_t i = 1; i < total; i++) {
+        uint8_t px = tt_packed_dual_pixel(p1, p2, pixel_count, i);
+        if (px == run_pixel) { run_count++; }
+        else { tt_bw_append_run(&w, run_count); run_pixel = px; run_count = 1; }
+    }
+    if (run_count > 1U) tt_bw_append_run(&w, run_count);
+}
+
+void tt_pack_planes_raw(
+    const uint8_t* primary, const uint8_t* secondary,
+    size_t pixel_count, uint8_t* out) {
+    size_t total = secondary ? (pixel_count * 2U) : pixel_count;
+    TtBitWriter w = {out, 0};
+    for (size_t i = 0; i < total; i++)
+        tt_bw_append(&w, tt_plane_pixel(primary, secondary, pixel_count, i));
+}
+
+void tt_pack_planes_rle(
+    const uint8_t* primary, const uint8_t* secondary,
+    size_t pixel_count, uint8_t* out) {
+    size_t total = secondary ? (pixel_count * 2U) : pixel_count;
+    if (total == 0) return;
+
+    TtBitWriter w = {out, 0};
+    uint8_t run_pixel = tt_plane_pixel(primary, secondary, pixel_count, 0);
+    uint32_t run_count = 1;
+    tt_bw_append(&w, run_pixel);
+
+    for (size_t i = 1; i < total; i++) {
+        uint8_t px = tt_plane_pixel(primary, secondary, pixel_count, i);
+        if (px == run_pixel) {
+            run_count++;
+        } else {
+            tt_bw_append_run(&w, run_count);
+            run_pixel = px;
+            run_count = 1;
+        }
+    }
+    if (run_count > 1U) tt_bw_append_run(&w, run_count);
+}
+
+// ---------- Image encoding ----------
+
+bool tt_encode_planes_payload(
+    const uint8_t* primary, const uint8_t* secondary,
+    size_t pixel_count, uint8_t comp_mode_val,
+    TtImagePayload* payload) {
+    if (!primary || !payload) return false;
+    memset(payload, 0, sizeof(*payload));
+
+    size_t total_pixels = secondary ? (pixel_count * 2U) : pixel_count;
+    size_t comp_len = tt_rle_planes_bit_length(primary, secondary, pixel_count);
+    bool use_compressed = false;
+    if (comp_mode_val == TT_COMP_RLE) {
+        use_compressed = true;
+    } else if (comp_mode_val == TT_COMP_AUTO) {
+        use_compressed = (comp_len > 0U) && (comp_len < total_pixels);
+    }
+    size_t src_len = use_compressed ? comp_len : total_pixels;
+
+    size_t padding = (TT_DATA_BITS_PER_FRAME - (src_len % TT_DATA_BITS_PER_FRAME)) % TT_DATA_BITS_PER_FRAME;
+    size_t padded_bits = src_len + padding;
+    size_t padded_bytes = padded_bits / 8U;
+
+    uint8_t* data_bytes = (uint8_t*)calloc(padded_bytes, 1);
+    if (!data_bytes) return false;
+
+    if (use_compressed) {
+        tt_pack_planes_rle(primary, secondary, pixel_count, data_bytes);
+    } else {
+        tt_pack_planes_raw(primary, secondary, pixel_count, data_bytes);
+    }
+
+    payload->data = data_bytes;
+    payload->byte_count = padded_bytes;
+    payload->comp_type = use_compressed ? 2U : 0U;
+    return true;
+}
+
+bool tt_encode_image_payload(
+    const uint8_t* pixels, uint16_t width, uint16_t height,
+    bool color_clear, uint8_t comp_mode_val,
+    TtImagePayload* payload) {
+    size_t pixel_count = (size_t)width * height;
+
+    // Handle pre-packed 1-bit format (flag byte 0xFE from low-memory render/BMP load)
+    // Pre-packed 0xFE: unpack to 1-byte/pixel then encode properly (like dev)
+    if (pixels[0] == 0xFE) {
+        const uint8_t* packed = pixels + 1;
+        size_t packed_bytes = (pixel_count + 7) / 8;
+        // Try unpack (works for small/medium tags)
+        uint8_t* unpacked = (uint8_t*)calloc(pixel_count, 1);
+        if (unpacked) {
+            for (size_t i = 0; i < pixel_count; i++)
+                unpacked[i] = (packed[i / 8] >> (7 - (i % 8))) & 1;
+            uint8_t* second = NULL;
+            if (color_clear) {
+                second = (uint8_t*)malloc(pixel_count);
+                if (!second) { free(unpacked); goto rawFallback; }
+                memset(second, 1, pixel_count);
+            }
+            bool ok = tt_encode_planes_payload(unpacked, second, pixel_count, comp_mode_val, payload);
+            free(second);
+            free(unpacked);
+            return ok;
+        }
+        rawFallback:
+        // Large tags: encode directly from packed bits (RLE or RAW, no unpack)
+        size_t total_bits = color_clear ? (pixel_count * 2U) : pixel_count;
+        // Try RLE compression
+        size_t rle_bits = 0;
+        bool use_rle = false;
+        if (comp_mode_val == TT_COMP_RLE) {
+            rle_bits = tt_rle_packed_bit_length(packed, pixel_count, color_clear);
+            use_rle = true;
+        } else if (comp_mode_val == TT_COMP_AUTO) {
+            rle_bits = tt_rle_packed_bit_length(packed, pixel_count, color_clear);
+            use_rle = (rle_bits > 0U) && (rle_bits < total_bits);
+        }
+        size_t src_bits = use_rle ? rle_bits : total_bits;
+        size_t padding = (TT_DATA_BITS_PER_FRAME - (src_bits % TT_DATA_BITS_PER_FRAME)) % TT_DATA_BITS_PER_FRAME;
+        size_t padded_bits = src_bits + padding;
+        size_t padded_bytes = padded_bits / 8U;
+        uint8_t* data = (uint8_t*)calloc(padded_bytes, 1);
+        if (!data) return false;
+        if (use_rle) {
+            tt_pack_packed_rle(packed, pixel_count, color_clear, data);
+            Serial.printf("[TT] Large tag RLE: %d→%d bits (%.0f%% saved)\n",
+                (int)total_bits, (int)rle_bits, (1.0f - (float)rle_bits/total_bits) * 100);
+        } else {
+            tt_pack_packed_raw(packed, pixel_count, color_clear, data);
+            Serial.printf("[TT] Large tag RAW: %d bits\n", (int)total_bits);
+        }
+        payload->data = data;
+        payload->byte_count = padded_bytes;
+        payload->comp_type = use_rle ? 2U : 0U;
+        return true;
+    }
+
+    // Handle dual-plane packed format (flag 0xFD: [primary_packed][secondary_packed])
+    if (pixels[0] == 0xFD) {
+        size_t packed_bytes = (pixel_count + 7) / 8;
+        const uint8_t* p1_packed = pixels + 1;
+        const uint8_t* p2_packed = pixels + 1 + packed_bytes;
+        uint8_t* primary = (uint8_t*)calloc(pixel_count, 1);
+        uint8_t* secondary = (uint8_t*)calloc(pixel_count, 1);
+        if (primary && secondary) {
+            for (size_t i = 0; i < pixel_count; i++) {
+                primary[i]   = (p1_packed[i / 8] >> (7 - (i % 8))) & 1;
+                secondary[i] = (p2_packed[i / 8] >> (7 - (i % 8))) & 1;
+            }
+            bool ok = tt_encode_planes_payload(primary, secondary, pixel_count, comp_mode_val, payload);
+            free(secondary); free(primary);
+            return ok;
+        }
+        free(secondary); free(primary);
+        // Fallback: encode directly from dual packed (RLE or RAW)
+        size_t total_bits = pixel_count * 2U;
+        size_t rle_bits = 0;
+        bool use_rle = false;
+        if (comp_mode_val == TT_COMP_RLE) {
+            rle_bits = tt_rle_dual_packed_bit_length(p1_packed, p2_packed, pixel_count);
+            use_rle = true;
+        } else if (comp_mode_val == TT_COMP_AUTO) {
+            rle_bits = tt_rle_dual_packed_bit_length(p1_packed, p2_packed, pixel_count);
+            use_rle = (rle_bits > 0U) && (rle_bits < total_bits);
+        }
+        size_t src_bits = use_rle ? rle_bits : total_bits;
+        size_t padding = (TT_DATA_BITS_PER_FRAME - (src_bits % TT_DATA_BITS_PER_FRAME)) % TT_DATA_BITS_PER_FRAME;
+        size_t padded_bytes = (src_bits + padding) / 8U;
+        uint8_t* data = (uint8_t*)calloc(padded_bytes, 1);
+        if (!data) return false;
+        if (use_rle) {
+            tt_pack_dual_packed_rle(p1_packed, p2_packed, pixel_count, data);
+            Serial.printf("[TT] Large dual-plane RLE: %d->%d bits (%.0f%% saved)\n",
+                (int)total_bits, (int)rle_bits, (1.0f - (float)rle_bits/total_bits) * 100);
+        } else {
+            memcpy(data, p1_packed, packed_bytes);
+            memcpy(data + packed_bytes, p2_packed, packed_bytes);
+            Serial.printf("[TT] Large dual-plane RAW: %d bits\n", (int)total_bits);
+        }
+        payload->data = data;
+        payload->byte_count = padded_bytes;
+        payload->comp_type = use_rle ? 2U : 0U;
+        return true;
+    }
+
+    uint8_t* second_plane = NULL;
+    if (color_clear) {
+        second_plane = (uint8_t*)malloc(pixel_count);
+        if (!second_plane) return false;
+        memset(second_plane, 1, pixel_count);
+    }
+
+    bool ok = tt_encode_planes_payload(pixels, second_plane, pixel_count, comp_mode_val, payload);
+    free(second_plane);
+    return ok;
+}
+
+void tt_free_image_payload(TtImagePayload* payload) {
+    if (!payload) return;
+    free(payload->data);
+    payload->data = NULL;
+    payload->byte_count = 0;
+    payload->comp_type = 0;
+}
+
+// ---------- IR driver (GPIO bit-bang on ESP32-S3) ----------
+
+#define TT_GPIO_BIT       (1 << (TT_IR_PIN - 32))
+#define TT_HALF_CARRIER   85
+
+inline uint32_t tt_get_ccount(void) {
+    uint32_t ccount;
+    __asm__ __volatile__("rsr %0, ccount" : "=a"(ccount));
+    return ccount;
+}
+
+inline void tt_delay_cycles(uint32_t cycles) {
+    uint32_t start = tt_get_ccount();
+    while ((tt_get_ccount() - start) < cycles) {}
+}
+
+inline void tt_gpio_high(void) { GPIO.out1_w1ts.val = TT_GPIO_BIT; }
+inline void tt_gpio_low(void)  { GPIO.out1_w1tc.val = TT_GPIO_BIT; }
+
+void tt_burst(uint32_t duration_cycles) {
+    uint32_t start = tt_get_ccount();
+    while ((tt_get_ccount() - start) < duration_cycles) {
+        tt_gpio_high();
+        uint32_t t = tt_get_ccount();
+        while ((tt_get_ccount() - t) < TT_HALF_CARRIER) {}
+        tt_gpio_low();
+        t = tt_get_ccount();
+        while ((tt_get_ccount() - t) < TT_HALF_CARRIER) {}
+    }
+}
+
+inline void tt_carrier_off(void) { tt_gpio_low(); }
+
+void tt_ir_init(void) {
+    if (tt_ir_initialized) return;
+    pinMode(TT_IR_PIN, OUTPUT);
+    digitalWrite(TT_IR_PIN, LOW);
+    tt_ir_stop_requested = false;
+    tt_ir_initialized = true;
+}
+
+void tt_ir_deinit(void) {
+    if (!tt_ir_initialized) return;
+    tt_ir_stop_requested = true;
+    digitalWrite(TT_IR_PIN, LOW);
+    tt_ir_initialized = false;
+}
+
+void tt_send_frame_pp4(const uint8_t* data, size_t len) {
+    for (size_t byte_idx = 0; byte_idx < len; byte_idx++) {
+        uint8_t current_byte = data[byte_idx];
+        for (int sym = 0; sym < 4; sym++) {
+            uint8_t symbol = current_byte & 0x03;
+            current_byte >>= 2;
+            tt_burst(TT_PP4_BURST);
+            tt_delay_cycles(tt_pp4_gaps[symbol]);
+        }
+    }
+    tt_burst(TT_PP4_BURST);
+    tt_gpio_low();
+}
+
+void tt_send_frame_pp16(const uint8_t* data, size_t len) {
+    for (size_t byte_idx = 0; byte_idx < len; byte_idx++) {
+        uint8_t current_byte = data[byte_idx];
+        for (int sym = 0; sym < 2; sym++) {
+            uint8_t symbol = current_byte & 0x0F;
+            current_byte >>= 4;
+            tt_burst(TT_PP16_BURST);
+            tt_delay_cycles(tt_pp16_gaps[symbol]);
+        }
+    }
+    tt_burst(TT_PP16_BURST);
+    tt_gpio_low();
+}
+
+bool tt_ir_transmit_ex(const uint8_t* data, size_t len,
+                           uint16_t repeats, uint8_t gap_delay, bool pp16) {
+    if (!tt_ir_initialized || !data || len == 0 || len > 255) return false;
+    tt_ir_stop_requested = false;
+
+    // PP16: prepend [00 00 00 40] preamble before frame data
+    uint8_t pp16buf[TT_MAX_FRAME_SIZE + 4];
+    const uint8_t* txData = data;
+    size_t txLen = len;
+    if (pp16) {
+        pp16buf[0] = 0x00; pp16buf[1] = 0x00; pp16buf[2] = 0x00; pp16buf[3] = 0x40;
+        memcpy(pp16buf + 4, data, len);
+        txData = pp16buf;
+        txLen = len + 4;
+    }
+
+    for (uint32_t rep = 0; rep <= repeats; rep++) {
+        if (tt_ir_stop_requested) {
+            tt_gpio_low();
+            return false;
+        }
+
+        portDISABLE_INTERRUPTS();
+        if (pp16) tt_send_frame_pp16(txData, txLen);
+        else tt_send_frame_pp4(txData, txLen);
+        portENABLE_INTERRUPTS();
+
+        if (rep < repeats) {
+            if (gap_delay > 0) {
+                uint32_t gap_cycles = (uint32_t)gap_delay * 120000U;
+                tt_delay_cycles(gap_cycles);
+            }
+            if ((rep % 5U) == 4U) delay(1);
+        }
+    }
+    return true;
+}
+
+// PP4 wrapper — used by broadcasts, LED, simple commands (always PP4)
+bool tt_ir_transmit(const uint8_t* data, size_t len, uint16_t repeats, uint8_t gap_delay) {
+    return tt_ir_transmit_ex(data, len, repeats, gap_delay, false);
+}
+
+// ---------- Image sequence builder ----------
+
+struct TtFrameSeq {
+    uint8_t** frames;
+    size_t*   lengths;
+    uint16_t* repeats;
+    size_t    count;
+};
+
+void tt_free_frame_seq(TtFrameSeq* seq) {
+    if (!seq) return;
+    for (size_t i = 0; i < seq->count; i++) free(seq->frames[i]);
+    free(seq->frames);
+    free(seq->lengths);
+    free(seq->repeats);
+    memset(seq, 0, sizeof(*seq));
+}
+
+bool tt_build_image_sequence_planes(TtFrameSeq* seq, const uint8_t* plid, const uint8_t* primary, const uint8_t* secondary, uint16_t width, uint16_t height, uint8_t page, uint16_t pos_x, uint16_t pos_y, uint16_t wake_reps, uint8_t comp) {
+    size_t pixel_count = (size_t)width * height;
+    TtImagePayload payload;
+    if (!tt_encode_planes_payload(primary, secondary, pixel_count, comp, &payload))
+        return false;
+
+    size_t frame_count = payload.byte_count / TT_DATA_BYTES_PER_FRAME;
+    size_t total = 2 + frame_count + 1;
+    seq->count = total;
+    seq->frames  = (uint8_t**)malloc(sizeof(uint8_t*) * total);
+    seq->lengths = (size_t*)malloc(sizeof(size_t) * total);
+    seq->repeats = (uint16_t*)malloc(sizeof(uint16_t) * total);
+    if (!seq->frames || !seq->lengths || !seq->repeats) {
+        tt_free_image_payload(&payload); seq->count = 0; return false;
+    }
+    size_t idx = 0;
+    seq->frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+    seq->lengths[idx] = tt_make_ping_frame(seq->frames[idx], plid);
+    seq->repeats[idx] = wake_reps; idx++;
+    seq->frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+    seq->lengths[idx] = tt_make_image_param_frame(seq->frames[idx], plid,
+        (uint16_t)payload.byte_count, payload.comp_type, page, width, height, pos_x, pos_y);
+    seq->repeats[idx] = 1; idx++;
+    for (size_t fi = 0; fi < frame_count; fi++) {
+        seq->frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+        seq->lengths[idx] = tt_make_image_data_frame(seq->frames[idx], plid, (uint16_t)fi, &payload.data[fi * TT_DATA_BYTES_PER_FRAME]);
+        seq->repeats[idx] = tt_data_repeats; idx++;
+    }
+    seq->frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+    seq->lengths[idx] = tt_make_refresh_frame(seq->frames[idx], plid);
+    seq->repeats[idx] = 20;
+    tt_free_image_payload(&payload);
+    return true;
+}
+
+bool tt_build_image_sequence(TtFrameSeq* seq, const uint8_t* plid, const uint8_t* pixels, uint16_t width, uint16_t height, uint8_t page, uint16_t pos_x, uint16_t pos_y, uint16_t wake_reps, bool color_clear, uint8_t comp) {
+
+    TtImagePayload payload;
+    if (!tt_encode_image_payload(pixels, width, height, color_clear, comp, &payload))
+        return false;
+
+    size_t frame_count = payload.byte_count / TT_DATA_BYTES_PER_FRAME;
+    size_t total = 2 + frame_count + 1;
+
+    seq->count   = total;
+    seq->frames  = (uint8_t**)malloc(sizeof(uint8_t*) * total);
+    seq->lengths = (size_t*)malloc(sizeof(size_t) * total);
+    seq->repeats = (uint16_t*)malloc(sizeof(uint16_t) * total);
+    if (!seq->frames || !seq->lengths || !seq->repeats) {
+        tt_free_image_payload(&payload);
+        seq->count = 0;
+        return false;
+    }
+
+    size_t idx = 0;
+
+    seq->frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+    seq->lengths[idx] = tt_make_ping_frame(seq->frames[idx], plid);
+    seq->repeats[idx] = wake_reps;
+    idx++;
+
+    seq->frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+    seq->lengths[idx] = tt_make_image_param_frame(
+        seq->frames[idx], plid,
+        (uint16_t)payload.byte_count, payload.comp_type, page,
+        width, height, pos_x, pos_y);
+    seq->repeats[idx] = 1;
+    idx++;
+
+    for (size_t fi = 0; fi < frame_count; fi++) {
+        seq->frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+        size_t start = fi * TT_DATA_BYTES_PER_FRAME;
+        seq->lengths[idx] = tt_make_image_data_frame(
+            seq->frames[idx], plid, (uint16_t)fi, &payload.data[start]);
+        seq->repeats[idx] = tt_data_repeats;
+        idx++;
+    }
+
+    seq->frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+    seq->lengths[idx] = tt_make_refresh_frame(seq->frames[idx], plid);
+    seq->repeats[idx] = 20;
+
+    tt_free_image_payload(&payload);
+    return true;
+}
+
+// ---------- Simple text-to-pixel renderer (uses M5Canvas) ----------
+
+uint8_t tt_text_size = 2;
+uint8_t tt_page = 1;
+uint16_t tt_pos_x = 0;
+uint16_t tt_pos_y = 0;
+bool tt_invert = true;
+
+// Font table for selector
+const uint8_t TT_FONT_COUNT = 8;
+const char* tt_font_names[] = {"Mono", "Sans 9", "Sans 12", "Sans 18", "Sans 24", "Serif 12", "Serif 18", "Serif 24"};
+uint8_t tt_font_idx = 0;
+
+void tt_apply_font(M5Canvas& canvas, uint8_t fontIdx, uint8_t textSize) {
+    switch (fontIdx) {
+        case 0: canvas.setTextFont(1); canvas.setTextSize(textSize); break;
+        case 1: canvas.setFreeFont(&FreeSans9pt7b); canvas.setTextSize(1); break;
+        case 2: canvas.setFreeFont(&FreeSans12pt7b); canvas.setTextSize(1); break;
+        case 3: canvas.setFreeFont(&FreeSans18pt7b); canvas.setTextSize(1); break;
+        case 4: canvas.setFreeFont(&FreeSans24pt7b); canvas.setTextSize(1); break;
+        case 5: canvas.setFreeFont(&FreeSerif12pt7b); canvas.setTextSize(1); break;
+        case 6: canvas.setFreeFont(&FreeSerif18pt7b); canvas.setTextSize(1); break;
+        case 7: canvas.setFreeFont(&FreeSerif24pt7b); canvas.setTextSize(1); break;
+    }
+}
+
+uint8_t* tt_render_text(const char* text, uint16_t width, uint16_t height, uint8_t textSize, bool invert, uint16_t offX, uint16_t offY) {
+    size_t pixel_count = (size_t)width * height;
+    Serial.printf("[TT] render %dx%d=%d heap=%d\n", width, height, (int)pixel_count, ESP.getFreeHeap());
+
+    // Try full 1-byte-per-pixel buffer first (works for small tags or when heap is sufficient)
+    uint8_t* pixels = (uint8_t*)calloc(pixel_count, 1);
+    if (pixels) {
+        M5Canvas canvas(&M5.Display);
+        if (canvas.createSprite(width, height)) {
+            canvas.setColorDepth(1);
+            canvas.fillSprite(TFT_BLACK);
+            canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+            tt_apply_font(canvas, tt_font_idx, textSize);
+            canvas.setTextWrap(true, true);
+            int yOff = (tt_font_idx == 0) ? offY + 2 : offY + canvas.fontHeight();
+            canvas.setCursor(offX + 2, yOff);
+            canvas.print(text);
+            for (uint16_t y = 0; y < height; y++)
+                for (uint16_t x = 0; x < width; x++) {
+                    bool lit = (canvas.readPixel(x, y) != 0);
+                    if (invert) lit = !lit;
+                    if (lit) pixels[y * width + x] = 1;
+                }
+            canvas.deleteSprite();
+            return pixels;
+        }
+        free(pixels);
+    }
+
+    // Low-memory path: render in 16-row strips, pack to 1-bit (15KB vs 120KB for 400x300)
+    Serial.printf("[TT] low-mem strip path: packed=%d bytes, heap=%d\n", (int)((pixel_count+7)/8+1), ESP.getFreeHeap());
+    size_t packed_size = (pixel_count + 7) / 8;
+    pixels = (uint8_t*)calloc(packed_size + 1, 1);
+    if (!pixels) { Serial.println(F("[TT] packed calloc FAILED")); return NULL; }
+    pixels[0] = 0xFE; // pre-packed flag
+
+    const uint16_t STRIP_H = 16;
+    M5Canvas strip(&M5.Display);
+    if (!strip.createSprite(width, STRIP_H)) {
+        Serial.printf("[TT] strip sprite FAILED %dx%d heap=%d\n", width, STRIP_H, ESP.getFreeHeap());
+        free(pixels); return NULL;
+    }
+    strip.setColorDepth(8);
+    strip.setTextColor(TFT_WHITE, TFT_BLACK);
+    tt_apply_font(strip, tt_font_idx, textSize);
+    strip.setTextWrap(true, false); // horizontal wrap only — NO vertical wrap on 16px strip
+
+    int fontH = strip.fontHeight();
+    if (fontH < 1) fontH = 8;
+    int yOff = (tt_font_idx == 0) ? offY + 2 : offY + fontH;
+    uint32_t litCount = 0;
+
+    for (uint16_t sy = 0; sy < height; sy += STRIP_H) {
+        uint16_t sh = (sy + STRIP_H <= height) ? STRIP_H : (uint16_t)(height - sy);
+        strip.fillSprite(TFT_BLACK);
+        strip.setCursor(offX + 2, yOff - (int)sy);
+        strip.print(text);
+        for (uint16_t y = 0; y < sh; y++)
+            for (uint16_t x = 0; x < width; x++) {
+                bool lit = (strip.readPixel(x, y) != 0);
+                if (invert) lit = !lit;
+                if (lit) {
+                    litCount++;
+                    size_t px_idx = (size_t)(sy + y) * width + x;
+                    pixels[1 + px_idx / 8] |= (1 << (7 - (px_idx % 8)));
+                }
+            }
+    }
+    strip.deleteSprite();
+    Serial.printf("[TT] strip render DONE lit=%u/%u heap=%d\n", litCount, (uint32_t)pixel_count, ESP.getFreeHeap());
+    return pixels;
+}
+
+// Read a pixel from a pixel buffer. Handles both raw 1-byte/pixel and
+// pre-packed 1-bit/pixel format (signalled by leading 0xFE flag byte).
+inline bool tt_read_pixel(const uint8_t* buf, uint16_t w, int x, int y) {
+    if (buf[0] == 0xFE) {
+        size_t idx = (size_t)y * w + x;
+        return (buf[1 + idx / 8] >> (7 - (idx % 8))) & 1;
+    }
+    return buf[y * w + x] != 0;
+}
+
+void tt_preview_pixels(const uint8_t* pixels, uint16_t w, uint16_t h, int screenY) {
+    int availW = 240, availH = 135 - screenY;
+    int pw, ph;
+    if ((int)w <= availW && (int)h <= availH) {
+        pw = w; ph = h;
+    } else {
+        float scaleW = (float)availW / w;
+        float scaleH = (float)availH / h;
+        float scale = (scaleW < scaleH) ? scaleW : scaleH;
+        pw = (int)(w * scale); ph = (int)(h * scale);
+    }
+    if (pw > availW) pw = availW;
+    if (ph > availH) ph = availH;
+    int offX = (240 - pw) / 2;
+    int offY = screenY + (availH - ph) / 2;
+    M5.Display.drawRect(offX - 1, offY - 1, pw + 2, ph + 2, TFT_DARKGREY);
+    for (int py = 0; py < ph; py++) {
+        for (int px = 0; px < pw; px++) {
+            int sx = px * w / pw;
+            int sy = py * h / ph;
+            if (sx < w && sy < h) {
+                M5.Display.drawPixel(offX + px, offY + py, tt_read_pixel(pixels, w, sx, sy) ? TFT_WHITE : TFT_BLACK);
+            }
+        }
+    }
+}
+
+void tt_preview_color(const uint8_t* primary, const uint8_t* secondary, uint16_t w, uint16_t h, int screenY) {
+    int availW = 240, availH = 135 - screenY;
+    int pw, ph;
+    if ((int)w <= availW && (int)h <= availH) { pw = w; ph = h; }
+    else { float s = min((float)availW/w, (float)availH/h); pw = (int)(w*s); ph = (int)(h*s); }
+    if (pw > availW) pw = availW;
+    if (ph > availH) ph = availH;
+    int offX = (240 - pw) / 2;
+    int offY = screenY + (availH - ph) / 2;
+    M5.Display.drawRect(offX - 1, offY - 1, pw + 2, ph + 2, TFT_DARKGREY);
+    for (int py = 0; py < ph; py++) {
+        for (int px = 0; px < pw; px++) {
+            int sx = px * w / pw, sy = py * h / ph;
+            if (sx < w && sy < h) {
+                int idx = sy * w + sx;
+                uint8_t p = primary ? primary[idx] : 0;
+                uint8_t c = secondary ? secondary[idx] : 1;
+                uint16_t col;
+                if (p) col = TFT_WHITE;
+                else if (!c) col = TFT_RED;
+                else col = TFT_BLACK;
+                M5.Display.drawPixel(offX + px, offY + py, col);
+            }
+        }
+    }
+}
+
+void tt_preview_dual_packed(const uint8_t* buf, uint16_t w, uint16_t h, int screenY) {
+    size_t packed_bytes = ((size_t)w * h + 7) / 8;
+    const uint8_t* p1 = buf + 1;
+    const uint8_t* p2 = buf + 1 + packed_bytes;
+    int availW = 240, availH = 135 - screenY;
+    int pw, ph;
+    if ((int)w <= availW && (int)h <= availH) { pw = w; ph = h; }
+    else { float s = min((float)availW/w, (float)availH/h); pw = (int)(w*s); ph = (int)(h*s); }
+    if (pw > availW) pw = availW;
+    if (ph > availH) ph = availH;
+    int offX = (240 - pw) / 2;
+    int offY = screenY + (availH - ph) / 2;
+    M5.Display.drawRect(offX - 1, offY - 1, pw + 2, ph + 2, TFT_DARKGREY);
+    for (int py = 0; py < ph; py++) {
+        for (int px = 0; px < pw; px++) {
+            int sx = px * w / pw, sy = py * h / ph;
+            if (sx < w && sy < h) {
+                size_t idx = (size_t)sy * w + sx;
+                uint8_t prim = (p1[idx/8] >> (7 - (idx%8))) & 1;
+                uint8_t sec  = (p2[idx/8] >> (7 - (idx%8))) & 1;
+                uint16_t col;
+                if (!sec) col = TFT_RED;
+                else if (prim) col = TFT_WHITE;
+                else col = TFT_BLACK;
+                M5.Display.drawPixel(offX + px, offY + py, col);
+            }
+        }
+    }
+}
+
+void tt_preview_tristate(const uint8_t* tri, uint16_t w, uint16_t h, int screenY) {
+    int availW = 240, availH = 135 - screenY;
+    int pw, ph;
+    if ((int)w <= availW && (int)h <= availH) { pw = w; ph = h; }
+    else { float s = min((float)availW/w, (float)availH/h); pw = (int)(w*s); ph = (int)(h*s); }
+    if (pw > availW) pw = availW; if (ph > availH) ph = availH;
+    int offX = (240 - pw) / 2, offY = screenY + (availH - ph) / 2;
+    M5.Display.drawRect(offX-1, offY-1, pw+2, ph+2, TFT_DARKGREY);
+    for (int py = 0; py < ph; py++) {
+        for (int px = 0; px < pw; px++) {
+            int sx = px*w/pw, sy = py*h/ph;
+            if (sx < w && sy < h) {
+                uint8_t v = tri[sy*w+sx];
+                M5.Display.drawPixel(offX+px, offY+py, v==1 ? TFT_WHITE : v==2 ? TFT_RED : TFT_BLACK);
+            }
+        }
+    }
+}
+
+void tt_tristate_to_planes(const uint8_t* tri, size_t count, uint8_t* primary, uint8_t* secondary) {
+    for (size_t i = 0; i < count; i++) {
+        primary[i] = (tri[i] == 1) ? 1 : 0;
+        secondary[i] = (tri[i] == 2) ? 0 : 1;
+    }
+}
+
+// ---------- TX task + progress UI ----------
+
+struct TtTxJob {
+    uint8_t  frame_data[TT_MAX_FRAME_SIZE];
+    size_t   frame_len;
+    uint16_t repeats;
+    uint8_t  gap_delay;
+};
+
+TtTxJob    tt_current_job;
+TtFrameSeq tt_current_seq;
+volatile int tt_tx_progress = 0;
+volatile int tt_tx_total = 0;
+
+// TX runs inline on main core to avoid SPI conflicts with display
+
+void tt_draw_tx_screen(const char* title, int spinIdx, unsigned long elapsed) {
+    const char* spinner = "|/-\\";
+    M5.Display.clear();
+    M5.Display.setTextFont(1);
+
+    M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(5, 3);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.print(title);
+
+    M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_GREEN);
+    M5.Display.setCursor(10, 30);
+    M5.Display.printf("%c  IR LED active", spinner[spinIdx % 4]);
+
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.setCursor(10, 50);
+    M5.Display.printf("Mode: %s", tt_use_pp16 ? "PP16" : "PP4");
+    M5.Display.setCursor(10, 65);
+    M5.Display.printf("Time: %lus", elapsed);
+
+    if (tt_tx_total > 0) {
+        int pct = ((tt_tx_progress + 1) * 100) / tt_tx_total;
+        M5.Display.setCursor(10, 80);
+        M5.Display.printf("Frame %d/%d  %d%%", tt_tx_progress + 1, tt_tx_total, pct);
+        int barX = 10, barY = 98, barW = 180, barH = 10;
+        int filled = ((tt_tx_progress + 1) * barW) / tt_tx_total;
+        M5.Display.drawRect(barX, barY, barW, barH, TFT_WHITE);
+        if (filled > 2) M5.Display.fillRect(barX + 1, barY + 1, filled - 2, barH - 2, TFT_GREEN);
+    } else {
+        M5.Display.setCursor(10, 80);
+        M5.Display.print("Repeats: continuous");
+    }
+
+    M5.Display.setCursor(10, 122);
+    M5.Display.setTextColor(TFT_ORANGE);
+    M5.Display.print("[BACK] Stop");
+    M5.Display.display();
+}
+
+void tt_transmit_single_inline(const char* title) {
+    tt_ir_init();
+    tt_ir_stop_requested = false;
+    unsigned long startTime = millis();
+    int spinIdx = 0;
+    uint16_t reps = tt_current_job.repeats;
+
+    tt_draw_tx_screen(title, 0, 0);
+
+    for (uint32_t rep = 0; rep <= reps; rep++) {
+        if (tt_ir_stop_requested) break;
+
+        portDISABLE_INTERRUPTS();
+        tt_send_frame_pp4(tt_current_job.frame_data, tt_current_job.frame_len);
+        portENABLE_INTERRUPTS();
+
+        if (rep % 5 == 0) {
+            spinIdx++;
+            tt_draw_tx_screen(title, spinIdx, (millis() - startTime) / 1000);
+            cardUpdate();
+            if (kp(KEY_BACKSPACE)) { tt_ir_stop_requested = true; break; }
+        }
+
+        uint32_t delay_us = (uint32_t)tt_current_job.gap_delay * 500;
+        if (delay_us >= 1000) delay(delay_us / 1000);
+        else delayMicroseconds(delay_us);
+    }
+
+    tt_carrier_off();
+    tt_ir_deinit();
+}
+
+void tt_transmit_sequence_inline(const char* title) {
+    tt_ir_init();
+    tt_ir_stop_requested = false;
+    tt_tx_total = (int)tt_current_seq.count;
+    unsigned long startTime = millis();
+    int spinIdx = 0;
+
+    tt_draw_tx_screen(title, 0, 0);
+
+    for (size_t i = 0; i < tt_current_seq.count; i++) {
+        if (tt_ir_stop_requested) break;
+        tt_tx_progress = (int)i;
+
+        spinIdx++;
+        tt_draw_tx_screen(title, spinIdx, (millis() - startTime) / 1000);
+        cardUpdate();
+        if (kp(KEY_BACKSPACE)) { tt_ir_stop_requested = true; break; }
+
+        tt_ir_transmit_ex(tt_current_seq.frames[i], tt_current_seq.lengths[i],
+                       tt_current_seq.repeats[i], 2, tt_use_pp16);
+    }
+
+    tt_carrier_off();
+    tt_ir_deinit();
+    tt_free_frame_seq(&tt_current_seq);
+}
+
+// Stream image directly — encode once then transmit one frame at a time,
+// reusing a single 96-byte buffer. This avoids allocating 750*96=72KB for
+// the full TtFrameSeq, critical on Cardputer ADV which has no PSRAM.
+bool tt_stream_image(const uint8_t* plid, const uint8_t* pixels,
+    uint16_t w, uint16_t h, uint8_t page, uint16_t wake_reps,
+    bool color_clear, uint8_t comp, const char* title) {
+    size_t pixel_count = (size_t)w * h;
+    TtImagePayload payload;
+    bool zeroAlloc = false;
+
+    // Try normal encode first
+    if (!tt_encode_image_payload(pixels, w, h, color_clear, comp, &payload)) {
+        // OOM — zero-alloc streaming from pre-packed buffer
+        if (pixels[0] != 0xFE) return false;
+        size_t packed_bytes = (pixel_count + 7) / 8;
+        // Dual-plane: primary from buffer, secondary = all 0xFF (generated per-frame)
+        size_t total_bytes = color_clear ? (packed_bytes * 2) : packed_bytes;
+        // Align to frame boundary
+        size_t padding_bits = (TT_DATA_BITS_PER_FRAME - ((total_bytes * 8) % TT_DATA_BITS_PER_FRAME)) % TT_DATA_BITS_PER_FRAME;
+        total_bytes = (total_bytes * 8 + padding_bits) / 8;
+        payload.data = NULL; // marker: generate on-the-fly
+        payload.byte_count = total_bytes;
+        payload.comp_type = 0;
+        zeroAlloc = true;
+        Serial.printf("[TT] Zero-alloc stream %s %d bytes\n", color_clear ? "BWR" : "BW", (int)total_bytes);
+    }
+
+    size_t frame_count = payload.byte_count / TT_DATA_BYTES_PER_FRAME;
+    size_t total = 2 + frame_count + 1;
+    size_t packed_bytes_za = (pixel_count + 7) / 8;
+
+    tt_ir_init();
+    tt_ir_stop_requested = false;
+    tt_tx_total = (int)total;
+    unsigned long startTime = millis();
+    uint8_t fbuf[TT_MAX_FRAME_SIZE];
+    int spinIdx = 0;
+    tt_draw_tx_screen(title, 0, 0);
+
+    // 1: Ping (wake tag)
+    tt_tx_progress = 0;
+    size_t flen = tt_make_ping_frame(fbuf, plid);
+    tt_ir_transmit_ex(fbuf, flen, wake_reps, 2, tt_use_pp16);
+
+    // 2: Image parameter frame (same as dev: 15 repeats, gap_delay=1, 50ms settle)
+    tt_tx_progress = 1;
+    spinIdx++; tt_draw_tx_screen(title, spinIdx, (millis()-startTime)/1000);
+    flen = tt_make_image_param_frame(fbuf, plid, (uint16_t)payload.byte_count,
+        payload.comp_type, page, w, h, 0, 0);
+    tt_ir_transmit_ex(fbuf, flen, 15, 1, tt_use_pp16);
+    delay(50);
+
+    // 3: Data frames (same as dev: transmit FIRST, then display update, gap_delay=1)
+    for (size_t fi = 0; fi < frame_count; fi++) {
+
+        if (zeroAlloc) {
+            // Generate 20-byte chunk on-the-fly from pixels buffer
+            uint8_t chunk[TT_DATA_BYTES_PER_FRAME];
+            size_t byteOff = fi * TT_DATA_BYTES_PER_FRAME;
+            for (int b = 0; b < TT_DATA_BYTES_PER_FRAME; b++) {
+                size_t pos = byteOff + b;
+                if (pos < packed_bytes_za) {
+                    chunk[b] = pixels[1 + pos]; // primary from buffer
+                } else if (color_clear && pos < packed_bytes_za * 2) {
+                    chunk[b] = 0xFF; // secondary = all white (color clear)
+                } else {
+                    chunk[b] = 0x00; // padding
+                }
+            }
+            flen = tt_make_image_data_frame(fbuf, plid, (uint16_t)fi, chunk);
+        } else {
+            flen = tt_make_image_data_frame(fbuf, plid, (uint16_t)fi,
+                &payload.data[fi * TT_DATA_BYTES_PER_FRAME]);
+        }
+        tt_ir_transmit_ex(fbuf, flen, tt_data_repeats, 1, tt_use_pp16);
+        // Display update AFTER transmit (same as dev)
+        cardUpdate();
+        if (kp(KEY_BACKSPACE)) { tt_ir_stop_requested = true; break; }
+        tt_tx_progress = 2 + (int)fi;
+        spinIdx++; tt_draw_tx_screen(title, spinIdx, (millis()-startTime)/1000);
+    }
+
+    // 4: Refresh frame
+    if (!tt_ir_stop_requested) {
+        tt_tx_progress = (int)total - 1;
+        tt_draw_tx_screen(title, spinIdx+1, (millis()-startTime)/1000);
+        flen = tt_make_refresh_frame(fbuf, plid);
+        tt_ir_transmit_ex(fbuf, flen, 20, 2, tt_use_pp16);
+    }
+
+    tt_carrier_off();
+    tt_ir_deinit();
+    if (!zeroAlloc) tt_free_image_payload(&payload);
+    Serial.printf("[TT] stream TX done, %d frames, heap=%d\n", (int)total, ESP.getFreeHeap());
+    return true;
+}
+
+// ---------- Barcode input helper ----------
+
+void tt_draw_barcode_ui(const String& input) {
+    M5.Display.clear();
+    M5.Display.setTextFont(1);
+
+    M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(5, 3);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.print("ESL Barcode Input");
+
+    M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_LIGHTGREY);
+    M5.Display.setCursor(10, 25);
+    M5.Display.print("Enter 17-char barcode");
+
+    M5.Display.setCursor(10, 45);
+    M5.Display.setTextSize(2);
+    for (int i = 0; i < TT_BC_LEN; i++) {
+        if (i < (int)input.length()) {
+            M5.Display.setTextColor(i < 2 ? TFT_CYAN : TFT_GREEN);
+            M5.Display.print(input[i]);
+        } else if (i == (int)input.length()) {
+            M5.Display.setTextColor(TFT_WHITE);
+            M5.Display.print("_");
+        } else {
+            M5.Display.setTextColor(TFT_DARKGREY);
+            M5.Display.print("_");
+        }
+    }
+
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(10, 70);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.printf("(%d / %d)", input.length(), TT_BC_LEN);
+    if (input.length() < 2) {
+        M5.Display.setTextColor(TFT_YELLOW);
+        M5.Display.print("  prefix (letters ok)");
+    } else {
+        M5.Display.setTextColor(TFT_LIGHTGREY);
+        M5.Display.print("  digits only");
+    }
+
+    if (tt_last_barcode.length() == TT_BC_LEN) {
+        M5.Display.setCursor(10, 85);
+        M5.Display.setTextColor(TFT_DARKGREY);
+        M5.Display.printf("Last: %s", tt_last_barcode.c_str());
+        M5.Display.setCursor(10, 98);
+        M5.Display.setTextColor(TFT_CYAN);
+        M5.Display.print("ENTER=reuse  S=save tag");
+    } else if (input.length() == TT_BC_LEN) {
+        M5.Display.setCursor(10, 98);
+        M5.Display.setTextColor(TFT_CYAN);
+        M5.Display.print("ENTER=go  S=save tag");
+    }
+
+    M5.Display.setCursor(10, 122);
+    M5.Display.setTextColor(TFT_ORANGE);
+    M5.Display.print("[BACK] Cancel");
+    M5.Display.display();
+}
+
+String tt_get_barcode() {
+    enterDebounce();
+    String input = "";
+    tt_draw_barcode_ui(input);
+
+    while (true) {
+        cardUpdate();
+
+        if (kp(KEY_BACKSPACE)) {
+            if (input.length() > 0) {
+                input.remove(input.length() - 1);
+                tt_draw_barcode_ui(input);
+            } else {
+                backDebounce();
+                return "";
+            }
+            delay(150);
+            continue;
+        }
+
+        if (input.length() >= 2 && (kp('s') || kp('S'))) {
+            String bc = (input.length() == TT_BC_LEN) ? input :
+                        (tt_last_barcode.length() == TT_BC_LEN ? tt_last_barcode : "");
+            if (bc.length() == TT_BC_LEN) {
+                delay(150);
+                TtTagProfile prof;
+                tt_barcode_to_profile(bc.c_str(), &prof);
+                String defName = prof.model_name ? String(prof.model_name) : "";
+                String name = tt_get_text_input("Tag name", true);
+                if (name.length() == 0) name = defName.length() > 0 ? defName : bc;
+                if (tt_target_add(bc.c_str(), name.c_str()))
+                    tt_show_success("Tag saved!");
+                else
+                    tt_show_error("Max tags reached");
+                tt_draw_barcode_ui(input);
+            }
+            delay(150);
+            continue;
+        }
+
+        if (kp(KEY_ENTER) || kp('\n')) {
+            if (input.length() == 0 && tt_last_barcode.length() == TT_BC_LEN) {
+                while (kp(KEY_ENTER) || kp('\n')) { cardUpdate(); delay(10); }
+                return tt_last_barcode;
+            }
+            if (input.length() == TT_BC_LEN) {
+                tt_last_barcode = input;
+                while (kp(KEY_ENTER) || kp('\n')) { cardUpdate(); delay(10); }
+                return input;
+            }
+            delay(150);
+            continue;
+        }
+
+        bool keyHandled = false;
+        if (input.length() < 2) {
+            for (char c = 'A'; c <= 'Z'; c++) {
+                if (kp(c) || kp(c + 32)) {
+                    input += c;
+                    tt_draw_barcode_ui(input);
+                    delay(150);
+                    keyHandled = true;
+                    break;
+                }
+            }
+        }
+        if (!keyHandled) {
+            for (char c = '0'; c <= '9'; c++) {
+                if (kp(c) && input.length() < TT_BC_LEN) {
+                    input += c;
+                    tt_draw_barcode_ui(input);
+                    delay(150);
+                    break;
+                }
+            }
+        }
+        delay(30);
+    }
+    return "";
+}
+
+// ---------- TagTinker UI helpers ----------
+
+void tt_show_msg(const char* title, const char* msg, uint16_t barColor, uint16_t textColor) {
+    M5.Display.clear();
+    M5.Display.setTextFont(1);
+    M5.Display.fillRect(0, 0, 240, 18, barColor);
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(5, 3);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.print(title);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(10, 50);
+    M5.Display.setTextColor(textColor);
+    M5.Display.print(msg);
+    M5.Display.setCursor(10, 122);
+    M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_DARKGREY);
+    M5.Display.print("[BACK] OK");
+    M5.Display.display();
+    delay(200);
+    while (true) {
+        cardUpdate();
+        if (kp(KEY_BACKSPACE) || kp(KEY_ENTER) || kp('\n')) break;
+        delay(50);
+    }
+    delay(150);
+}
+
+void tt_show_error(const char* msg) { tt_show_msg("Error", msg, 0x8000, TFT_ORANGE); }
+void tt_show_success(const char* msg) { tt_show_msg("Success", msg, 0x03E0, TFT_GREEN); }
+
+void tt_draw_text_input(const char* title, const String& input, int cursorPos) {
+    M5.Display.clear();
+    M5.Display.setTextFont(1);
+    M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(5, 3);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.print(title);
+
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(5, 30);
+    M5.Display.setTextColor(TFT_GREEN);
+    String visible = input;
+    if (visible.length() > 13) visible = visible.substring(visible.length() - 13);
+    M5.Display.print(visible);
+    if ((millis() / 400) % 2 == 0) {
+        M5.Display.setTextColor(TFT_WHITE);
+        M5.Display.print("_");
+    }
+
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(5, 55);
+    M5.Display.setTextColor(TFT_LIGHTGREY);
+    M5.Display.printf("%d chars", input.length());
+
+    M5.Display.setCursor(5, 110);
+    M5.Display.setTextColor(TFT_CYAN);
+    M5.Display.print("ENTER=OK");
+    M5.Display.setCursor(120, 110);
+    M5.Display.setTextColor(TFT_ORANGE);
+    M5.Display.print("BACK=Cancel");
+    M5.Display.display();
+}
+
+String tt_get_text_input(const char* title, bool allowEmpty) {
+    enterDebounce();
+    backDebounce();
+    delay(50);
+    String input = "";
+    tt_draw_text_input(title, input, 0);
+
+    while (true) {
+        cardUpdate();
+
+        if (kp(KEY_BACKSPACE)) {
+            if (input.length() > 0) {
+                input.remove(input.length() - 1);
+            } else {
+                delay(150);
+                return "";
+            }
+            tt_draw_text_input(title, input, 0);
+            delay(150);
+            continue;
+        }
+
+        if (kp(KEY_ENTER) || kp('\n')) {
+            if (allowEmpty || input.length() > 0) {
+                enterDebounce();
+                return input;
+            }
+            delay(150);
+            continue;
+        }
+
+        bool typed = false;
+        for (char c = 32; c <= 126; c++) {
+            if (c == '\n' || c == '\r' || c == KEY_BACKSPACE) continue;
+            if (kp(c) && input.length() < 512) {
+                input += c;
+                typed = true;
+                break;
+            }
+        }
+        if (typed) {
+            tt_draw_text_input(title, input, 0);
+            delay(120);
+        }
+        delay(30);
+    }
+    return "";
+}
+
+// ---------- TagTinker unified menu system ----------
+
+int tt_dir = 1;
+
+struct TtMenuItem {
+    std::function<String()> label;
+    std::function<void()>   action;
+    bool isAction;
+};
+
+TtMenuItem ttItem(std::function<String()> l, std::function<void()> a, bool act) {
+    return {l, a, act};
+}
+
+#define TT_MENU_VISIBLE 8
+#define TT_MENU_ROW_H   14
+#define TT_MENU_TOP_Y   20
+
+void tt_menu_draw(std::vector<TtMenuItem>& items, const char* title, int sel, int scroll) {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextFont(1);
+    M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(5, 3);
+    M5.Display.setTextColor(TFT_GREEN);
+    M5.Display.print(title);
+
+    int y = TT_MENU_TOP_Y;
+    for (int i = scroll; i < (int)items.size() && i < scroll + TT_MENU_VISIBLE; i++) {
+        bool isSel = (i == sel);
+        if (isSel) {
+            M5.Display.fillRect(0, y, 236, TT_MENU_ROW_H, TFT_NAVY);
+            M5.Display.setTextColor(TFT_GREEN);
+        } else {
+            M5.Display.setTextColor(TFT_WHITE);
+        }
+        M5.Display.setTextSize(1.5);
+        M5.Display.setCursor(isSel ? 8 : 5, y + 2);
+        M5.Display.print(items[i].label());
+        y += TT_MENU_ROW_H;
+    }
+
+    if ((int)items.size() > TT_MENU_VISIBLE) {
+        int total = (int)items.size() - TT_MENU_VISIBLE;
+        int barArea = TT_MENU_VISIBLE * TT_MENU_ROW_H;
+        int barH = barArea * TT_MENU_VISIBLE / (int)items.size();
+        if (barH < 8) barH = 8;
+        int barY = TT_MENU_TOP_Y + (total > 0 ? (barArea - barH) * scroll / total : 0);
+        M5.Display.fillRect(237, barY, 3, barH, TFT_DARKGREY);
+    }
+    M5.Display.display();
+}
+
+void tt_menu(std::vector<TtMenuItem>& items, const char* title) {
+    enterDebounce();
+    backDebounce();
+    delay(30);
+    int sel = 0;
+    int scroll = 0;
+    tt_menu_draw(items, title, sel, scroll);
+
+    while (true) {
+        cardUpdate();
+        bool changed = false;
+
+        if (kp(KEY_BACKSPACE)) {
+            while (kp(KEY_BACKSPACE)) { cardUpdate(); delay(10); }
+            return;
+        }
+
+        if (kp(KEY_ENTER) || kp('\n')) {
+            while (kp(KEY_ENTER) || kp('\n')) { cardUpdate(); delay(10); }
+            tt_dir = 1;
+            if (sel >= 0 && sel < (int)items.size()) {
+                items[sel].action();
+                changed = true;
+            }
+        }
+        else if (kp(';')) {
+            sel = (sel > 0) ? sel - 1 : (int)items.size() - 1;
+            if (sel < scroll) scroll = sel;
+            if (sel >= scroll + TT_MENU_VISIBLE) scroll = sel - TT_MENU_VISIBLE + 1;
+            changed = true; delay(110);
+        }
+        else if (kp('.')) {
+            sel = (sel < (int)items.size() - 1) ? sel + 1 : 0;
+            if (sel < scroll) scroll = sel;
+            if (sel >= scroll + TT_MENU_VISIBLE) scroll = sel - TT_MENU_VISIBLE + 1;
+            changed = true; delay(110);
+        }
+        else if (kp(',') && sel >= 0 && sel < (int)items.size() && !items[sel].isAction) {
+            tt_dir = -1;
+            items[sel].action();
+            changed = true;
+            delay(110);
+        }
+        else if (kp('/') && sel >= 0 && sel < (int)items.size() && !items[sel].isAction) {
+            tt_dir = 1;
+            items[sel].action();
+            changed = true;
+            delay(110);
+        }
+
+        if (changed) tt_menu_draw(items, title, sel, scroll);
+        delay(15);
+    }
+}
+
+int tt_menu_select(std::vector<String>& labels, const char* title) {
+    enterDebounce();
+    backDebounce();
+    delay(30);
+    int result = -1;
+    std::vector<TtMenuItem> items;
+    for (int i = 0; i < (int)labels.size(); i++) {
+        items.push_back(ttItem([&labels, i](){ return labels[i]; }, [&result, i](){ result = i; }, true));
+    }
+    int sel = 0, scroll = 0;
+    tt_menu_draw(items, title, sel, scroll);
+
+    while (true) {
+        cardUpdate();
+        bool changed = false;
+        if (kp(KEY_BACKSPACE)) { while (kp(KEY_BACKSPACE)) { cardUpdate(); delay(10); } return -1; }
+        if (kp(KEY_ENTER) || kp('\n')) { while (kp(KEY_ENTER)||kp('\n')) { cardUpdate(); delay(10); } return sel; }
+        if (kp(';')) { sel = (sel > 0) ? sel - 1 : (int)items.size() - 1; if (sel < scroll) scroll = sel; if (sel >= scroll+TT_MENU_VISIBLE) scroll = sel-TT_MENU_VISIBLE+1; changed = true; delay(110); }
+        else if (kp('.')) { sel = (sel < (int)items.size()-1) ? sel + 1 : 0; if (sel < scroll) scroll = sel; if (sel >= scroll+TT_MENU_VISIBLE) scroll = sel-TT_MENU_VISIBLE+1; changed = true; delay(110); }
+        if (changed) tt_menu_draw(items, title, sel, scroll);
+        delay(15);
+    }
+    return -1;
+}
+
+// ---------- Text presets menu ----------
+
+void tt_presets_menu() {
+    tt_presets_load();
+    while (true) {
+        std::vector<String> labels;
+        for (uint8_t i = 0; i < tt_preset_count; i++)
+            labels.push_back(String(tt_presets[i].name));
+        labels.push_back("+ New Preset");
+        String title = "Presets (" + String(tt_preset_count) + ")";
+        int sel = tt_menu_select(labels, title.c_str());
+        if (sel < 0) return;
+
+        if (sel < tt_preset_count) {
+            std::vector<TtMenuItem> acts;
+            uint8_t idx = sel;
+            acts.push_back(ttItem([idx](){ return String("Text: ") + tt_presets[idx].text; }, [](){}, false));
+            acts.push_back({[](){ return String("Delete"); }, [&, idx](){
+                tt_preset_delete(idx);
+                tt_show_success("Deleted");
+            }, true});
+            tt_menu(acts, tt_presets[idx].name);
+        } else {
+            String name = tt_get_text_input("Preset name", false);
+            if (name.length() == 0) continue;
+            String text = tt_get_text_input("Preset text", false);
+            if (text.length() == 0) continue;
+            if (tt_preset_add(name.c_str(), text.c_str()))
+                tt_show_success("Preset saved!");
+            else
+                tt_show_error("Max presets");
+        }
+    }
+}
+
+String tt_choose_text() {
+    tt_presets_load();
+    if (tt_preset_count == 0)
+        return tt_get_text_input("Text for ESL", false);
+
+    std::vector<String> opts;
+    opts.push_back("New text...");
+    for (uint8_t i = 0; i < tt_preset_count; i++)
+        opts.push_back(String(tt_presets[i].name));
+    int sel = tt_menu_select(opts, "Choose Text");
+    if (sel < 0) return "";
+    if (sel == 0) return tt_get_text_input("Text for ESL", false);
+    return String(tt_presets[sel - 1].text);
+}
+
+// ---------- TagTinker menu handlers ----------
+
+void tt_do_transmit_single(const char* title) {
+    tt_tx_total = 0;
+    tt_transmit_single_inline(title);
+}
+
+bool tt_result_screen(const char* title) {
+    delay(100);
+    M5.Display.clear();
+    M5.Display.setTextFont(1);
+    M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(5, 3);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.print(title);
+
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(30, 45);
+    M5.Display.setTextColor(tt_ir_stop_requested ? TFT_ORANGE : TFT_GREEN);
+    M5.Display.println(tt_ir_stop_requested ? "Stopped" : "Complete!");
+
+    M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(10, 90);
+    M5.Display.setTextColor(TFT_CYAN);
+    M5.Display.print("[ENTER] Replay");
+    M5.Display.setCursor(10, 108);
+    M5.Display.setTextColor(TFT_ORANGE);
+    M5.Display.print("[BACK] Return");
+    M5.Display.display();
+
+    delay(300);
+    while (kp(KEY_ENTER) || kp(KEY_BACKSPACE) || kp('\n')) { cardUpdate(); delay(20); }
+
+    while (true) {
+        cardUpdate();
+        if (kp(KEY_ENTER) || kp('\n')) {
+            delay(200);
+            return true;
+        }
+        if (kp(KEY_BACKSPACE)) {
+            delay(200);
+            return false;
+        }
+        delay(30);
+    }
+    return false;
+}
+
+bool tt_send_tristate(const uint8_t* tri, uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    size_t pc = (size_t)w * h;
+    if (!hasColor) {
+        uint8_t* mono = (uint8_t*)malloc(pc);
+        if (!mono) return false;
+        for (size_t i = 0; i < pc; i++) mono[i] = (tri[i] == 1) ? 1 : 0;
+        memset(&tt_current_seq, 0, sizeof(tt_current_seq));
+        bool ok = tt_build_image_sequence(&tt_current_seq, plid, mono, w, h, tt_page, 0, 0, 80, true, tt_comp_mode);
+        free(mono);
+        if (!ok) return false;
+    } else {
+        uint8_t* pri = (uint8_t*)malloc(pc);
+        uint8_t* sec = (uint8_t*)malloc(pc);
+        if (!pri || !sec) { free(pri); free(sec); return false; }
+        tt_tristate_to_planes(tri, pc, pri, sec);
+        memset(&tt_current_seq, 0, sizeof(tt_current_seq));
+        bool ok = tt_build_image_sequence_planes(&tt_current_seq, plid, pri, sec, w, h, tt_page, 0, 0, 80, tt_comp_mode);
+        free(pri); free(sec);
+        if (!ok) return false;
+    }
+    tt_tx_progress = 0;
+    tt_transmit_sequence_inline("Sending");
+    tt_result_screen("Sent");
+    return true;
+}
+
+void tt_broadcast_page_flip() {
+    uint8_t page = 0;
+    uint16_t duration = 10;
+    bool forever = false;
+    uint16_t repeats = 100;
+    bool spam = false;
+
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ return "Page: " + String(page); }, [&](){ page = (page + tt_dir + 8) % 8; }, false));
+    cfg.push_back(ttItem([&](){ return "Duration: " + String(duration) + "s"; }, [&](){ duration = (tt_dir > 0) ? ((duration >= 60) ? 5 : duration + 5) : ((duration <= 5) ? 60 : duration - 5); }, false));
+    cfg.push_back(ttItem([&](){ return String("Forever: ") + (forever ? "ON" : "OFF"); }, [&](){ forever = !forever; }, false));
+    cfg.push_back(ttItem([&](){ return "Repeats: " + String(repeats); }, [&](){ if (tt_dir > 0) { if (repeats >= 500) repeats = 50; else repeats += 50; } else { if (repeats <= 50) repeats = 500; else repeats -= 50; } }, false));
+    cfg.push_back(ttItem([&](){ return String("Spam: ") + (spam ? "ON" : "OFF"); }, [&](){ spam = !spam; }, false));
+    cfg.push_back({[](){ return String(">> TRANSMIT <<"); }, [&]() {
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t len = tt_make_broadcast_page_frame(buf, page, forever, duration);
+        memcpy(tt_current_job.frame_data, buf, len);
+        tt_current_job.frame_len = len;
+        tt_current_job.gap_delay = 2;
+        tt_current_job.repeats = spam ? 0xFFFF : repeats;
+        while (true) {
+            tt_do_transmit_single(spam ? "BC Page (Spam)" : "BC Page Flip");
+            if (!tt_result_screen("Broadcast Page Flip")) break;
+        }
+    }, true});
+    tt_menu(cfg, "Broadcast Page Flip");
+}
+
+void tt_broadcast_led() {
+    const uint8_t bc_plid[4] = {0, 0, 0, 0};
+    tt_led_test_with_plid(bc_plid);
+}
+
+
+void tt_broadcast_debug() {
+    enterDebounce();
+    uint8_t buf[TT_MAX_FRAME_SIZE];
+    size_t len = tt_make_broadcast_debug_frame(buf);
+    memcpy(tt_current_job.frame_data, buf, len);
+    tt_current_job.frame_len = len;
+    tt_current_job.repeats = 200;
+    
+    tt_current_job.gap_delay = 2;
+
+    while (true) {
+        tt_do_transmit_single("BC Debug Screen");
+        if (!tt_result_screen("Broadcast Debug")) break;
+    }
+}
+
+void tt_ping_tag() {
+    String barcode = tt_get_barcode();
+    if (barcode.length() != TT_BC_LEN) return;
+
+    uint8_t plid[4];
+    if (!tt_barcode_to_plid(barcode.c_str(), plid)) {
+        tt_show_error("Invalid barcode");
+        return;
+    }
+
+    uint8_t buf[TT_MAX_FRAME_SIZE];
+    size_t len = tt_make_ping_frame(buf, plid);
+    memcpy(tt_current_job.frame_data, buf, len);
+    tt_current_job.frame_len = len;
+    tt_current_job.repeats = tt_wake_repeats_val;
+    
+    tt_current_job.gap_delay = 2;
+
+    while (true) {
+        tt_do_transmit_single("Ping Tag");
+        if (!tt_result_screen("Ping Tag")) break;
+    }
+}
+
+void tt_led_send(const uint8_t plid[4], uint8_t mode, uint16_t duration) {
+    uint8_t ping_buf[TT_MAX_FRAME_SIZE];
+    size_t ping_len = tt_make_ping_frame(ping_buf, plid);
+
+    uint8_t led_payload[6] = {0x06, mode, 0x00, 0x00,
+        (uint8_t)((duration >> 8) & 0xFF), (uint8_t)(duration & 0xFF)};
+    uint8_t led_buf[TT_MAX_FRAME_SIZE];
+    size_t led_len = tt_make_addressed_frame(led_buf, plid, led_payload, 6);
+
+    memcpy(tt_current_job.frame_data, ping_buf, ping_len);
+    tt_current_job.frame_len = ping_len;
+    tt_current_job.repeats = 160;
+    tt_current_job.gap_delay = 2;
+    tt_tx_total = 0;
+    tt_transmit_single_inline("Ping (wake)");
+
+    memcpy(tt_current_job.frame_data, led_buf, led_len);
+    tt_current_job.frame_len = led_len;
+    tt_current_job.repeats = 80;
+    tt_current_job.gap_delay = 2;
+    tt_transmit_single_inline("LED CMD");
+}
+
+void tt_led_test_with_plid(const uint8_t plid[4]) {
+    uint16_t ledDuration = 5;
+    bool highPower = true;
+    bool fastBlink = true;
+
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ return "Duration: " + String(ledDuration) + "s"; }, [&](){
+        if (tt_dir > 0) { if (ledDuration >= 300) ledDuration = 5;
+        else if (ledDuration >= 60) ledDuration += 60;
+        else ledDuration += 5; } else { if (ledDuration <= 5) ledDuration = 300; else if (ledDuration > 60) ledDuration -= 60; else ledDuration -= 5; }
+    }, false));
+    cfg.push_back(ttItem([&](){ return String("Power: ") + (highPower ? "HIGH" : "LOW"); }, [&](){ highPower = !highPower; }, false));
+    cfg.push_back(ttItem([&](){ return String("Blink: ") + (fastBlink ? "Fast" : "Slow"); }, [&](){ fastBlink = !fastBlink; }, false));
+    cfg.push_back({[](){ return String(">> LED ON <<"); }, [&](){
+        uint8_t mode = (fastBlink ? 0x49 : 0x41) | (highPower ? 0x80 : 0x00);
+        tt_led_send(plid, mode, ledDuration);
+        tt_result_screen("LED ON");
+    }, true});
+    cfg.push_back({[](){ return String(">> LED FOREVER <<"); }, [&](){
+        uint8_t mode = (fastBlink ? 0xC9 : 0xC1);
+        tt_led_send(plid, mode, 0);
+        tt_result_screen("LED FOREVER");
+    }, true});
+    cfg.push_back({[](){ return String(">> LED OFF <<"); }, [&](){
+        tt_led_send(plid, 0x49, 1);
+        tt_result_screen("LED OFF (1s)");
+    }, true});
+    tt_menu(cfg, "LED Test");
+}
+
+void tt_led_test() {
+    String barcode = tt_get_barcode();
+    if (barcode.length() != TT_BC_LEN) return;
+    uint8_t plid[4];
+    if (!tt_barcode_to_plid(barcode.c_str(), plid)) {
+        tt_show_error("Invalid barcode");
+        return;
+    }
+    tt_led_test_with_plid(plid);
+}
+
+void tt_push_text() {
+    String barcode = tt_get_barcode();
+    if (barcode.length() != TT_BC_LEN) return;
+
+    uint8_t plid[4];
+    if (!tt_barcode_to_plid(barcode.c_str(), plid)) {
+        tt_show_error("Invalid barcode");
+        return;
+    }
+
+    TtTagProfile profile;
+    tt_barcode_to_profile(barcode.c_str(), &profile);
+
+    uint16_t w = profile.known ? profile.width : 296;
+    uint16_t h = profile.known ? profile.height : 128;
+
+    if (w == 0 || h == 0) {
+        tt_show_error("Segment tag - no gfx");
+        return;
+    }
+
+    bool hasColor = profile.known && profile.color != TT_COLOR_MONO;
+    uint8_t txtFg = 1;
+    uint8_t txtBg = 0;
+
+    if (tt_text_size < 1) tt_text_size = 1;
+    if (w >= 600) tt_text_size = 4;
+    else if (w >= 296) tt_text_size = 3;
+    else if (w >= 200) tt_text_size = 2;
+    else tt_text_size = 1;
+
+    String text = tt_choose_text();
+    if (text.length() == 0) return;
+
+    size_t pc = (size_t)w * h;
+    std::vector<TtMenuItem> cfg;
+    int textLen = text.length();
+    cfg.push_back(ttItem([&](){ return String(profile.model_name ? profile.model_name : "?") + " " + w + "x" + h; }, [](){}, false));
+    cfg.push_back(ttItem([&](){
+        int cw = 6 * tt_text_size, ch = 8 * tt_text_size;
+        int maxCh = ((w - 4) / cw) * ((h - 4) / ch);
+        if (textLen > maxCh) return "Size: " + String(tt_text_size) + " OVERFLOW! max " + maxCh;
+        return "Size: " + String(tt_text_size) + " (" + textLen + "/" + maxCh + ")";
+    }, [](){ tt_text_size = (tt_dir > 0) ? ((tt_text_size >= 10) ? 1 : tt_text_size + 1) : ((tt_text_size <= 1) ? 10 : tt_text_size - 1); }, false));
+    cfg.push_back(ttItem([](){ return String("Font: ") + tt_font_names[tt_font_idx]; }, [](){ tt_font_idx = (tt_font_idx + tt_dir + TT_FONT_COUNT) % TT_FONT_COUNT; }, false));
+    cfg.push_back(ttItem([](){ return "Page: " + String(tt_page); }, [](){ tt_page = (tt_page + tt_dir + 8) % 8; }, false));
+    cfg.push_back(ttItem([](){ return "Offset X: " + String(tt_pos_x); }, [&](){ tt_pos_x = (tt_dir > 0) ? ((tt_pos_x + 5 > w) ? 0 : tt_pos_x + 5) : ((tt_pos_x < 5) ? 0 : tt_pos_x - 5); }, false));
+    cfg.push_back(ttItem([](){ return "Offset Y: " + String(tt_pos_y); }, [&](){ tt_pos_y = (tt_dir > 0) ? ((tt_pos_y + 5 > h) ? 0 : tt_pos_y + 5) : ((tt_pos_y < 5) ? 0 : tt_pos_y - 5); }, false));
+    if (hasColor) {
+        const char* fgN[] = {"White", "Black", "Red"};
+        const char* bgN[] = {"White", "Black", "Red"};
+        cfg.push_back(ttItem([&](){ return String("Text: ") + fgN[txtFg]; }, [&](){ txtFg = (txtFg + tt_dir + 3) % 3; }, false));
+        cfg.push_back(ttItem([&](){ return String("BG: ") + bgN[txtBg]; }, [&](){ txtBg = (txtBg + tt_dir + 3) % 3; }, false));
+    } else {
+        cfg.push_back(ttItem([](){ return String("Invert: ") + (tt_invert ? "ON" : "OFF"); }, [](){ tt_invert = !tt_invert; }, false));
+    }
+    cfg.push_back(ttItem([](){ return String("Compress: ") + (tt_comp_mode == TT_COMP_AUTO ? "Auto" : tt_comp_mode == TT_COMP_RAW ? "Raw" : "RLE"); }, [](){ tt_comp_mode = (tt_comp_mode + tt_dir + 3) % 3; }, false));
+    cfg.push_back({[](){ return String("Preview"); }, [&](){
+        uint8_t* txt = tt_render_text(text.c_str(), w, h, tt_text_size, false, tt_pos_x, tt_pos_y);
+        if (!txt) return;
+        uint8_t* pri = (uint8_t*)calloc(pc, 1);
+        uint8_t* col = (uint8_t*)malloc(pc);
+        if (!pri || !col) { free(txt); free(pri); free(col); return; }
+        memset(col, 1, pc);
+        for (size_t i = 0; i < pc; i++) {
+            bool lit = (txt[0] == 0xFE) ? ((txt[1 + i/8] >> (7 - (i%8))) & 1) : (txt[i] != 0);
+            uint8_t fg = lit ? txtFg : txtBg;
+            pri[i] = (fg == 0) ? 1 : 0;
+            if (hasColor) col[i] = (fg == 2) ? 0 : 1;
+        }
+        M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+        M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+        M5.Display.setTextSize(1.5); M5.Display.setCursor(5, 3);
+        M5.Display.setTextColor(TFT_GREEN);
+        M5.Display.printf("%ux%u sz%d", w, h, tt_text_size);
+        if (hasColor) tt_preview_color(pri, col, w, h, 20);
+        else tt_preview_pixels(pri, w, h, 20);
+        M5.Display.display(); free(txt); free(pri); free(col);
+        delay(200); while (true) { cardUpdate(); if (kp(KEY_BACKSPACE)||kp(KEY_ENTER)) break; delay(50); } delay(150);
+    }, true});
+    cfg.push_back({[](){ return String(">> SEND <<"); }, [&](){
+        uint8_t* txt = tt_render_text(text.c_str(), w, h, tt_text_size, false, tt_pos_x, tt_pos_y);
+        if (!txt) { tt_show_error("Memory"); return; }
+        if (!hasColor) {
+            // Simple mono path: stream directly from packed/raw buffer
+            bool ok = tt_stream_image(plid, txt, w, h, tt_page, tt_wake_repeats_val, false, tt_comp_mode, "Push Text");
+            free(txt);
+            if (!ok) { tt_show_error("Encode err"); return; }
+        } else {
+            // Color path: expand to two planes first
+            uint8_t* pri = (uint8_t*)calloc(pc, 1);
+            uint8_t* col = (uint8_t*)malloc(pc);
+            if (!pri || !col) { free(txt); free(pri); free(col); tt_show_error("Memory"); return; }
+            memset(col, 1, pc);
+            for (size_t i = 0; i < pc; i++) {
+                bool lit = (txt[0] == 0xFE) ? ((txt[1 + i/8] >> (7 - (i%8))) & 1) : (txt[i] != 0);
+                uint8_t fg = lit ? txtFg : txtBg;
+                pri[i] = (fg == 0) ? 1 : 0;
+                col[i] = (fg == 2) ? 0 : 1;
+            }
+            free(txt);
+            memset(&tt_current_seq, 0, sizeof(tt_current_seq));
+            bool ok = tt_build_image_sequence_planes(&tt_current_seq, plid, pri, col, w, h, tt_page, 0, 0, tt_wake_repeats_val, tt_comp_mode);
+            free(pri); free(col);
+            if (!ok) { tt_show_error("Encode err"); return; }
+            tt_tx_progress = 0;
+            tt_transmit_sequence_inline("Push Text");
+        }
+        tt_result_screen("Push Text");
+    }, true});
+    tt_menu(cfg, "Push Text Config");
+}
+
+void tt_show_tag_info() {
+    String barcode = tt_get_barcode();
+    if (barcode.length() != TT_BC_LEN) return;
+
+    uint8_t plid[4];
+    tt_barcode_to_plid(barcode.c_str(), plid);
+
+    TtTagProfile profile;
+    tt_barcode_to_profile(barcode.c_str(), &profile);
+
+    bool validCS = tt_is_barcode_valid(barcode.c_str());
+    char plidStr[18];
+    snprintf(plidStr, sizeof(plidStr), "%02X:%02X:%02X:%02X", plid[0], plid[1], plid[2], plid[3]);
+
+    std::vector<TtMenuItem> info;
+    info.push_back(ttItem([&](){ return "BC: " + barcode; }, [](){}, false));
+    info.push_back(ttItem([plidStr](){ return String("PLID: ") + plidStr; }, [](){}, false));
+    info.push_back(ttItem([&](){ return "Type: " + String(profile.type_code); }, [](){}, false));
+    info.push_back(ttItem([validCS](){ return String("Checksum: ") + (validCS ? "Valid" : "INVALID"); }, [](){}, false));
+    {
+        int prodLine = (barcode[2]-'0')*10 + (barcode[3]-'0');
+        int prodDate = (barcode[4]-'0')*100 + (barcode[5]-'0')*10 + (barcode[6]-'0');
+        int yr = 2000 + prodDate/100, wk = prodDate%100;
+        char meta[48]; snprintf(meta, sizeof(meta), "Prod: F%02d %dw%02d Serial:%s", prodLine, yr, wk, barcode.substring(7,12).c_str());
+        info.push_back(ttItem([meta](){ return String(meta); }, [](){}, false));
+    }
+
+    if (profile.known) {
+        if (profile.model_name)
+            info.push_back(ttItem([&](){ return String("Model: ") + profile.model_name; }, [](){}, false));
+
+        info.push_back(ttItem([&](){ return "Display: " + String(profile.width) + "x" + String(profile.height); }, [](){}, false));
+
+        info.push_back(ttItem([&](){ return String("Kind: ") + (profile.kind == TT_KIND_DOTMATRIX ? "Dot Matrix" : "Segment"); }, [](){}, false));
+
+        const char* colStr = profile.color == TT_COLOR_RED ? "Red" : profile.color == TT_COLOR_YELLOW ? "Yellow" : "Mono";
+        info.push_back(ttItem([colStr](){ return String("Color: ") + colStr; }, [](){}, false));
+
+        info.push_back(ttItem([&](){ return "Pages: 0-7"; }, [](){}, false));
+
+        info.push_back(ttItem([&](){ return "PL Bit: " + String(profile.pl_bit_def); }, [](){}, false));
+
+        size_t pixels = (size_t)profile.width * profile.height;
+        size_t rawBytes = (pixels + 7) / 8;
+        size_t frames = (rawBytes + 19) / 20;
+        info.push_back(ttItem([pixels](){ return "Pixels: " + String((uint32_t)pixels); }, [](){}, false));
+        info.push_back(ttItem([rawBytes](){ return "Raw size: " + String((uint32_t)rawBytes) + " B"; }, [](){}, false));
+        info.push_back(ttItem([frames](){ return "Frames: " + String((uint32_t)frames) + " (+ ping/param/refresh)"; }, [](){}, false));
+
+        String compRec = (pixels > 5000) ? "RLE recommended" : "Raw OK";
+        info.push_back(ttItem([compRec](){ return "Compress: " + compRec; }, [](){}, false));
+
+        info.push_back({[](){ return String(">> Save Tag <<"); }, [&](){
+            String name = tt_get_text_input("Tag name", true);
+            if (name.length() == 0 && profile.model_name) name = String(profile.model_name);
+            if (name.length() == 0) name = barcode;
+            if (tt_target_add(barcode.c_str(), name.c_str()))
+                tt_show_success("Tag saved!");
+            else
+                tt_show_error("Max tags reached");
+        }, true});
+    } else {
+        info.push_back(ttItem([](){ return String("Unknown tag type"); }, [](){}, false));
+    }
+
+    tt_menu(info, "Tag Info");
+}
+
+void tt_push_image() {
+    String barcode = tt_get_barcode();
+    if (barcode.length() != TT_BC_LEN) return;
+
+    uint8_t plid[4];
+    if (!tt_barcode_to_plid(barcode.c_str(), plid)) {
+        tt_show_error("Invalid barcode");
+        return;
+    }
+
+    TtTagProfile profile;
+    tt_barcode_to_profile(barcode.c_str(), &profile);
+    uint16_t w = profile.known ? profile.width : 296;
+    uint16_t h = profile.known ? profile.height : 128;
+    if (w == 0 || h == 0) { tt_show_error("Segment tag - no gfx"); return; }
+
+    std::vector<String> bmpFiles;
+    M5.Display.clear();
+    M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+    M5.Display.setTextSize(1.5); M5.Display.setTextFont(1);
+    M5.Display.setCursor(5, 3); M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.print("Scanning SD for BMP...");
+    M5.Display.display();
+
+    {
+        File dir = SD.open("/evil/esl");
+        if (dir && dir.isDirectory()) {
+            File f = dir.openNextFile();
+            while (f) {
+                String fname = f.name();
+                if (!f.isDirectory() && (fname.endsWith(".bmp") || fname.endsWith(".BMP"))) {
+                    if (fname.startsWith("/")) bmpFiles.push_back(fname);
+                    else bmpFiles.push_back(String("/evil/esl/") + fname);
+                }
+                f.close();
+                if (bmpFiles.size() >= 100) break;
+                f = dir.openNextFile();
+            }
+            dir.close();
+        }
+    }
+
+    if (bmpFiles.size() == 0) {
+        tt_show_error("No BMP on SD");
+        return;
+    }
+
+    std::vector<String> bmpLabels;
+    for (size_t i = 0; i < bmpFiles.size(); i++) {
+        String sn = bmpFiles[i]; if (sn.startsWith("/evil/esl/")) sn = sn.substring(10); if (sn.endsWith(".bmp") || sn.endsWith(".BMP")) sn = sn.substring(0, sn.length() - 4);
+        if (sn.length() > 28) sn = "..." + sn.substring(sn.length() - 25);
+        bmpLabels.push_back(sn);
+    }
+    int selectedIdx = tt_menu_select(bmpLabels, "Select BMP");
+    if (selectedIdx < 0) return;
+
+    String filePath = bmpFiles[selectedIdx];
+
+    M5.Display.clear();
+    M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+    M5.Display.setTextSize(1.5); M5.Display.setTextFont(1);
+    M5.Display.setCursor(5, 3); M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.print("Loading BMP...");
+    M5.Display.display();
+
+    File bmpFile = SD.open(filePath);
+    if (!bmpFile) { tt_show_error("Can't open file"); return; }
+
+    uint8_t header[54];
+    if (bmpFile.read(header, 54) != 54 || header[0] != 'B' || header[1] != 'M') {
+        bmpFile.close();
+        tt_show_error("Invalid BMP");
+        return;
+    }
+
+    int32_t bmpW = *(int32_t*)&header[18];
+    int32_t bmpH = *(int32_t*)&header[22];
+    uint16_t bmpBpp = *(uint16_t*)&header[28];
+    uint32_t dataOffset = *(uint32_t*)&header[10];
+    bool bottomUp = (bmpH > 0);
+    if (bmpH < 0) bmpH = -bmpH;
+
+    bool hasColor = profile.known && profile.color != TT_COLOR_MONO;
+    bool dualPlane = hasColor && bmpBpp == 24;
+
+    size_t pixelCount = (size_t)w * h;
+    size_t packedSize = (pixelCount + 7) / 8;
+    size_t bufSize = dualPlane ? (1 + 2 * packedSize) : (1 + packedSize);
+    uint8_t* pixels = (uint8_t*)calloc(bufSize, 1);
+    if (!pixels) { bmpFile.close(); tt_show_error("Memory error"); return; }
+    pixels[0] = dualPlane ? 0xFD : 0xFE;
+    if (dualPlane) memset(pixels + 1 + packedSize, 0xFF, packedSize);
+
+    int rowBytes = ((bmpW * bmpBpp / 8) + 3) & ~3;
+    uint8_t* rowBuf = (uint8_t*)malloc(rowBytes);
+    if (!rowBuf) { free(pixels); bmpFile.close(); tt_show_error("Memory error"); return; }
+
+    float scaleW = (float)w / bmpW, scaleH = (float)h / bmpH;
+    float scale = (scaleW < scaleH) ? scaleW : scaleH;
+    int dstW = (int)(bmpW * scale), dstH = (int)(bmpH * scale);
+    int offX = (w - dstW) / 2, offY = (h - dstH) / 2;
+
+    for (int dy = 0; dy < dstH; dy++) {
+        int srcY = (int)(dy / scale);
+        if (srcY >= bmpH) srcY = bmpH - 1;
+        int fileRow = bottomUp ? (bmpH - 1 - srcY) : srcY;
+        bmpFile.seek(dataOffset + (uint32_t)fileRow * rowBytes);
+        bmpFile.read(rowBuf, rowBytes);
+        for (int dx = 0; dx < dstW; dx++) {
+            int srcX = (int)(dx / scale);
+            if (srcX >= bmpW) srcX = bmpW - 1;
+            int px = offX + dx, py = offY + dy;
+            if (px < 0 || px >= w || py < 0 || py >= h) continue;
+            size_t idx = (size_t)py * w + px;
+            if (dualPlane) {
+                uint8_t r = rowBuf[srcX*3+2], g = rowBuf[srcX*3+1], b = rowBuf[srcX*3];
+                bool isRed = (r > 150 && g < 100 && b < 100);
+                uint8_t lum = (r*77+g*150+b*29)>>8;
+                if (isRed) {
+                    pixels[1 + packedSize + idx/8] &= ~(1 << (7 - (idx%8)));
+                } else if (lum < 128) {
+                    pixels[1 + idx/8] |= (1 << (7 - (idx%8)));
+                }
+            } else {
+                uint8_t lum = 0;
+                if (bmpBpp == 24) { lum = (rowBuf[srcX*3+2]*77+rowBuf[srcX*3+1]*150+rowBuf[srcX*3]*29)>>8; }
+                else if (bmpBpp == 1) { lum = (rowBuf[srcX/8] & (0x80>>(srcX%8))) ? 255 : 0; }
+                else if (bmpBpp == 8) { lum = rowBuf[srcX]; }
+                if (lum < 128) {
+                    pixels[1 + idx/8] |= (1 << (7 - (idx%8)));
+                }
+            }
+        }
+    }
+    free(rowBuf);
+    bmpFile.close();
+    bool imgInvert = true;
+
+    std::vector<TtMenuItem> icfg;
+    icfg.push_back(ttItem([&](){ return String(w) + "x" + h + " BMP:" + bmpW + "x" + bmpH; }, [](){}, false));
+    icfg.push_back(ttItem([](){ return "Page: " + String(tt_page); }, [](){ tt_page = (tt_page + tt_dir + 8) % 8; }, false));
+    icfg.push_back(ttItem([&](){ return String("Invert: ") + (imgInvert ? "OFF" : "ON"); }, [&](){ imgInvert = !imgInvert; }, false));
+    if (hasColor) {
+        icfg.push_back(ttItem([&](){ return String("Color: ") + (dualPlane ? "B/W/R" : "B/W"); }, [&](){ dualPlane = !dualPlane; }, false));
+    }
+    icfg.push_back(ttItem([](){ return String("Compress: ") + (tt_comp_mode == TT_COMP_AUTO ? "Auto" : tt_comp_mode == TT_COMP_RAW ? "Raw" : "RLE"); }, [](){ tt_comp_mode = (tt_comp_mode + tt_dir + 3) % 3; }, false));
+    icfg.push_back({[](){ return String("Preview"); }, [&](){
+        M5.Display.clear(); M5.Display.setTextFont(1);
+        M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+        M5.Display.setTextSize(1.5); M5.Display.setCursor(5, 3); M5.Display.setTextColor(TFT_WHITE);
+        M5.Display.printf("%s %ux%u%s", profile.model_name ? profile.model_name : "?", w, h, imgInvert ? " INV" : "");
+        size_t pbytes = (pixelCount + 7) / 8;
+        if (dualPlane) {
+            size_t pvSz = 1 + 2*pbytes;
+            uint8_t* pv = (uint8_t*)malloc(pvSz);
+            if (pv) {
+                pv[0] = 0xFD;
+                if (imgInvert) { for (size_t i = 0; i < pbytes; i++) pv[1+i] = ~pixels[1+i]; }
+                else { memcpy(pv+1, pixels+1, pbytes); }
+                // Secondary plane: copy from buffer if 0xFD, else fill 0xFF (color_clear)
+                if (pixels[0] == 0xFD) {
+                    memcpy(pv + 1 + pbytes, pixels + 1 + pbytes, pbytes);
+                } else {
+                    memset(pv + 1 + pbytes, 0xFF, pbytes); // no red = B/W display
+                }
+                tt_preview_dual_packed(pv, w, h, 22);
+                free(pv);
+            }
+        } else {
+            uint8_t* pv = (uint8_t*)malloc(pbytes + 1);
+            if (pv) {
+                pv[0] = 0xFE;
+                if (imgInvert) { for (size_t i = 0; i < pbytes; i++) pv[1+i] = ~pixels[1+i]; }
+                else { memcpy(pv+1, pixels+1, pbytes); }
+                tt_preview_pixels(pv, w, h, 22);
+                free(pv);
+            }
+        }
+        M5.Display.display();
+        delay(200); while (true) { cardUpdate(); if (kp(KEY_BACKSPACE)||kp(KEY_ENTER)) break; delay(50); } delay(150);
+    }, true});
+    icfg.push_back({[](){ return String(">> SEND <<"); }, [&](){
+        // In-place invert to save 39KB heap for RLE encoding
+        size_t pbytes = (pixelCount + 7) / 8;
+        if (imgInvert && pixels[0] == 0xFE) {
+            for (size_t i = 0; i < pbytes; i++) pixels[1+i] = ~pixels[1+i];
+        }
+        bool ok = tt_stream_image(plid, pixels, w, h, tt_page, tt_wake_repeats_val, hasColor, tt_comp_mode, "Push Image");
+        // Undo invert so preview still works
+        if (imgInvert && pixels[0] == 0xFE) {
+            for (size_t i = 0; i < pbytes; i++) pixels[1+i] = ~pixels[1+i];
+        }
+        if (!ok) { tt_show_error("Encode err"); return; }
+        tt_result_screen("Push Image");
+    }, true});
+    tt_menu(icfg, "Push Image Config");
+    free(pixels);
+}
+
+void tt_target_actions(uint8_t idx) {
+    TtSavedTarget& tgt = tt_targets[idx];
+    uint8_t plid[4];
+    tt_barcode_to_plid(tgt.barcode, plid);
+    TtTagProfile profile;
+    tt_barcode_to_profile(tgt.barcode, &profile);
+
+    std::vector<std::pair<String, std::function<void()>>> opts;
+    bool running = true;
+    while (running) {
+        opts.clear();
+        String title = String(tgt.name[0] ? tgt.name : tgt.barcode);
+        opts.push_back({"Change Page", [&]() {
+            uint8_t pg = 1; uint16_t dur = 10; bool fvr = false; uint16_t reps = 100; bool spm = false;
+            std::vector<TtMenuItem> pcfg;
+            pcfg.push_back(ttItem([&](){ return "Page: " + String(pg); }, [&](){ pg = (pg + tt_dir + 8) % 8; }, false));
+            pcfg.push_back(ttItem([&](){ return "Duration: " + String(dur) + "s"; }, [&](){ if (tt_dir>0) { dur=(dur>=60)?5:dur+5; } else { dur=(dur<=5)?60:dur-5; } }, false));
+            pcfg.push_back(ttItem([&](){ return String("Forever: ") + (fvr?"ON":"OFF"); }, [&](){ fvr=!fvr; }, false));
+            pcfg.push_back(ttItem([&](){ return "Repeats: " + String(reps); }, [&](){ if(tt_dir>0){if(reps>=500)reps=50;else reps+=50;}else{if(reps<=50)reps=500;else reps-=50;} }, false));
+            pcfg.push_back(ttItem([&](){ return String("Spam: ") + (spm?"ON":"OFF"); }, [&](){ spm=!spm; }, false));
+            pcfg.push_back({[](){ return String(">> FLIP <<"); }, [&](){
+                uint8_t payload[6] = {0x06, (uint8_t)((((pg+1)&7)<<3)|0x01|(fvr?0x80:0x00)), 0, 0, (uint8_t)((dur>>8)&0xFF), (uint8_t)(dur&0xFF)};
+                uint8_t buf[TT_MAX_FRAME_SIZE];
+                size_t len = tt_make_addressed_frame(buf, plid, payload, 6);
+                memcpy(tt_current_job.frame_data, buf, len);
+                tt_current_job.frame_len = len;
+                tt_current_job.repeats = spm ? 0xFFFF : reps;
+                tt_current_job.gap_delay = 2;
+                while (true) {
+                    tt_do_transmit_single(spm ? "Flip (Spam)" : "Page Flip");
+                    if (!tt_result_screen("Page Flip")) break;
+                }
+            }, true});
+            tt_menu(pcfg, "Change Page");
+        }});
+        opts.push_back({"LED Test", [&]() {
+            tt_led_test_with_plid(plid);
+        }});
+        opts.push_back({"Push Text", [&]() {
+            uint16_t w = profile.known ? profile.width : 296;
+            uint16_t h = profile.known ? profile.height : 128;
+            if (w == 0 || h == 0) { tt_show_error("Segment - no gfx"); return; }
+            bool hc = profile.known && profile.color != TT_COLOR_MONO;
+            uint8_t sFg = 1, sBg = 0;
+            if (w >= 600) tt_text_size = 4; else if (w >= 296) tt_text_size = 3;
+            else if (w >= 200) tt_text_size = 2; else tt_text_size = 1;
+            String text = tt_choose_text();
+            if (text.length() == 0) return;
+            size_t spc = (size_t)w * h;
+            std::vector<TtMenuItem> tc;
+            int tLen = text.length();
+            tc.push_back(ttItem([&](){ return String(profile.model_name ? profile.model_name : "?") + " " + w + "x" + h; }, [](){}, false));
+            tc.push_back(ttItem([&](){
+                int cw2 = 6 * tt_text_size, ch2 = 8 * tt_text_size;
+                int mx = ((w-4)/cw2)*((h-4)/ch2);
+                if (tLen > mx) return "Size: " + String(tt_text_size) + " OVERFLOW! max " + mx;
+                return "Size: " + String(tt_text_size) + " (" + tLen + "/" + mx + ")";
+            }, [](){ tt_text_size = (tt_dir > 0) ? ((tt_text_size >= 10) ? 1 : tt_text_size + 1) : ((tt_text_size <= 1) ? 10 : tt_text_size - 1); }, false));
+            tc.push_back(ttItem([](){ return "Page: " + String(tt_page); }, [](){ tt_page = (tt_page + tt_dir + 8) % 8; }, false));
+            tc.push_back(ttItem([&w](){ return "Offset X: " + String(tt_pos_x); }, [&w](){ tt_pos_x = (tt_dir > 0) ? ((tt_pos_x + 5 > w) ? 0 : tt_pos_x + 5) : ((tt_pos_x < 5) ? 0 : tt_pos_x - 5); }, false));
+            tc.push_back(ttItem([&h](){ return "Offset Y: " + String(tt_pos_y); }, [&h](){ tt_pos_y = (tt_dir > 0) ? ((tt_pos_y + 5 > h) ? 0 : tt_pos_y + 5) : ((tt_pos_y < 5) ? 0 : tt_pos_y - 5); }, false));
+            if (hc) {
+                const char* fN[] = {"White","Black","Red"};
+                const char* bN[] = {"White","Black","Red"};
+                tc.push_back(ttItem([&](){ return String("Text: ") + fN[sFg]; }, [&](){ sFg = (sFg + tt_dir + 3) % 3; }, false));
+                tc.push_back(ttItem([&](){ return String("BG: ") + bN[sBg]; }, [&](){ sBg = (sBg + tt_dir + 3) % 3; }, false));
+            } else {
+                tc.push_back(ttItem([](){ return String("Invert: ") + (tt_invert ? "ON" : "OFF"); }, [](){ tt_invert = !tt_invert; }, false));
+            }
+            tc.push_back(ttItem([](){ return String("Compress: ") + (tt_comp_mode == TT_COMP_AUTO ? "Auto" : tt_comp_mode == TT_COMP_RAW ? "Raw" : "RLE"); }, [](){ tt_comp_mode = (tt_comp_mode + tt_dir + 3) % 3; }, false));
+            tc.push_back({[](){ return String("Preview"); }, [&](){
+                uint8_t* t2 = tt_render_text(text.c_str(), w, h, tt_text_size, false, tt_pos_x, tt_pos_y);
+                if (!t2) return;
+                uint8_t* p2 = (uint8_t*)calloc(spc, 1); uint8_t* c2 = (uint8_t*)malloc(spc);
+                if (!p2||!c2) { free(t2); free(p2); free(c2); return; }
+                memset(c2, 1, spc);
+                if (hc) { for (size_t i=0;i<spc;i++) { bool lit=(t2[0]==0xFE)?((t2[1+i/8]>>(7-(i%8)))&1):(t2[i]!=0); uint8_t g=lit?sFg:sBg; p2[i]=(g==0)?1:0; c2[i]=(g==2)?0:1; } }
+                else { for (size_t i=0;i<spc;i++) { bool lit=(t2[0]==0xFE)?((t2[1+i/8]>>(7-(i%8)))&1):(t2[i]!=0); p2[i] = tt_invert ? !lit : lit; } }
+                M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+                M5.Display.fillRect(0,0,240,18,TFT_NAVY); M5.Display.setTextSize(1.5);
+                M5.Display.setCursor(5,3); M5.Display.setTextColor(TFT_GREEN);
+                M5.Display.printf("%ux%u sz%d", w, h, tt_text_size);
+                if (hc) tt_preview_color(p2, c2, w, h, 20); else tt_preview_pixels(p2, w, h, 20);
+                M5.Display.display(); free(t2); free(p2); free(c2);
+                delay(200); while(true){cardUpdate();if(kp(KEY_BACKSPACE)||kp(KEY_ENTER))break;delay(50);}delay(150);
+            }, true});
+            tc.push_back({[](){ return String(">> SEND <<"); }, [&](){
+                uint8_t* t2 = tt_render_text(text.c_str(), w, h, tt_text_size, false, tt_pos_x, tt_pos_y);
+                if (!t2) { tt_show_error("Memory"); return; }
+                // Apply invert if needed
+                if (tt_invert) {
+                    size_t pbytes2 = (spc + 7) / 8;
+                    if (t2[0] == 0xFE) {
+                        uint8_t* pv2 = (uint8_t*)malloc(pbytes2 + 1);
+                        if (!pv2) { free(t2); tt_show_error("Memory"); return; }
+                        pv2[0] = 0xFE;
+                        for (size_t i = 0; i < pbytes2; i++) pv2[1+i] = ~t2[1+i];
+                        free(t2); t2 = pv2;
+                    } else {
+                        for (size_t i = 0; i < spc; i++) t2[i] = !t2[i];
+                    }
+                }
+                if (!hc) {
+                    // Mono: stream directly
+                    bool ok2 = tt_stream_image(plid, t2, w, h, tt_page, tt_wake_repeats_val, false, tt_comp_mode, "Push Text");
+                    free(t2);
+                    if (!ok2) { tt_show_error("Encode err"); return; }
+                } else {
+                    // Color: build primary + secondary with FG/BG mapping
+                    size_t pbytes = (spc + 7) / 8;
+                    // Try 1-byte/pixel (small/medium tags)
+                    uint8_t* p2 = (uint8_t*)calloc(spc, 1);
+                    uint8_t* c2 = p2 ? (uint8_t*)malloc(spc) : NULL;
+                    if (p2 && c2) {
+                        memset(c2, 1, spc);
+                        for (size_t i=0;i<spc;i++) {
+                            bool lit = (t2[0]==0xFE) ? ((t2[1+i/8]>>(7-(i%8)))&1) : (t2[i]!=0);
+                            uint8_t g = lit ? sBg : sFg;
+                            p2[i] = (g==0) ? 1 : 0;
+                            c2[i] = (g==2) ? 0 : 1;
+                        }
+                        free(t2);
+                        memset(&tt_current_seq, 0, sizeof(tt_current_seq));
+                        bool ok2 = tt_build_image_sequence_planes(&tt_current_seq, plid, p2, c2, w, h, tt_page, 0, 0, tt_wake_repeats_val, tt_comp_mode);
+                        free(p2); free(c2);
+                        if (!ok2) { tt_show_error("Encode err"); return; }
+                        tt_tx_progress = 0;
+                        tt_transmit_sequence_inline("Push Text");
+                    } else {
+                        free(p2); free(c2);
+                        // Large tags: packed FG/BG mapping → 0xFD format
+                        if (t2[0] == 0xFE) {
+                            // Free t2 first to maximize heap, but save the data
+                            // Copy packed data, free t2, then build dual
+                            uint8_t* dual = (uint8_t*)calloc(1 + 2*pbytes, 1);
+                            if (!dual) {
+                                // Try again after freeing t2 — copy to dual directly
+                                // Need t2 alive for mapping, so try smaller: just send mono
+                                bool ok2 = tt_stream_image(plid, t2, w, h, tt_page, tt_wake_repeats_val, true, tt_comp_mode, "Push Text");
+                                free(t2);
+                                if (!ok2) { tt_show_error("Encode err"); return; }
+                            } else {
+                                dual[0] = 0xFD;
+                                // Secondary plane default: all 1s (no color)
+                                memset(dual + 1 + pbytes, 0xFF, pbytes);
+                                for (size_t i = 0; i < spc; i++) {
+                                    bool lit = (t2[1 + i/8] >> (7 - (i%8))) & 1;
+                                    uint8_t g = lit ? sBg : sFg;
+                                    if (g == 0) dual[1 + i/8] |= (1 << (7-(i%8)));           // primary: white=1
+                                    else dual[1 + i/8] &= ~(1 << (7-(i%8)));                  // primary: black/red=0
+                                    if (g == 2) dual[1 + pbytes + i/8] &= ~(1 << (7-(i%8)));  // secondary: red=0
+                                }
+                                free(t2);
+                                bool ok2 = tt_stream_image(plid, dual, w, h, tt_page, tt_wake_repeats_val, false, tt_comp_mode, "Push Text");
+                                free(dual);
+                                if (!ok2) { tt_show_error("Encode err"); return; }
+                            }
+                        } else {
+                            bool ok2 = tt_stream_image(plid, t2, w, h, tt_page, tt_wake_repeats_val, true, tt_comp_mode, "Push Text");
+                            free(t2);
+                            if (!ok2) { tt_show_error("Encode err"); return; }
+                        }
+                    }
+                }
+                tt_result_screen("Push Text");
+            }, true});
+            tt_menu(tc, "Push Text Config");
+        }});
+        opts.push_back({"Push Image (BMP)", [&]() {
+            uint16_t w = profile.known ? profile.width : 296;
+            uint16_t h = profile.known ? profile.height : 128;
+            if (w == 0 || h == 0) { tt_show_error("Segment - no gfx"); return; }
+
+            std::vector<String> bmpFiles;
+            {
+                File dir = SD.open("/evil/esl");
+                if (dir && dir.isDirectory()) {
+                    File f = dir.openNextFile();
+                    while (f) {
+                        String fn = f.name();
+                        if (!f.isDirectory() && (fn.endsWith(".bmp") || fn.endsWith(".BMP"))) {
+                            if (fn.startsWith("/")) bmpFiles.push_back(fn);
+                            else bmpFiles.push_back(String("/evil/esl/") + fn);
+                        }
+                        f.close(); if (bmpFiles.size() >= 100) break;
+                        f = dir.openNextFile();
+                    }
+                    dir.close();
+                }
+            }
+            if (bmpFiles.size() == 0) { tt_show_error("No BMP in /evil/esl/"); return; }
+
+            std::vector<String> bl;
+            for (size_t i = 0; i < bmpFiles.size(); i++) {
+                String sn = bmpFiles[i]; if (sn.startsWith("/evil/esl/")) sn = sn.substring(10); if (sn.endsWith(".bmp") || sn.endsWith(".BMP")) sn = sn.substring(0, sn.length() - 4);
+                if (sn.length() > 28) sn = "..." + sn.substring(sn.length() - 25);
+                bl.push_back(sn);
+            }
+            int selIdx = tt_menu_select(bl, "Select BMP");
+            if (selIdx < 0) return;
+
+            File bmpFile = SD.open(bmpFiles[selIdx]);
+            if (!bmpFile) { tt_show_error("Can't open"); return; }
+            uint8_t header[54];
+            if (bmpFile.read(header, 54) != 54 || header[0] != 'B' || header[1] != 'M') {
+                bmpFile.close(); tt_show_error("Invalid BMP"); return;
+            }
+            int32_t bmpW = *(int32_t*)&header[18];
+            int32_t bmpH = *(int32_t*)&header[22];
+            uint16_t bmpBpp = *(uint16_t*)&header[28];
+            uint32_t dataOffset = *(uint32_t*)&header[10];
+            bool bottomUp = (bmpH > 0);
+            if (bmpH < 0) bmpH = -bmpH;
+
+            bool hc2 = profile.known && profile.color != TT_COLOR_MONO;
+            bool dp2 = hc2 && bmpBpp == 24;
+            size_t pc = (size_t)w * h;
+            size_t pcPacked = (pc + 7) / 8;
+            size_t bufSz2 = dp2 ? (1 + 2*pcPacked) : (1 + pcPacked);
+            uint8_t* pixels = (uint8_t*)calloc(bufSz2, 1);
+            if (!pixels) { bmpFile.close(); tt_show_error("Memory"); return; }
+            pixels[0] = dp2 ? 0xFD : 0xFE;
+            if (dp2) memset(pixels + 1 + pcPacked, 0xFF, pcPacked);
+            int rowBytes = ((bmpW * bmpBpp / 8) + 3) & ~3;
+            uint8_t* rowBuf = (uint8_t*)malloc(rowBytes);
+            if (!rowBuf) { free(pixels); bmpFile.close(); tt_show_error("Memory"); return; }
+
+            float sW2 = (float)w/bmpW, sH2 = (float)h/bmpH;
+            float sc2 = (sW2 < sH2) ? sW2 : sH2;
+            int dW2 = (int)(bmpW*sc2), dH2 = (int)(bmpH*sc2);
+            int oX2 = (w-dW2)/2, oY2 = (h-dH2)/2;
+            for (int dy = 0; dy < dH2; dy++) {
+                int sy = (int)(dy/sc2); if (sy >= bmpH) sy = bmpH-1;
+                int fr = bottomUp ? (bmpH-1-sy) : sy;
+                bmpFile.seek(dataOffset + (uint32_t)fr * rowBytes);
+                bmpFile.read(rowBuf, rowBytes);
+                for (int dx = 0; dx < dW2; dx++) {
+                    int sx = (int)(dx/sc2); if (sx >= bmpW) sx = bmpW-1;
+                    int px2 = oX2+dx, py2 = oY2+dy;
+                    if (px2<0 || px2>=w || py2<0 || py2>=h) continue;
+                    size_t idx2 = (size_t)py2 * w + px2;
+                    if (dp2) {
+                        uint8_t r = rowBuf[sx*3+2], g = rowBuf[sx*3+1], b = rowBuf[sx*3];
+                        bool isRed = (r > 150 && g < 100 && b < 100);
+                        uint8_t lum = (r*77+g*150+b*29)>>8;
+                        if (isRed) {
+                            pixels[1 + pcPacked + idx2/8] &= ~(1 << (7 - (idx2%8)));
+                        } else if (lum < 128) {
+                            pixels[1 + idx2/8] |= (1 << (7 - (idx2%8)));
+                        }
+                    } else {
+                        uint8_t lum = 0;
+                        if (bmpBpp == 24) { lum = (rowBuf[sx*3+2]*77+rowBuf[sx*3+1]*150+rowBuf[sx*3]*29)>>8; }
+                        else if (bmpBpp == 1) { lum = (rowBuf[sx/8] & (0x80>>(sx%8))) ? 255 : 0; }
+                        else if (bmpBpp == 8) { lum = rowBuf[sx]; }
+                        if (lum < 128) {
+                            pixels[1 + idx2/8] |= (1 << (7 - (idx2%8)));
+                        }
+                    }
+                }
+            }
+            free(rowBuf); bmpFile.close();
+
+            bool inv2 = true;
+            std::vector<TtMenuItem> ic;
+            String ti2 = String(w) + "x" + String(h) + " BMP:" + String(bmpW) + "x" + String(bmpH);
+            ic.push_back(ttItem([ti2](){ return ti2; }, [](){}, false));
+            ic.push_back(ttItem([](){ return "Page: " + String(tt_page); }, [](){ tt_page = (tt_page + tt_dir + 8) % 8; }, false));
+            ic.push_back(ttItem([&inv2](){ return String("Invert: ") + (inv2 ? "OFF" : "ON"); }, [&inv2](){ inv2 = !inv2; }, false));
+            if (hc2) {
+                ic.push_back(ttItem([&dp2](){ return String("Color: ") + (dp2 ? "B/W/R" : "B/W"); }, [&dp2](){ dp2 = !dp2; }, false));
+            }
+            ic.push_back(ttItem([](){ return String("Compress: ") + (tt_comp_mode == TT_COMP_AUTO ? "Auto" : tt_comp_mode == TT_COMP_RAW ? "Raw" : "RLE"); }, [](){ tt_comp_mode = (tt_comp_mode + tt_dir + 3) % 3; }, false));
+            ic.push_back({[](){ return String("Preview"); }, [&](){
+                M5.Display.clear(); M5.Display.setTextFont(1);
+                M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+                M5.Display.setTextSize(1.5); M5.Display.setCursor(5, 3); M5.Display.setTextColor(TFT_WHITE);
+                M5.Display.printf("%s %ux%u%s", profile.model_name ? profile.model_name : "?", w, h, inv2 ? " INV" : "");
+                if (dp2) {
+                    size_t pvSz = 1 + 2*pcPacked;
+                    uint8_t* pv = (uint8_t*)malloc(pvSz);
+                    if (pv) {
+                        pv[0] = 0xFD;
+                        if (inv2) { for (size_t i=0;i<pcPacked;i++) pv[1+i]=~pixels[1+i]; }
+                        else { memcpy(pv+1, pixels+1, pcPacked); }
+                        if (pixels[0] == 0xFD) {
+                            memcpy(pv + 1 + pcPacked, pixels + 1 + pcPacked, pcPacked);
+                        } else {
+                            memset(pv + 1 + pcPacked, 0xFF, pcPacked);
+                        }
+                        tt_preview_dual_packed(pv, w, h, 22);
+                        free(pv);
+                    }
+                } else {
+                    uint8_t* pv = (uint8_t*)malloc(pcPacked + 1);
+                    if (pv) {
+                        pv[0] = 0xFE;
+                        if (inv2) { for (size_t i=0;i<pcPacked;i++) pv[1+i]=~pixels[1+i]; }
+                        else { memcpy(pv+1, pixels+1, pcPacked); }
+                        tt_preview_pixels(pv, w, h, 22);
+                        free(pv);
+                    }
+                }
+                M5.Display.setCursor(5, 122); M5.Display.setTextColor(TFT_ORANGE);
+                M5.Display.print("[BACK]"); M5.Display.display();
+                delay(200); while (true) { cardUpdate(); if (kp(KEY_BACKSPACE)||kp(KEY_ENTER)) break; delay(50); } delay(150);
+            }, true});
+            ic.push_back({[](){ return String(">> SEND <<"); }, [&](){
+                // In-place invert to save heap for RLE
+                if (inv2 && pixels[0] == 0xFE) {
+                    for (size_t i = 0; i < pcPacked; i++) pixels[1+i] = ~pixels[1+i];
+                }
+                bool ok3 = tt_stream_image(plid, pixels, w, h, tt_page, tt_wake_repeats_val, hc2, tt_comp_mode, "Push Image");
+                if (inv2 && pixels[0] == 0xFE) {
+                    for (size_t i = 0; i < pcPacked; i++) pixels[1+i] = ~pixels[1+i];
+                }
+                if (!ok3) { tt_show_error("Encode err"); return; }
+                tt_result_screen("Push Image");
+            }, true});
+            tt_menu(ic, "Push Image Config");
+            free(pixels);
+        }});
+        opts.push_back({"Online Content", [&]() {
+            uint16_t ow = profile.known ? profile.width : 296;
+            uint16_t oh = profile.known ? profile.height : 128;
+            if (ow == 0 || oh == 0) { tt_show_error("Segment - no gfx"); return; }
+            bool ohc = profile.known && profile.color != TT_COLOR_MONO;
+            tt_online_content_with(plid, ow, oh, ohc);
+        }});
+        opts.push_back({"Info", [&]() {
+            bool vc = tt_is_barcode_valid(tgt.barcode);
+            char ps[18]; snprintf(ps, sizeof(ps), "%02X:%02X:%02X:%02X", plid[0], plid[1], plid[2], plid[3]);
+            std::vector<TtMenuItem> nfo;
+            nfo.push_back(ttItem([&](){ return String("BC: ") + tgt.barcode; }, [](){}, false));
+            nfo.push_back(ttItem([ps](){ return String("PLID: ") + ps; }, [](){}, false));
+            nfo.push_back(ttItem([&](){ return "Type: " + String(profile.type_code); }, [](){}, false));
+            nfo.push_back(ttItem([vc](){ return String("Format: ") + (vc ? "Valid" : "Bad digits"); }, [](){}, false));
+            if (profile.known) {
+                if (profile.model_name) nfo.push_back(ttItem([&](){ return String("Model: ") + profile.model_name; }, [](){}, false));
+                nfo.push_back(ttItem([&](){ return "Display: " + String(profile.width) + "x" + String(profile.height); }, [](){}, false));
+                nfo.push_back(ttItem([&](){ return String("Kind: ") + (profile.kind == TT_KIND_DOTMATRIX ? "Dot Matrix" : "Segment"); }, [](){}, false));
+                const char* cs = profile.color == TT_COLOR_RED ? "Red" : profile.color == TT_COLOR_YELLOW ? "Yellow" : "Mono";
+                nfo.push_back(ttItem([cs](){ return String("Color: ") + cs; }, [](){}, false));
+                nfo.push_back(ttItem([](){ return String("Pages: 1-4 (model dependent)"); }, [](){}, false));
+                nfo.push_back(ttItem([&](){ return "PL Bit: " + String(profile.pl_bit_def); }, [](){}, false));
+                size_t px = (size_t)profile.width * profile.height;
+                size_t rb = (px + 7) / 8;
+                size_t fr = (rb + 19) / 20;
+                nfo.push_back(ttItem([px](){ return "Pixels: " + String((uint32_t)px); }, [](){}, false));
+                nfo.push_back(ttItem([rb](){ return "Raw: " + String((uint32_t)rb) + " B"; }, [](){}, false));
+                nfo.push_back(ttItem([fr](){ return "Frames: " + String((uint32_t)fr); }, [](){}, false));
+                nfo.push_back(ttItem([px](){ return String("Compress: ") + (px > 5000 ? "RLE recommended" : "Raw OK"); }, [](){}, false));
+            } else {
+                nfo.push_back(ttItem([](){ return String("Unknown tag type"); }, [](){}, false));
+            }
+            tt_menu(nfo, tgt.name[0] ? tgt.name : "Tag Info");
+        }});
+        opts.push_back({"Rename", [&]() {
+            String newName = tt_get_text_input("Enter text", false);
+            if (newName.length() > 0) {
+                strncpy(tgt.name, newName.c_str(), 31); tgt.name[31] = 0;
+                tt_targets_save();
+            }
+        }});
+        opts.push_back({"Delete", [&, idx]() {
+            tt_target_delete(idx);
+            running = false;
+        }});
+        if (!running) break;
+        std::vector<TtMenuItem> mi;
+        for (auto& p : opts) mi.push_back({[&p](){ return p.first; }, p.second, true});
+        tt_menu(mi, title.c_str());
+        break;
+    }
+}
+
+void tt_saved_targets_menu() {
+    tt_targets_load();
+    while (true) {
+        std::vector<String> labels;
+        for (uint8_t i = 0; i < tt_target_count; i++)
+            labels.push_back(tt_targets[i].name[0] ? tt_targets[i].name : tt_targets[i].barcode);
+        labels.push_back("+ Add New Tag");
+
+        String title = "Saved Tags (" + String(tt_target_count) + ")";
+        int sel = tt_menu_select(labels, title.c_str());
+        if (sel < 0) return;
+
+        if (sel < tt_target_count) {
+            tt_target_actions(sel);
+        } else {
+            String bc = tt_get_barcode();
+            if (bc.length() == TT_BC_LEN) {
+                String name = tt_get_text_input("Name (optional)", true);
+                tt_target_add(bc.c_str(), name.c_str());
+            }
+        }
+    }
+}
+
+void tt_settings_menu() {
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back({[](){ return String("Compress: ") + (tt_comp_mode == TT_COMP_AUTO ? "Auto" : tt_comp_mode == TT_COMP_RAW ? "Raw" : "RLE"); },
+        [](){ tt_comp_mode = (tt_comp_mode + tt_dir + 3) % 3; }, false});
+    cfg.push_back({[](){ return "Data Repeats: " + String(tt_data_repeats); },
+        [](){ tt_data_repeats = (tt_dir > 0) ? ((tt_data_repeats >= 15) ? 1 : tt_data_repeats + 1) : ((tt_data_repeats <= 1) ? 15 : tt_data_repeats - 1); }, false});
+    cfg.push_back({[](){ return "Wake Repeats: " + String(tt_wake_repeats_val); },
+        [](){ if (tt_dir > 0) { if (tt_wake_repeats_val >= 995) tt_wake_repeats_val = 10; else tt_wake_repeats_val += 5; } else { if (tt_wake_repeats_val <= 10) tt_wake_repeats_val = 995; else tt_wake_repeats_val -= 5; } }, false});
+    cfg.push_back({[](){ char b[24]; snprintf(b,sizeof(b),"Store Key: 0x%04X",tt_store_key); return String(b); },
+        [](){ tt_store_key = (uint16_t)(tt_store_key + tt_dir * 0x0100); }, false});
+    cfg.push_back({[](){ return String("Protocol: ") + (tt_use_pp16 ? "PP16 (4x fast)" : "PP4 (standard)"); },
+        [](){ tt_use_pp16 = !tt_use_pp16; }, false});
+    tt_menu(cfg, "TagTinker Settings");
+}
+
+// ---------- Raw Frame sender ----------
+
+
+// ========== LED Explorer — predefined LED payload tests ==========
+
+struct TtLedTest { uint8_t mode; uint8_t b2; uint8_t b3; uint8_t durH; uint8_t durL; const char* desc; };
+const TtLedTest tt_led_tests[] = {
+    {0x49, 0x00, 0x00, 0x00, 0x05, "Fast blink 5s"},
+    {0x41, 0x00, 0x00, 0x00, 0x05, "Slow blink 5s"},
+    {0xC9, 0x00, 0x00, 0x00, 0x05, "Fast HIGH 5s"},
+    {0xC1, 0x00, 0x00, 0x00, 0x05, "Slow HIGH 5s"},
+    {0xC9, 0x00, 0x00, 0x00, 0x00, "Fast FOREVER"},
+    {0xC1, 0x00, 0x00, 0x00, 0x00, "Slow FOREVER"},
+    {0x49, 0x00, 0x00, 0x00, 0x01, "LED OFF (1s)"},
+    {0x4B, 0x00, 0x00, 0x00, 0x05, "Bit1 set"},
+    {0x4D, 0x00, 0x00, 0x00, 0x05, "Bit2 set"},
+    {0x4F, 0x00, 0x00, 0x00, 0x05, "Bit1+2 set"},
+    {0x51, 0x00, 0x00, 0x00, 0x05, "Bit3 (pg2?)"},
+    {0x59, 0x00, 0x00, 0x00, 0x05, "Bit3+4 (pg3?)"},
+    {0x09, 0x00, 0x00, 0x00, 0x05, "No bit6 pg1"},
+    {0x01, 0x00, 0x00, 0x00, 0x05, "No bit6 pg0"},
+    {0xCB, 0x00, 0x00, 0x00, 0x05, "HIGH+Bit1"},
+    {0xCD, 0x00, 0x00, 0x00, 0x05, "HIGH+Bit2"},
+    {0x42, 0x00, 0x00, 0x00, 0x05, "No enable bit"},
+    {0x40, 0x00, 0x00, 0x00, 0x05, "Only bit6"},
+    {0x10, 0x00, 0x00, 0x00, 0x05, "Only bit4"},
+    {0x20, 0x00, 0x00, 0x00, 0x05, "Only bit5"},
+    {0xFF, 0x00, 0x00, 0x00, 0x05, "All bits"},
+    {0x49, 0x01, 0x00, 0x00, 0x05, "B2=0x01"},
+    {0x49, 0x02, 0x00, 0x00, 0x05, "B2=0x02"},
+    {0x49, 0x0A, 0x00, 0x00, 0x05, "B2=0x0A"},
+    {0x49, 0xFF, 0x00, 0x00, 0x05, "B2=0xFF"},
+    {0x49, 0x00, 0x01, 0x00, 0x05, "B3=0x01"},
+    {0x49, 0x00, 0x02, 0x00, 0x05, "B3=0x02"},
+    {0x49, 0x00, 0xFF, 0x00, 0x05, "B3=0xFF"},
+    {0x49, 0x00, 0x00, 0x01, 0x00, "Dur=256s"},
+    {0x49, 0x00, 0x00, 0xFF, 0xFF, "Dur=MAX"},
+    {0xF1, 0x00, 0x00, 0x00, 0x0A, "Debug 0xF1"},
+};
+const int tt_led_test_count = sizeof(tt_led_tests) / sizeof(tt_led_tests[0]);
+
+void tt_led_explorer() {
+    tt_targets_load();
+    if (tt_target_count == 0) { tt_show_error("No saved tags"); return; }
+    std::vector<String> tagLabels;
+    for (uint8_t i = 0; i < tt_target_count; i++)
+        tagLabels.push_back(tt_targets[i].name[0] ? tt_targets[i].name : tt_targets[i].barcode);
+    int ti = tt_menu_select(tagLabels, "Select Tag");
+    if (ti < 0) return;
+    uint8_t plid[4];
+    tt_barcode_to_plid(tt_targets[ti].barcode, plid);
+    bool useBroadcast = false;
+
+    int testIdx = 0;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[24]; snprintf(b,sizeof(b),"Test %d/%d",testIdx+1,tt_led_test_count); return String(b); },
+        [&](){ testIdx = (testIdx + tt_dir + tt_led_test_count) % tt_led_test_count; }, false));
+    cfg.push_back(ttItem([&](){ return String(tt_led_tests[testIdx].desc); }, [](){}, false));
+    cfg.push_back(ttItem([&](){ char b[40]; snprintf(b,sizeof(b),"M:0x%02X B2:0x%02X B3:0x%02X D:%02X%02X",
+        tt_led_tests[testIdx].mode, tt_led_tests[testIdx].b2, tt_led_tests[testIdx].b3,
+        tt_led_tests[testIdx].durH, tt_led_tests[testIdx].durL); return String(b); }, [](){}, false));
+    cfg.push_back(ttItem([&](){ return String("Target: ") + (useBroadcast ? "BROADCAST" : "Tag"); },
+        [&](){ useBroadcast = !useBroadcast; }, false));
+    cfg.push_back({[](){ return String(">> SEND THIS <<"); }, [&](){
+        const TtLedTest& t = tt_led_tests[testIdx];
+        const uint8_t* pid = useBroadcast ? (const uint8_t*)"\x00\x00\x00\x00" : plid;
+        uint8_t pb[TT_MAX_FRAME_SIZE];
+        size_t pl = tt_make_ping_frame(pb, pid);
+        tt_lab_send_raw(pid, pb, pl, 80, "Wake");
+        uint8_t pay[6] = {0x06, t.mode, t.b2, t.b3, t.durH, t.durL};
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t len = tt_make_addressed_frame(buf, pid, pay, 6);
+        tt_lab_send_raw(pid, buf, len, 50, t.desc);
+        tt_result_screen(t.desc);
+    }, true});
+    cfg.push_back({[](){ return String(">> AUTO ALL <<"); }, [&](){
+        tt_ir_stop_requested = false;
+        const uint8_t* pid = useBroadcast ? (const uint8_t*)"\x00\x00\x00\x00" : plid;
+        for (int i = 0; i < tt_led_test_count; i++) {
+            if (tt_ir_stop_requested) break;
+            testIdx = i;
+            const TtLedTest& t = tt_led_tests[i];
+            M5.Display.fillScreen(TFT_BLACK);
+            M5.Display.fillRect(0,0,240,18,TFT_NAVY);
+            M5.Display.setTextFont(1); M5.Display.setTextSize(1.5);
+            M5.Display.setCursor(5,3); M5.Display.setTextColor(TFT_GREEN);
+            M5.Display.printf("Test %d/%d %s",i+1,tt_led_test_count, useBroadcast?"[BC]":"");
+            M5.Display.setTextSize(2); M5.Display.setCursor(5,28); M5.Display.setTextColor(TFT_WHITE);
+            M5.Display.print(t.desc);
+            char hex[40]; snprintf(hex,sizeof(hex),"M:0x%02X B2:0x%02X B3:0x%02X D:%02X%02X",t.mode,t.b2,t.b3,t.durH,t.durL);
+            M5.Display.setTextSize(1); M5.Display.setCursor(5,52); M5.Display.setTextColor(TFT_CYAN);
+            M5.Display.print(hex);
+            M5.Display.setCursor(5,68); M5.Display.setTextColor(TFT_ORANGE); M5.Display.print("Sending...");
+            M5.Display.setCursor(5,122); M5.Display.setTextColor(TFT_DARKGREY); M5.Display.print("[BACK] Stop");
+            M5.Display.display();
+            uint8_t pb[TT_MAX_FRAME_SIZE];
+            size_t pl = tt_make_ping_frame(pb, pid);
+            tt_lab_send_raw(pid, pb, pl, 40, "Ping");
+            uint8_t pay[6] = {0x06, t.mode, t.b2, t.b3, t.durH, t.durL};
+            uint8_t buf[TT_MAX_FRAME_SIZE];
+            size_t len = tt_make_addressed_frame(buf, pid, pay, 6);
+            tt_lab_send_raw(pid, buf, len, 30, t.desc);
+            M5.Display.setCursor(5,68); M5.Display.setTextColor(TFT_GREEN); M5.Display.print("Observe 3s...   ");
+            M5.Display.display();
+            unsigned long wait = millis();
+            while (millis()-wait < 3000) { cardUpdate(); if(kp(KEY_BACKSPACE)){tt_ir_stop_requested=true;break;} delay(30); }
+            if (tt_ir_stop_requested) break;
+        }
+        if (!tt_ir_stop_requested) tt_show_success("All tests done");
+    }, true});
+    tt_menu(cfg, "LED Explorer");
+}
+
+// ========== Protocol Lab — exhaustive reverse-engineering test suite ==========
+
+void tt_lab_send_raw(const uint8_t plid[4], const uint8_t* frame, size_t len, uint16_t reps, const char* title) {
+    memcpy(tt_current_job.frame_data, frame, len);
+    tt_current_job.frame_len = len;
+    tt_current_job.repeats = reps;
+    tt_current_job.gap_delay = 2;
+    tt_tx_total = 0;
+    tt_transmit_single_inline(title);
+    tt_ir_stop_requested = false;
+}
+
+void tt_lab_ping_then_send(const uint8_t plid[4], const uint8_t* frame, size_t len, uint16_t ping_reps, uint16_t cmd_reps, const char* title) {
+    uint8_t pb[TT_MAX_FRAME_SIZE];
+    size_t pl = tt_make_ping_frame(pb, plid);
+    tt_lab_send_raw(plid, pb, pl, ping_reps, "Wake");
+    tt_lab_send_raw(plid, frame, len, cmd_reps, title);
+}
+
+// --- 1. CMD 0x06 Byte Scan (LED/Page control byte) ---
+void tt_lab_cmd06_scan(const uint8_t plid[4]) {
+    uint8_t val = 0x49;
+    uint8_t b2 = 0x00, b3 = 0x00;
+    uint16_t dur = 5;
+    uint8_t step = 1;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[20]; snprintf(b,sizeof(b),"Value: 0x%02X (%d)", val, val); return String(b); },
+        [&](){ val = (uint8_t)(val + tt_dir * step); }, false));
+    cfg.push_back(ttItem([&](){ return "Step: " + String(step); },
+        [&](){ step = (step == 1) ? 16 : (step == 16) ? 32 : 1; }, false));
+    cfg.push_back(ttItem([&](){ char b[16]; snprintf(b,sizeof(b),"Byte2: 0x%02X",b2); return String(b); },
+        [&](){ b2 = (uint8_t)(b2 + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ char b[16]; snprintf(b,sizeof(b),"Byte3: 0x%02X",b3); return String(b); },
+        [&](){ b3 = (uint8_t)(b3 + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ return "Duration: " + String(dur) + "s"; },
+        [&](){ dur = (tt_dir > 0) ? ((dur >= 60) ? 1 : dur + 1) : ((dur <= 1) ? 60 : dur - 1); }, false));
+    cfg.push_back({[](){ return String(">> SEND <<"); }, [&](){
+        uint8_t pay[6] = {0x06, val, b2, b3, (uint8_t)(dur >> 8), (uint8_t)(dur & 0xFF)};
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t len = tt_make_addressed_frame(buf, plid, pay, 6);
+        char t[24]; snprintf(t,sizeof(t),"CMD06 0x%02X",val);
+        tt_lab_ping_then_send(plid, buf, len, 80, 50, t);
+        tt_result_screen(t);
+    }, true});
+    cfg.push_back({[](){ return String(">> AUTO 0x00-0xFF <<"); }, [&](){
+        tt_ir_stop_requested = false;
+        for (int v = 0; v <= 255; v++) {
+            if (tt_ir_stop_requested) break;
+            val = (uint8_t)v;
+            M5.Display.fillScreen(TFT_BLACK);
+            M5.Display.setTextFont(1); M5.Display.setTextSize(2);
+            M5.Display.setCursor(5,5); M5.Display.setTextColor(TFT_GREEN);
+            M5.Display.printf("CMD06 0x%02X (%d/256)", v, v+1);
+            M5.Display.setTextSize(1); M5.Display.setCursor(5,30); M5.Display.setTextColor(TFT_CYAN);
+            M5.Display.printf("Bits: %c%c%c%c%c%c%c%c", v&128?'1':'0',v&64?'1':'0',v&32?'1':'0',v&16?'1':'0',v&8?'1':'0',v&4?'1':'0',v&2?'1':'0',v&1?'1':'0');
+            M5.Display.setCursor(5,122); M5.Display.setTextColor(TFT_DARKGREY); M5.Display.print("[BACK] Stop");
+            M5.Display.display();
+            uint8_t pay[6] = {0x06, (uint8_t)v, b2, b3, 0x00, 0x03};
+            uint8_t buf[TT_MAX_FRAME_SIZE];
+            size_t len = tt_make_addressed_frame(buf, plid, pay, 6);
+            tt_lab_ping_then_send(plid, buf, len, 40, 30, "scan");
+            unsigned long w = millis();
+            while (millis()-w < 2000) { cardUpdate(); if(kp(KEY_BACKSPACE)){tt_ir_stop_requested=true;break;} delay(30); }
+        }
+        if (!tt_ir_stop_requested) tt_show_success("Scan complete");
+    }, true});
+    tt_menu(cfg, "CMD 0x06 Byte Scan");
+}
+
+// --- 2. MCU Tunnel Sub-Command Scan (cmd 0x34, sub 0x00-0x3F) ---
+void tt_lab_mcu_scan(const uint8_t plid[4]) {
+    uint8_t sub = 0x00;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[24]; snprintf(b,sizeof(b),"Sub-cmd: 0x%02X (%d)",sub,sub); return String(b); },
+        [&](){ sub = (uint8_t)(sub + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){
+        const char* known = (sub==0x01)?"REFRESH":(sub==0x05)?"IMG PARAM":(sub==0x20)?"IMG DATA":"???";
+        return String("Known: ") + known; }, [](){}, false));
+    cfg.push_back({[](){ return String(">> SEND <<"); }, [&](){
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t p = tt_mcu_frame(buf, plid, sub);
+        for (int i = 0; i < 18; i++) buf[p++] = 0x00;
+        size_t len = tt_terminate(buf, p);
+        char t[24]; snprintf(t,sizeof(t),"MCU 0x%02X",sub);
+        tt_lab_ping_then_send(plid, buf, len, 80, 50, t);
+        tt_result_screen(t);
+    }, true});
+    cfg.push_back({[](){ return String(">> AUTO 0x00-0x3F <<"); }, [&](){
+        tt_ir_stop_requested = false;
+        for (int v = 0; v <= 0x3F; v++) {
+            if (tt_ir_stop_requested) break;
+            sub = (uint8_t)v;
+            M5.Display.fillScreen(TFT_BLACK);
+            M5.Display.setTextFont(1); M5.Display.setTextSize(2);
+            M5.Display.setCursor(5,5); M5.Display.setTextColor(TFT_YELLOW);
+            M5.Display.printf("MCU sub 0x%02X (%d/64)", v, v+1);
+            M5.Display.setTextSize(1); M5.Display.setCursor(5,30); M5.Display.setTextColor(TFT_CYAN);
+            const char* known = (v==0x01)?"= REFRESH":(v==0x05)?"= IMG PARAM":(v==0x20)?"= IMG DATA":"";
+            M5.Display.print(known);
+            M5.Display.setCursor(5,122); M5.Display.setTextColor(TFT_DARKGREY); M5.Display.print("[BACK] Stop");
+            M5.Display.display();
+            uint8_t buf[TT_MAX_FRAME_SIZE];
+            size_t p = tt_mcu_frame(buf, plid, (uint8_t)v);
+            for (int i = 0; i < 18; i++) buf[p++] = 0x00;
+            size_t len = tt_terminate(buf, p);
+            tt_lab_ping_then_send(plid, buf, len, 40, 30, "scan");
+            unsigned long w = millis();
+            while (millis()-w < 2000) { cardUpdate(); if(kp(KEY_BACKSPACE)){tt_ir_stop_requested=true;break;} delay(30); }
+        }
+        if (!tt_ir_stop_requested) tt_show_success("MCU scan done");
+    }, true});
+    tt_menu(cfg, "MCU Sub-Cmd Scan");
+}
+
+// --- 3. Full CMD Byte Scan (0x00-0xFF) ---
+void tt_lab_cmd_scan(const uint8_t plid[4]) {
+    uint8_t cmd = 0x00;
+    uint8_t step = 1;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[24]; snprintf(b,sizeof(b),"CMD: 0x%02X (%d)",cmd,cmd); return String(b); },
+        [&](){ cmd = (uint8_t)(cmd + tt_dir * step); }, false));
+    cfg.push_back(ttItem([&](){ return "Step: " + String(step); },
+        [&](){ step = (step == 1) ? 16 : (step == 16) ? 32 : 1; }, false));
+    cfg.push_back(ttItem([&](){
+        const char* known = (cmd==0x06)?"LED/PAGE":(cmd==0x34)?"MCU TUNNEL":(cmd==0x97)?"PING/DEBUG":"???";
+        return String("Known: ") + known; }, [](){}, false));
+    cfg.push_back({[](){ return String(">> SEND <<"); }, [&](){
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, cmd);
+        for (int i = 0; i < 20; i++) buf[p++] = 0x00;
+        size_t len = tt_terminate(buf, p);
+        char t[24]; snprintf(t,sizeof(t),"CMD 0x%02X",cmd);
+        tt_lab_ping_then_send(plid, buf, len, 80, 50, t);
+        tt_result_screen(t);
+    }, true});
+    cfg.push_back({[](){ return String(">> AUTO 0x00-0xFF <<"); }, [&](){
+        tt_ir_stop_requested = false;
+        for (int v = 0; v <= 255; v++) {
+            if (tt_ir_stop_requested) break;
+            cmd = (uint8_t)v;
+            M5.Display.fillScreen(TFT_BLACK);
+            M5.Display.setTextFont(1); M5.Display.setTextSize(2);
+            M5.Display.setCursor(5,5); M5.Display.setTextColor(TFT_MAGENTA);
+            M5.Display.printf("CMD 0x%02X (%d/256)", v, v+1);
+            M5.Display.setTextSize(1); M5.Display.setCursor(5,30); M5.Display.setTextColor(TFT_CYAN);
+            const char* known = (v==0x06)?"= LED/PAGE":(v==0x34)?"= MCU TUNNEL":(v==0x97)?"= PING":"";
+            M5.Display.print(known);
+            M5.Display.setCursor(5,122); M5.Display.setTextColor(TFT_DARKGREY); M5.Display.print("[BACK] Stop");
+            M5.Display.display();
+            uint8_t buf[TT_MAX_FRAME_SIZE];
+            size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, (uint8_t)v);
+            for (int i = 0; i < 20; i++) buf[p++] = 0x00;
+            size_t len = tt_terminate(buf, p);
+            tt_lab_ping_then_send(plid, buf, len, 40, 20, "scan");
+            unsigned long w = millis();
+            while (millis()-w < 2000) { cardUpdate(); if(kp(KEY_BACKSPACE)){tt_ir_stop_requested=true;break;} delay(30); }
+        }
+        if (!tt_ir_stop_requested) tt_show_success("CMD scan done");
+    }, true});
+    tt_menu(cfg, "CMD Byte Scan");
+}
+
+// --- 4. Proto Byte Scan ---
+void tt_lab_proto_scan(const uint8_t plid[4]) {
+    uint8_t proto = 0x85;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[24]; snprintf(b,sizeof(b),"Proto: 0x%02X (%d)",proto,proto); return String(b); },
+        [&](){ proto = (uint8_t)(proto + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ return (proto == 0x85) ? String("Known: DM protocol") : String("Unknown"); }, [](){}, false));
+    cfg.push_back({[](){ return String(">> SEND ping <<"); }, [&](){
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t p = 0;
+        buf[p++] = proto;
+        memcpy(&buf[p], plid, 4); p += 4;
+        buf[p++] = 0x97;
+        buf[p++] = 0x01; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x00;
+        for (int i = 0; i < 20; i++) buf[p++] = 0x01;
+        size_t len = tt_terminate(buf, p);
+        char t[20]; snprintf(t,sizeof(t),"Proto 0x%02X",proto);
+        tt_lab_send_raw(plid, buf, len, 100, t);
+        tt_result_screen(t);
+    }, true});
+    cfg.push_back({[](){ return String(">> SEND LED <<"); }, [&](){
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t p = 0;
+        buf[p++] = proto;
+        memcpy(&buf[p], plid, 4); p += 4;
+        buf[p++] = 0x06;
+        buf[p++] = 0x49; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x05;
+        size_t len = tt_terminate(buf, p);
+        uint8_t pb[TT_MAX_FRAME_SIZE];
+        size_t pl = tt_make_ping_frame(pb, plid);
+        tt_lab_send_raw(plid, pb, pl, 80, "Wake");
+        char t[20]; snprintf(t,sizeof(t),"Proto 0x%02X LED",proto);
+        tt_lab_send_raw(plid, buf, len, 50, t);
+        tt_result_screen(t);
+    }, true});
+    tt_menu(cfg, "Proto Byte Scan");
+}
+
+// --- 5. Param 0x88 Mystery Byte Test ---
+void tt_lab_param88(const uint8_t plid[4], const char* barcode) {
+    uint8_t mystery = 0x88;
+    uint8_t page = 1;
+    TtTagProfile prof;
+    tt_barcode_to_profile(barcode, &prof);
+    uint16_t w = prof.known ? prof.width : 208;
+    uint16_t h = prof.known ? prof.height : 112;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[24]; snprintf(b,sizeof(b),"Byte: 0x%02X (%d)",mystery,mystery); return String(b); },
+        [&](){ mystery = (uint8_t)(mystery + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ return "Page: " + String(page); },
+        [&](){ page = (page + tt_dir + 8) % 8; }, false));
+    cfg.push_back({[](){ return String(">> SEND (checkerboard) <<"); }, [&](){
+        size_t pc = (size_t)w * h;
+        uint8_t* px = (uint8_t*)calloc(pc, 1);
+        if (!px) { tt_show_error("OOM"); return; }
+        for (size_t i = 0; i < pc; i++) px[i] = ((i/8 + i/(w*8)) & 1) ? 1 : 0;
+        TtImagePayload payload;
+        if (!tt_encode_image_payload(px, w, h, false, TT_COMP_RAW, &payload)) { free(px); tt_show_error("Encode"); return; }
+        free(px);
+        size_t fc = payload.byte_count / TT_DATA_BYTES_PER_FRAME;
+        size_t total = 2 + fc + 1;
+        TtFrameSeq seq; memset(&seq, 0, sizeof(seq));
+        seq.count = total;
+        seq.frames = (uint8_t**)malloc(sizeof(uint8_t*) * total);
+        seq.lengths = (size_t*)malloc(sizeof(size_t) * total);
+        seq.repeats = (uint16_t*)malloc(sizeof(uint16_t) * total);
+        if (!seq.frames || !seq.lengths || !seq.repeats) { tt_free_image_payload(&payload); tt_show_error("OOM"); return; }
+        size_t idx = 0;
+        seq.frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+        seq.lengths[idx] = tt_make_ping_frame(seq.frames[idx], plid);
+        seq.repeats[idx] = 80; idx++;
+        seq.frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+        {
+            uint8_t* b = seq.frames[idx];
+            size_t p = tt_mcu_frame(b, plid, 0x05);
+            tt_append_word(b, &p, (uint16_t)payload.byte_count);
+            b[p++] = 0x00; b[p++] = payload.comp_type; b[p++] = page;
+            tt_append_word(b, &p, w); tt_append_word(b, &p, h);
+            tt_append_word(b, &p, 0); tt_append_word(b, &p, 0);
+            tt_append_word(b, &p, 0x0000);
+            b[p++] = mystery;
+            tt_append_word(b, &p, 0x0000);
+            for (int i = 0; i < 4; i++) b[p++] = 0x00;
+            seq.lengths[idx] = tt_terminate(b, p);
+        }
+        seq.repeats[idx] = 1; idx++;
+        for (size_t fi = 0; fi < fc; fi++) {
+            seq.frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+            seq.lengths[idx] = tt_make_image_data_frame(seq.frames[idx], plid, (uint16_t)fi, &payload.data[fi * TT_DATA_BYTES_PER_FRAME]);
+            seq.repeats[idx] = tt_data_repeats; idx++;
+        }
+        seq.frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+        seq.lengths[idx] = tt_make_refresh_frame(seq.frames[idx], plid);
+        seq.repeats[idx] = 20;
+        tt_free_image_payload(&payload);
+        memcpy(&tt_current_seq, &seq, sizeof(seq));
+        char t[24]; snprintf(t,sizeof(t),"0x88=0x%02X",mystery);
+        tt_transmit_sequence_inline(t);
+        tt_result_screen(t);
+    }, true});
+    tt_menu(cfg, "Param 0x88 Test");
+}
+
+// --- 6. Partial Update Test (pos_x, pos_y) ---
+void tt_lab_partial(const uint8_t plid[4]) {
+    uint16_t px = 0, py = 0, pw = 50, ph = 50;
+    uint8_t page = 1;
+    uint8_t pattern = 0;
+    const char* patterns[] = {"Black", "White", "Checker", "Stripes-H", "Stripes-V"};
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ return "X: " + String(px); }, [&](){ px = (uint16_t)(px + tt_dir * 10 + 300) % 300; }, false));
+    cfg.push_back(ttItem([&](){ return "Y: " + String(py); }, [&](){ py = (uint16_t)(py + tt_dir * 10 + 200) % 200; }, false));
+    cfg.push_back(ttItem([&](){ return "W: " + String(pw); }, [&](){ pw = (uint16_t)max(8, min(208, (int)pw + tt_dir * 8)); }, false));
+    cfg.push_back(ttItem([&](){ return "H: " + String(ph); }, [&](){ ph = (uint16_t)max(8, min(112, (int)ph + tt_dir * 8)); }, false));
+    cfg.push_back(ttItem([&](){ return "Page: " + String(page); }, [&](){ page = (page + tt_dir + 8) % 8; }, false));
+    cfg.push_back(ttItem([&](){ return String("Pattern: ") + patterns[pattern]; }, [&](){ pattern = (pattern + tt_dir + 5) % 5; }, false));
+    cfg.push_back({[](){ return String(">> SEND <<"); }, [&](){
+        size_t pc = (size_t)pw * ph;
+        uint8_t* pix = (uint8_t*)calloc(pc, 1);
+        if (!pix) { tt_show_error("OOM"); return; }
+        for (size_t i = 0; i < pc; i++) {
+            int x = i % pw, y = i / pw;
+            switch(pattern) {
+                case 0: pix[i] = 1; break;
+                case 1: pix[i] = 0; break;
+                case 2: pix[i] = ((x/4 + y/4) & 1); break;
+                case 3: pix[i] = (y/4) & 1; break;
+                case 4: pix[i] = (x/4) & 1; break;
+            }
+        }
+        memset(&tt_current_seq, 0, sizeof(tt_current_seq));
+        bool ok = tt_build_image_sequence(&tt_current_seq, plid, pix, pw, ph, page, px, py, 80, false, tt_comp_mode);
+        free(pix);
+        if (!ok) { tt_show_error("Encode"); return; }
+        char t[32]; snprintf(t,sizeof(t),"Partial %dx%d@%d,%d",pw,ph,px,py);
+        tt_transmit_sequence_inline(t);
+        tt_result_screen(t);
+    }, true});
+    tt_menu(cfg, "Partial Update Test");
+}
+
+// --- 7. Compression Type Test ---
+void tt_lab_comp(const uint8_t plid[4], const char* barcode) {
+    uint8_t comp = 0;
+    uint8_t page = 1;
+    TtTagProfile prof;
+    tt_barcode_to_profile(barcode, &prof);
+    uint16_t w = prof.known ? prof.width : 208;
+    uint16_t h = prof.known ? prof.height : 112;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[24]; snprintf(b,sizeof(b),"Comp type: %d (%s)",comp,comp==0?"RAW":comp==1?"???":comp==2?"RLE":"???"); return String(b); },
+        [&](){ comp = (uint8_t)(comp + tt_dir + 8) % 8; }, false));
+    cfg.push_back(ttItem([&](){ return "Page: " + String(page); }, [&](){ page = (page + tt_dir + 8) % 8; }, false));
+    cfg.push_back({[](){ return String(">> SEND (gradient) <<"); }, [&](){
+        size_t pc = (size_t)w * h;
+        uint8_t* pix = (uint8_t*)calloc(pc, 1);
+        if (!pix) { tt_show_error("OOM"); return; }
+        for (size_t i = 0; i < pc; i++) pix[i] = ((i % w) * 255 / w > 128) ? 1 : 0;
+        TtImagePayload payload;
+        size_t total_pixels = pc;
+        size_t raw_bits = total_pixels;
+        size_t pad_raw = (TT_DATA_BITS_PER_FRAME - (raw_bits % TT_DATA_BITS_PER_FRAME)) % TT_DATA_BITS_PER_FRAME;
+        size_t raw_bytes = (raw_bits + pad_raw) / 8U;
+        uint8_t* data = (uint8_t*)calloc(raw_bytes, 1);
+        if (!data) { free(pix); tt_show_error("OOM"); return; }
+        TtBitWriter bw = {data, 0};
+        for (size_t i = 0; i < pc; i++) tt_bw_append(&bw, pix[i]);
+        free(pix);
+        payload.data = data;
+        payload.byte_count = raw_bytes;
+        payload.comp_type = comp;
+        size_t fc = payload.byte_count / TT_DATA_BYTES_PER_FRAME;
+        size_t total = 2 + fc + 1;
+        TtFrameSeq seq; memset(&seq, 0, sizeof(seq));
+        seq.count = total;
+        seq.frames = (uint8_t**)malloc(sizeof(uint8_t*) * total);
+        seq.lengths = (size_t*)malloc(sizeof(size_t) * total);
+        seq.repeats = (uint16_t*)malloc(sizeof(uint16_t) * total);
+        if (!seq.frames || !seq.lengths || !seq.repeats) { free(data); tt_show_error("OOM"); return; }
+        size_t idx = 0;
+        seq.frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+        seq.lengths[idx] = tt_make_ping_frame(seq.frames[idx], plid);
+        seq.repeats[idx] = 80; idx++;
+        seq.frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+        seq.lengths[idx] = tt_make_image_param_frame(seq.frames[idx], plid, (uint16_t)raw_bytes, comp, page, w, h, 0, 0);
+        seq.repeats[idx] = 1; idx++;
+        for (size_t fi = 0; fi < fc; fi++) {
+            seq.frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+            seq.lengths[idx] = tt_make_image_data_frame(seq.frames[idx], plid, (uint16_t)fi, &data[fi * TT_DATA_BYTES_PER_FRAME]);
+            seq.repeats[idx] = tt_data_repeats; idx++;
+        }
+        seq.frames[idx] = (uint8_t*)malloc(TT_MAX_FRAME_SIZE);
+        seq.lengths[idx] = tt_make_refresh_frame(seq.frames[idx], plid);
+        seq.repeats[idx] = 20;
+        free(data);
+        memcpy(&tt_current_seq, &seq, sizeof(seq));
+        char t[24]; snprintf(t,sizeof(t),"Comp=%d",comp);
+        tt_transmit_sequence_inline(t);
+        tt_result_screen(t);
+    }, true});
+    tt_menu(cfg, "Compression Type Test");
+}
+
+// --- 8. Debug/Ping Payload Variations ---
+void tt_lab_ping_var(const uint8_t plid[4]) {
+    uint8_t first = 0x01;
+    uint8_t fill = 0x01;
+    uint8_t cmd = 0x97;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[24]; snprintf(b,sizeof(b),"CMD: 0x%02X (%s)",cmd,cmd==0x97?"PING":"other"); return String(b); },
+        [&](){ cmd = (uint8_t)(cmd + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ char b[16]; snprintf(b,sizeof(b),"Byte1: 0x%02X",first); return String(b); },
+        [&](){ first = (uint8_t)(first + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ char b[16]; snprintf(b,sizeof(b),"Fill: 0x%02X",fill); return String(b); },
+        [&](){ fill = (uint8_t)(fill + tt_dir); }, false));
+    cfg.push_back({[](){ return String(">> SEND <<"); }, [&](){
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, cmd);
+        buf[p++] = first; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x00;
+        for (int i = 0; i < 20; i++) buf[p++] = fill;
+        size_t len = tt_terminate(buf, p);
+        char t[24]; snprintf(t,sizeof(t),"Ping 0x%02X/0x%02X",first,fill);
+        tt_lab_send_raw(plid, buf, len, 100, t);
+        tt_result_screen(t);
+    }, true});
+    tt_menu(cfg, "Ping/Debug Variations");
+}
+
+// --- 9. Broadcast vs Targeted comparison ---
+void tt_lab_bc_vs_tgt(const uint8_t plid[4]) {
+    uint8_t cmd = 0x06;
+    uint8_t pay0 = 0x49;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[20]; snprintf(b,sizeof(b),"CMD: 0x%02X",cmd); return String(b); },
+        [&](){ cmd = (uint8_t)(cmd + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ char b[20]; snprintf(b,sizeof(b),"Payload[0]: 0x%02X",pay0); return String(b); },
+        [&](){ pay0 = (uint8_t)(pay0 + tt_dir); }, false));
+    cfg.push_back({[](){ return String(">> BROADCAST <<"); }, [&](){
+        const uint8_t bc[4] = {0,0,0,0};
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t p = tt_raw_frame(buf, TT_PROTO_DM, bc, cmd);
+        buf[p++] = pay0; for(int i=0;i<4;i++) buf[p++]=0x00;
+        size_t len = tt_terminate(buf, p);
+        tt_lab_send_raw(bc, buf, len, 100, "Broadcast");
+        tt_result_screen("Broadcast");
+    }, true});
+    cfg.push_back({[](){ return String(">> TARGETED <<"); }, [&](){
+        uint8_t pb[TT_MAX_FRAME_SIZE];
+        size_t pl = tt_make_ping_frame(pb, plid);
+        tt_lab_send_raw(plid, pb, pl, 80, "Wake");
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t p = tt_raw_frame(buf, TT_PROTO_DM, plid, cmd);
+        buf[p++] = pay0; for(int i=0;i<4;i++) buf[p++]=0x00;
+        size_t len = tt_terminate(buf, p);
+        tt_lab_send_raw(plid, buf, len, 50, "Targeted");
+        tt_result_screen("Targeted");
+    }, true});
+    tt_menu(cfg, "Broadcast vs Targeted");
+}
+
+// --- 10. Custom Raw Frame Builder ---
+void tt_lab_raw_builder(const uint8_t plid[4]) {
+    uint8_t proto = 0x85;
+    uint8_t cmd = 0x06;
+    uint8_t payload[20]; memset(payload, 0, 20);
+    payload[0] = 0x49;
+    uint8_t pay_len = 5;
+    int edit_idx = 0;
+    bool use_plid = true;
+    uint16_t reps = 50;
+    bool ping_first = true;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ char b[20]; snprintf(b,sizeof(b),"Proto: 0x%02X",proto); return String(b); },
+        [&](){ proto = (uint8_t)(proto + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ char b[20]; snprintf(b,sizeof(b),"CMD: 0x%02X",cmd); return String(b); },
+        [&](){ cmd = (uint8_t)(cmd + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ return String("PLID: ") + (use_plid ? "targeted" : "broadcast"); },
+        [&](){ use_plid = !use_plid; }, false));
+    cfg.push_back(ttItem([&](){ return String("Ping first: ") + (ping_first ? "YES" : "NO"); },
+        [&](){ ping_first = !ping_first; }, false));
+    cfg.push_back(ttItem([&](){ return "Payload len: " + String(pay_len); },
+        [&](){ pay_len = (uint8_t)max(1, min(20, (int)pay_len + tt_dir)); }, false));
+    cfg.push_back(ttItem([&](){ return "Edit byte: " + String(edit_idx); },
+        [&](){ edit_idx = (edit_idx + tt_dir + 20) % 20; }, false));
+    cfg.push_back(ttItem([&](){ char b[20]; snprintf(b,sizeof(b),"[%d]=0x%02X",edit_idx,payload[edit_idx]); return String(b); },
+        [&](){ payload[edit_idx] = (uint8_t)(payload[edit_idx] + tt_dir); }, false));
+    cfg.push_back(ttItem([&](){ return "Repeats: " + String(reps); },
+        [&](){ reps = (uint16_t)max(1, min(500, (int)reps + tt_dir * 10)); }, false));
+    cfg.push_back({[](){ return String(">> SEND <<"); }, [&](){
+        const uint8_t* p_id = use_plid ? plid : (const uint8_t*)"\x00\x00\x00\x00";
+        uint8_t buf[TT_MAX_FRAME_SIZE];
+        size_t p = 0;
+        buf[p++] = proto;
+        memcpy(&buf[p], p_id, 4); p += 4;
+        buf[p++] = cmd;
+        memcpy(&buf[p], payload, pay_len); p += pay_len;
+        size_t len = tt_terminate(buf, p);
+        if (ping_first) {
+            uint8_t pb[TT_MAX_FRAME_SIZE];
+            size_t pl = tt_make_ping_frame(pb, use_plid ? plid : p_id);
+            tt_lab_send_raw(p_id, pb, pl, 80, "Wake");
+        }
+        tt_lab_send_raw(p_id, buf, len, reps, "Custom");
+        tt_result_screen("Custom frame");
+    }, true});
+    tt_menu(cfg, "Raw Frame Builder");
+}
+
+// --- Main Protocol Lab menu ---
+void tt_protocol_lab() {
+    tt_targets_load();
+    if (tt_target_count == 0) { tt_show_error("No saved tags"); return; }
+    std::vector<String> tagLabels;
+    for (uint8_t i = 0; i < tt_target_count; i++)
+        tagLabels.push_back(tt_targets[i].name[0] ? tt_targets[i].name : tt_targets[i].barcode);
+    int ti = tt_menu_select(tagLabels, "Select Tag");
+    if (ti < 0) return;
+    uint8_t plid[4];
+    tt_barcode_to_plid(tt_targets[ti].barcode, plid);
+
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([](){ return String("CMD06 Byte Scan"); }, [&](){ tt_lab_cmd06_scan(plid); }, true));
+    cfg.push_back(ttItem([](){ return String("MCU Sub-Cmd Scan"); }, [&](){ tt_lab_mcu_scan(plid); }, true));
+    cfg.push_back(ttItem([](){ return String("CMD Byte Scan"); }, [&](){ tt_lab_cmd_scan(plid); }, true));
+    cfg.push_back(ttItem([](){ return String("Proto Byte Scan"); }, [&](){ tt_lab_proto_scan(plid); }, true));
+    cfg.push_back(ttItem([](){ return String("Param 0x88 Test"); }, [&](){ tt_lab_param88(plid, tt_targets[ti].barcode); }, true));
+    cfg.push_back(ttItem([](){ return String("Partial Update"); }, [&](){ tt_lab_partial(plid); }, true));
+    cfg.push_back(ttItem([](){ return String("Compression Type"); }, [&](){ tt_lab_comp(plid, tt_targets[ti].barcode); }, true));
+    cfg.push_back(ttItem([](){ return String("Ping Variations"); }, [&](){ tt_lab_ping_var(plid); }, true));
+    cfg.push_back(ttItem([](){ return String("Broadcast vs Target"); }, [&](){ tt_lab_bc_vs_tgt(plid); }, true));
+    cfg.push_back(ttItem([](){ return String("Raw Frame Builder"); }, [&](){ tt_lab_raw_builder(plid); }, true));
+    tt_menu(cfg, "Protocol Lab");
+}
+
+void tt_raw_frame_sender() {
+    uint8_t raw[TT_MAX_FRAME_SIZE];
+    memset(raw, 0, sizeof(raw));
+    int rawLen = 0;
+
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ return "Length: " + String(rawLen) + " bytes"; }, [&](){
+        rawLen = (tt_dir > 0) ? ((rawLen >= 48) ? 1 : rawLen + 1) : ((rawLen <= 1) ? 48 : rawLen - 1);
+    }, false));
+
+    for (int b = 0; b < 12; b++) {
+        cfg.push_back(ttItem([&, b](){
+            if (b >= rawLen) { char t[16]; snprintf(t, sizeof(t), "byte %d: --", b); return String(t); }
+            char hex[16]; snprintf(hex, sizeof(hex), "byte %d: 0x%02X", b, raw[b]);
+            return String(hex);
+        }, [&, b](){
+            if (b < rawLen) raw[b] = (raw[b] + tt_dir + 256) % 256;
+        }, false));
+    }
+
+    cfg.push_back({[](){ return String(">> SEND RAW <<"); }, [&](){
+        if (rawLen < 1) { tt_show_error("Empty frame"); return; }
+        uint8_t frame[TT_MAX_FRAME_SIZE];
+        memcpy(frame, raw, rawLen);
+        uint16_t crc = tt_crc16(frame, rawLen);
+        frame[rawLen] = crc & 0xFF;
+        frame[rawLen + 1] = (crc >> 8) & 0xFF;
+        memcpy(tt_current_job.frame_data, frame, rawLen + 2);
+        tt_current_job.frame_len = rawLen + 2;
+        tt_current_job.repeats = 50;
+        tt_current_job.gap_delay = 2;
+        while (true) {
+            tt_do_transmit_single("Raw Frame TX");
+            if (!tt_result_screen("Raw Frame")) break;
+        }
+    }, true});
+    tt_menu(cfg, "Raw Frame Sender");
+}
+// =====================================================================
+
+// =====================================================================
+// =================== ONLINE CONTENT PLUGINS ==========================
+// =====================================================================
+
+uint8_t* tt_render_canvas(uint16_t w, uint16_t h, std::function<void(M5Canvas&)> drawer) {
+    size_t pc = (size_t)w * h;
+    size_t packed_sz = (pc + 7) / 8;
+
+    // Allocate pre-packed output buffer (15KB for 400x300, 39KB for 648x480)
+    uint8_t* pixels = (uint8_t*)calloc(packed_sz + 1, 1);
+    if (!pixels) return NULL;
+    pixels[0] = 0xFE;
+
+    // Try 1-bit sprite at full resolution (15-39KB — much less than 8-bit)
+    M5Canvas canvas(&M5.Display);
+    canvas.setColorDepth(1);
+    void* spr = canvas.createSprite(w, h);
+    if (spr) {
+        canvas.fillSprite(TFT_BLACK);
+        canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+        drawer(canvas);
+        for (uint16_t y = 0; y < h; y++)
+            for (uint16_t x = 0; x < w; x++)
+                if (canvas.readPixel(x, y) != 0) {
+                    size_t idx = (size_t)y * w + x;
+                    pixels[1 + idx/8] |= (1 << (7 - (idx%8)));
+                }
+        canvas.deleteSprite();
+        Serial.printf("[TT] render_canvas 1-bit %dx%d heap=%d\n", w, h, ESP.getFreeHeap());
+        return pixels;
+    }
+
+    // Fallback: 8-bit sprite if 1-bit doesn't work on this M5GFX version
+    canvas.setColorDepth(8);
+    spr = canvas.createSprite(w, h);
+    if (spr) {
+        canvas.fillSprite(TFT_BLACK);
+        canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+        drawer(canvas);
+        for (uint16_t y = 0; y < h; y++)
+            for (uint16_t x = 0; x < w; x++)
+                if (canvas.readPixel(x, y) != 0) {
+                    size_t idx = (size_t)y * w + x;
+                    pixels[1 + idx/8] |= (1 << (7 - (idx%8)));
+                }
+        canvas.deleteSprite();
+        Serial.printf("[TT] render_canvas 8-bit %dx%d heap=%d\n", w, h, ESP.getFreeHeap());
+        return pixels;
+    }
+
+    // Last resort: too large even for 1-bit sprite — return empty image
+    Serial.printf("[TT] render_canvas FAILED %dx%d heap=%d\n", w, h, ESP.getFreeHeap());
+    free(pixels);
+    return NULL;
+}
+
+bool tt_check_wifi() {
+    if (WiFi.status() == WL_CONNECTED) return true;
+    tt_show_error("WiFi not connected");
+    return false;
+}
+
+String tt_http_get(const char* url) {
+    HTTPClient http;
+    WiFiClientSecure sclient;
+    sclient.setInsecure();
+    http.begin(sclient, url);
+    http.setTimeout(8000);
+    int code = http.GET();
+    String result = "";
+    if (code == 200) result = http.getString();
+    http.end();
+    return result;
+}
+
+void tt_send_pixels_to_tag(uint8_t* pixels, uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    if (!tt_stream_image(plid, pixels, w, h, tt_page, tt_wake_repeats_val, hasColor, tt_comp_mode, "Sending")) {
+        tt_show_error("Encode error");
+        return;
+    }
+    tt_result_screen("Sent");
+}
+
+void tt_online_send(uint8_t* pixels, uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.fillRect(0, 0, 240, 18, TFT_NAVY);
+    M5.Display.setTextFont(1); M5.Display.setTextSize(1.5);
+    M5.Display.setCursor(5, 3); M5.Display.setTextColor(TFT_GREEN);
+    M5.Display.printf("Preview %ux%u", w, h);
+    tt_preview_pixels(pixels, w, h, 20);
+    M5.Display.display();
+    delay(200);
+    while (true) {
+        cardUpdate();
+        if (kp(KEY_ENTER) || kp('\n')) { enterDebounce(); tt_send_pixels_to_tag(pixels, w, h, plid, hasColor); return; }
+        if (kp(KEY_BACKSPACE)) { backDebounce(); return; }
+        delay(30);
+    }
+}
+
+// Scale factor for online content: tag height relative to 128px reference
+int ts(uint16_t h, int base) {
+    int s = base * h / 128;
+    return s < 1 ? 1 : s;
+}
+
+// --- CRYPTO TICKER with 24h graph ---
+
+void tt_online_crypto(uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    if (!tt_check_wifi()) return;
+    M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+    M5.Display.setCursor(10, 50); M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_GREEN); M5.Display.print("Fetching crypto...");
+    M5.Display.display();
+
+    float btcUsd=0, btcEur=0, ethUsd=0, ethEur=0;
+    float prices[24]; int priceCount = 0;
+
+    {
+        String json = tt_http_get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd,eur");
+        if (json.length() == 0) { tt_show_error("HTTP failed"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) { tt_show_error("JSON error"); return; }
+        btcUsd = doc["bitcoin"]["usd"]; btcEur = doc["bitcoin"]["eur"];
+        ethUsd = doc["ethereum"]["usd"]; ethEur = doc["ethereum"]["eur"];
+    }
+
+    M5.Display.setCursor(10, 65); M5.Display.print("Fetching graph...");
+    M5.Display.display();
+
+    {
+        String hist = tt_http_get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1");
+        if (hist.length() > 0) {
+            JsonDocument hdoc;
+            if (!deserializeJson(hdoc, hist)) {
+                JsonArray arr = hdoc["prices"];
+                int step = arr.size() / 24;
+                if (step < 1) step = 1;
+                for (int i = 0; i < (int)arr.size() && priceCount < 24; i += step)
+                    prices[priceCount++] = arr[i][1];
+            }
+        }
+    }
+
+    uint8_t* pixels = tt_render_canvas(w, h, [&](M5Canvas& c) {
+        c.drawRect(0, 0, w, h, TFT_WHITE);
+        c.setTextSize(ts(h,2)); c.setCursor(4, 3); c.print("BTC");
+        char buf[20];
+        snprintf(buf, sizeof(buf), "$%.0f", btcUsd); c.setCursor(56, 3); c.print(buf);
+        c.setTextSize(ts(h,1));
+        snprintf(buf, sizeof(buf), "EUR %.0f", btcEur); c.setCursor(56, 20); c.print(buf);
+
+        if (priceCount > 2) {
+            int gx = 4, gy = 34, gw = w - 8, gh = h/2 - 38;
+            c.drawRect(gx-1, gy-1, gw+2, gh+2, TFT_WHITE);
+            float mn = prices[0], mx = prices[0];
+            for (int i = 1; i < priceCount; i++) { if (prices[i]<mn) mn=prices[i]; if (prices[i]>mx) mx=prices[i]; }
+            float range = mx - mn; if (range < 1) range = 1;
+            for (int i = 1; i < priceCount; i++) {
+                int x0 = gx + (i-1)*gw/priceCount, y0 = gy+gh-1-(int)((prices[i-1]-mn)/range*(gh-2));
+                int x1 = gx + i*gw/priceCount, y1 = gy+gh-1-(int)((prices[i]-mn)/range*(gh-2));
+                c.drawLine(x0, y0, x1, y1, TFT_WHITE);
+            }
+            c.setTextSize(ts(h,1));
+            snprintf(buf, sizeof(buf), "%.0f", mx); c.setCursor(gx+2, gy+1); c.print(buf);
+            snprintf(buf, sizeof(buf), "%.0f", mn); c.setCursor(gx+2, gy+gh-9); c.print(buf);
+        }
+
+        int midY = h/2 + (priceCount > 2 ? 4 : 0);
+        c.drawLine(2, midY, w-3, midY, TFT_WHITE);
+        c.setTextSize(ts(h,2)); c.setCursor(4, midY+3); c.print("ETH");
+        snprintf(buf, sizeof(buf), "$%.0f", ethUsd); c.setCursor(56, midY+3); c.print(buf);
+        c.setTextSize(ts(h,1));
+        snprintf(buf, sizeof(buf), "EUR %.0f", ethEur); c.setCursor(56, midY+20); c.print(buf);
+
+        c.fillTriangle(w-14, 8, w-9, 3, w-4, 8, TFT_WHITE);
+        c.fillTriangle(w-14, midY+8, w-9, midY+13, w-4, midY+8, TFT_WHITE);
+    });
+    if (!pixels) { tt_show_error("Memory"); return; }
+    tt_online_send(pixels, w, h, plid, hasColor);
+    free(pixels);
+}
+
+// --- WEATHER with city selection ---
+
+struct TtCity { const char* name; float lat; float lon; };
+const TtCity tt_cities[] = {
+    {"Paris", 48.85, 2.35}, {"London", 51.51, -0.13}, {"New York", 40.71, -74.01},
+    {"Tokyo", 35.68, 139.69}, {"Berlin", 52.52, 13.41}, {"Madrid", 40.42, -3.70},
+    {"Rome", 41.90, 12.50}, {"Amsterdam", 52.37, 4.90}, {"Brussels", 50.85, 4.35},
+    {"Geneva", 46.20, 6.15}, {"Dubai", 25.20, 55.27}, {"Sydney", -33.87, 151.21},
+    {"Montreal", 45.50, -73.57}, {"Seoul", 37.57, 126.98}, {"Singapore", 1.35, 103.82},
+};
+const int tt_city_count = sizeof(tt_cities) / sizeof(tt_cities[0]);
+
+void tt_draw_weather_icon(M5Canvas& c, int x, int y, int sz, int code) {
+    if (code <= 1) {
+        c.fillCircle(x+sz/2, y+sz/2, sz/3, TFT_WHITE);
+        for (int a = 0; a < 8; a++) {
+            float r = a * 0.785;
+            int cx = x+sz/2, cy = y+sz/2;
+            c.drawLine(cx+(int)(cos(r)*sz*0.4), cy+(int)(sin(r)*sz*0.4),
+                       cx+(int)(cos(r)*sz*0.55), cy+(int)(sin(r)*sz*0.55), TFT_WHITE);
+        }
+    } else if (code <= 3) {
+        c.fillRoundRect(x+sz/6, y+sz/3, sz*2/3, sz/3, sz/6, TFT_WHITE);
+        c.fillCircle(x+sz/3, y+sz/3, sz/5, TFT_WHITE);
+        c.fillCircle(x+sz*2/3, y+sz/4, sz/5, TFT_WHITE);
+    } else if (code >= 51 && code <= 67) {
+        c.fillRoundRect(x+sz/6, y+sz/6, sz*2/3, sz/4, sz/8, TFT_WHITE);
+        for (int i = 0; i < 3; i++) c.drawLine(x+sz/4+i*sz/5, y+sz/2, x+sz/5+i*sz/5, y+sz*3/4, TFT_WHITE);
+    } else if (code >= 71 && code <= 77) {
+        c.fillRoundRect(x+sz/6, y+sz/6, sz*2/3, sz/4, sz/8, TFT_WHITE);
+        for (int i = 0; i < 3; i++) c.drawCircle(x+sz/4+i*sz/5, y+sz*2/3, 2, TFT_WHITE);
+    } else {
+        c.fillRoundRect(x+sz/6, y+sz/6, sz*2/3, sz/4, sz/8, TFT_WHITE);
+        c.drawLine(x+sz/3, y+sz/2, x+sz/2, y+sz*3/4, TFT_WHITE);
+        c.drawLine(x+sz/2, y+sz*3/4, x+sz/3+2, y+sz*3/4, TFT_WHITE);
+    }
+}
+
+void tt_online_weather(uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    if (!tt_check_wifi()) return;
+
+    std::vector<String> cityLabels;
+    for (int i = 0; i < tt_city_count; i++) cityLabels.push_back(tt_cities[i].name);
+    int ci = tt_menu_select(cityLabels, "Select City");
+    if (ci < 0) return;
+
+    M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+    M5.Display.setCursor(10, 50); M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_GREEN); M5.Display.printf("Weather %s...", tt_cities[ci].name);
+    M5.Display.display();
+
+    float temp; float wind; int wcode; int isDay;
+    const char* cityName = tt_cities[ci].name;
+    {
+        char url[128];
+        snprintf(url, sizeof(url), "https://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f&current_weather=true", tt_cities[ci].lat, tt_cities[ci].lon);
+        String json = tt_http_get(url);
+        if (json.length() == 0) { tt_show_error("HTTP failed"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) { tt_show_error("JSON error"); return; }
+        temp = doc["current_weather"]["temperature"];
+        wind = doc["current_weather"]["windspeed"];
+        wcode = doc["current_weather"]["weathercode"];
+        isDay = doc["current_weather"]["is_day"];
+    }
+
+    uint8_t* pixels = tt_render_canvas(w, h, [&](M5Canvas& c) {
+        c.drawRect(0, 0, w, h, TFT_WHITE);
+        int iconSz = h/3;
+        tt_draw_weather_icon(c, 4, 4, iconSz, wcode);
+        c.setTextSize(ts(h,2)); c.setCursor(iconSz + 8, 6); c.print(cityName);
+        c.setTextSize(ts(h,4));
+        char buf[16]; snprintf(buf, sizeof(buf), "%.1f", temp);
+        int tx = (w - strlen(buf)*24)/2;
+        c.setCursor(tx > 4 ? tx : 4, h/2 - 20); c.print(buf);
+        c.setTextSize(ts(h,1)); c.setCursor(tx + strlen(buf)*24 + 2, h/2 - 18); c.print("C");
+        c.setTextSize(ts(h,1));
+        snprintf(buf, sizeof(buf), "Wind: %.0f km/h", wind);
+        c.setCursor(4, h-24); c.print(buf);
+        c.setCursor(w/2, h-24); c.print(isDay ? "Day" : "Night");
+    });
+    if (!pixels) { tt_show_error("Memory"); return; }
+    tt_online_send(pixels, w, h, plid, hasColor);
+    free(pixels);
+}
+
+// --- CLOCK (white on black = inverted for e-ink) ---
+
+void tt_online_clock(uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    if (!tt_check_wifi()) return;
+    M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+    M5.Display.setCursor(10, 50); M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_GREEN); M5.Display.print("Fetching time...");
+    M5.Display.display();
+
+    int hour, minute, day, month, year; String dowStr;
+    {
+        String json = tt_http_get("https://timeapi.io/api/time/current/zone?timeZone=Europe/Paris");
+        if (json.length() == 0) { tt_show_error("HTTP failed"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) { tt_show_error("JSON error"); return; }
+        hour = doc["hour"]; minute = doc["minute"];
+        day = doc["day"]; month = doc["month"]; year = doc["year"];
+        dowStr = doc["dayOfWeek"].as<String>();
+    }
+
+    uint8_t* pixels = tt_render_canvas(w, h, [&](M5Canvas& c) {
+        c.fillSprite(TFT_WHITE);
+        c.setTextColor(TFT_BLACK, TFT_WHITE);
+        c.drawRect(0, 0, w, h, TFT_BLACK);
+        c.setTextSize(ts(h,5));
+        char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%02d:%02d", hour, minute);
+        int tw = strlen(tbuf) * 30;
+        c.setCursor((w - tw) / 2, h/2 - 30); c.print(tbuf);
+        c.setTextSize(ts(h,2));
+        int dw = dowStr.length() * 12;
+        c.setCursor((w - dw) / 2, h/2 + 8); c.print(dowStr);
+        char dbuf[12]; snprintf(dbuf, sizeof(dbuf), "%02d/%02d/%04d", day, month, year);
+        c.setTextSize(ts(h,1));
+        c.setCursor((w - strlen(dbuf)*6)/2, h - 16); c.print(dbuf);
+    });
+    if (!pixels) { tt_show_error("Memory"); return; }
+    for (size_t i = 0; i < (size_t)w*h; i++) pixels[i] = !pixels[i];
+    tt_online_send(pixels, w, h, plid, hasColor);
+    free(pixels);
+}
+
+// --- RANDOM QUOTE with config ---
+
+void tt_online_quote(uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    if (!tt_check_wifi()) return;
+    M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+    M5.Display.setCursor(10, 50); M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_GREEN); M5.Display.print("Fetching quote...");
+    M5.Display.display();
+
+    String quote, author;
+    {
+        String json = tt_http_get("https://zenquotes.io/api/random");
+        if (json.length() == 0) { tt_show_error("HTTP failed"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) { tt_show_error("JSON error"); return; }
+        quote = doc[0]["q"].as<String>();
+        author = doc[0]["a"].as<String>();
+    }
+
+    uint8_t qSize = 1;
+    if (w >= 296) qSize = 2;
+    uint8_t qFg = 1, qBg = 0;
+
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([&](){ int cw=6*qSize,ch=8*qSize; int mx=((w-8)/cw)*((h-20)/ch);
+        return "Size:" + String(qSize) + " (" + String(quote.length()) + "/" + String(mx) + ")"; },
+        [&](){ qSize = (qSize >= 4) ? 1 : qSize + 1; }, false));
+    if (hasColor) {
+        const char* fn[] = {"White","Black","Red"};
+        const char* bn[] = {"White","Black","Red"};
+        cfg.push_back(ttItem([&](){ return String("Text: ") + fn[qFg]; }, [&](){ qFg = (qFg + tt_dir + 3) % 3; }, false));
+        cfg.push_back(ttItem([&](){ return String("BG: ") + bn[qBg]; }, [&](){ qBg = (qBg + tt_dir + 3) % 3; }, false));
+    }
+    cfg.push_back({[](){ return String("Preview & Send"); }, [&](){
+        uint8_t* pixels = tt_render_canvas(w, h, [&](M5Canvas& c) {
+            c.drawRect(0, 0, w, h, TFT_WHITE);
+            c.setTextSize(qSize); c.setTextWrap(true, true);
+            c.setCursor(6, 6); c.print("\""); c.print(quote); c.print("\"");
+            c.setTextSize(1);
+            c.setCursor(w/2, h - 12); c.print("- "); c.print(author);
+        });
+        if (!pixels) { tt_show_error("Memory"); return; }
+        // Send via tt_stream_image (handles both mono and color via encoder)
+        tt_online_send(pixels, w, h, plid, hasColor);
+        free(pixels);
+    }, true});
+    tt_menu(cfg, "Quote Config");
+}
+
+// --- FUN FACT ---
+
+void tt_online_fact(uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    if (!tt_check_wifi()) return;
+    M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+    M5.Display.setCursor(10, 50); M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_GREEN); M5.Display.print("Fetching fact...");
+    M5.Display.display();
+
+    String factStr;
+    {
+        String json = tt_http_get("https://uselessfacts.jsph.pl/api/v2/facts/random");
+        if (json.length() == 0) { tt_show_error("HTTP failed"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) { tt_show_error("JSON error"); return; }
+        factStr = doc["text"].as<String>();
+    }
+
+    uint8_t* pixels = tt_render_canvas(w, h, [&](M5Canvas& c) {
+        c.drawRect(0, 0, w, h, TFT_WHITE);
+        c.setTextSize(2);
+        c.fillCircle(14, 14, 9, TFT_WHITE);
+        c.setTextColor(TFT_BLACK); c.setCursor(9, 5); c.print("!");
+        c.setTextColor(TFT_WHITE, TFT_BLACK);
+        c.setCursor(28, 4); c.print("Did you know?");
+        c.drawLine(2, 28, w - 3, 28, TFT_WHITE);
+        c.setTextSize(1); c.setTextWrap(true, true);
+        c.setCursor(6, 34); c.print(factStr);
+    });
+    if (!pixels) { tt_show_error("Memory"); return; }
+    tt_online_send(pixels, w, h, plid, hasColor);
+    free(pixels);
+}
+
+// --- ISS TRACKER with world map from SD ---
+
+void tt_online_iss(uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    if (!tt_check_wifi()) return;
+    M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+    M5.Display.setCursor(10, 50); M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_GREEN); M5.Display.print("Fetching ISS...");
+    M5.Display.display();
+
+    float lat, lon, alt, vel;
+    String visStr;
+    {
+        String json = tt_http_get("https://api.wheretheiss.at/v1/satellites/25544");
+        if (json.length() == 0) { tt_show_error("HTTP failed"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) { tt_show_error("JSON error"); return; }
+        lat = doc["latitude"]; lon = doc["longitude"];
+        alt = doc["altitude"]; vel = doc["velocity"];
+        visStr = doc["visibility"].as<String>();
+    }
+
+    int mapH = h - 28;
+    int mapW = w - 4;
+
+    uint8_t* mapPixels = NULL;
+    int mW = 0, mH = 0;
+    File mf = SD.open("/evil/esl/worldmap.bmp");
+    if (mf) {
+        uint8_t hdr[54];
+        if (mf.read(hdr, 54) == 54 && hdr[0]=='B' && hdr[1]=='M') {
+            mW = *(int32_t*)&hdr[18];
+            mH = abs(*(int32_t*)&hdr[22]);
+            bool bu = (*(int32_t*)&hdr[22]) > 0;
+            uint16_t bpp = *(uint16_t*)&hdr[28];
+            uint32_t doff = *(uint32_t*)&hdr[10];
+            mapPixels = (uint8_t*)calloc(mW * mH, 1);
+            if (mapPixels) {
+                int rb = ((mW * bpp / 8) + 3) & ~3;
+                uint8_t* row = (uint8_t*)malloc(rb);
+                if (row) {
+                    for (int r = 0; r < mH; r++) {
+                        int sr = bu ? (mH-1-r) : r;
+                        mf.seek(doff + (uint32_t)sr * rb);
+                        mf.read(row, rb);
+                        for (int c = 0; c < mW; c++) {
+                            uint8_t lum = 0;
+                            if (bpp == 1) lum = (row[c/8] & (0x80 >> (c%8))) ? 255 : 0;
+                            else if (bpp == 8) lum = row[c];
+                            else if (bpp == 24) lum = (row[c*3+2]*77+row[c*3+1]*150+row[c*3]*29)>>8;
+                            if (lum > 128) mapPixels[r * mW + c] = 1;
+                        }
+                    }
+                    free(row);
+                }
+            }
+        }
+        mf.close();
+    }
+
+    uint8_t* pixels = tt_render_canvas(w, h, [&](M5Canvas& c) {
+        c.drawRect(0, 0, w, h, TFT_WHITE);
+        c.drawRect(1, 1, w-2, mapH+2, TFT_WHITE);
+
+        if (mapPixels && mW > 0 && mH > 0) {
+            for (int py = 0; py < mapH; py++) {
+                for (int px = 0; px < mapW; px++) {
+                    int sx = px * mW / mapW;
+                    int sy = py * mH / mapH;
+                    if (sx < mW && sy < mH && mapPixels[sy * mW + sx])
+                        c.drawPixel(2 + px, 2 + py, TFT_WHITE);
+                }
+            }
+        }
+
+        int issX = 2 + (int)((lon + 180.0) / 360.0 * mapW);
+        int issY = 2 + (int)((90.0 - lat) / 180.0 * mapH);
+        c.fillCircle(issX, issY, 3, TFT_WHITE);
+        c.drawCircle(issX, issY, 5, TFT_WHITE);
+        c.drawLine(issX-7, issY, issX+7, issY, TFT_WHITE);
+
+        c.setTextSize(1);
+        int iy = mapH + 4;
+        char buf[42];
+        snprintf(buf, sizeof(buf), "Alt:%.0fkm Spd:%.0fkm/h", alt, vel);
+        c.setCursor(3, iy); c.print(buf);
+        snprintf(buf, sizeof(buf), "%.1f,%.1f %s", lat, lon, visStr.c_str());
+        c.setCursor(3, iy + 10); c.print(buf);
+    });
+    free(mapPixels);
+    if (!pixels) { tt_show_error("Memory"); return; }
+    tt_online_send(pixels, w, h, plid, hasColor);
+    free(pixels);
+}
+
+// --- GITHUB PROFILE ---
+
+void tt_online_github(uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    if (!tt_check_wifi()) return;
+    String user = tt_get_text_input("GitHub username", false);
+    if (user.length() == 0) return;
+
+    M5.Display.fillScreen(TFT_BLACK); M5.Display.setTextFont(1);
+    M5.Display.setCursor(10, 50); M5.Display.setTextSize(1.5);
+    M5.Display.setTextColor(TFT_GREEN); M5.Display.printf("Fetching %s...", user.c_str());
+    M5.Display.display();
+
+    String name, bio, login;
+    int followers = 0, repos = 0, contribs = 0;
+    {
+        String json = tt_http_get(("https://api.github.com/users/" + user).c_str());
+        if (json.length() == 0) { tt_show_error("HTTP failed"); return; }
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) { tt_show_error("JSON error"); return; }
+        name = doc["name"].as<String>();
+        if (name == "null" || name.length() == 0) name = user;
+        bio = doc["bio"].as<String>();
+        if (bio == "null") bio = "";
+        login = doc["login"].as<String>();
+        followers = doc["followers"];
+        repos = doc["public_repos"];
+    }
+    {
+        String cjson = tt_http_get(("https://github-contributions-api.jogruber.de/v4/" + user + "?y=last").c_str());
+        if (cjson.length() > 0) {
+            JsonDocument cdoc;
+            if (!deserializeJson(cdoc, cjson)) contribs = cdoc["total"]["lastYear"];
+        }
+    }
+
+    uint8_t* pixels = tt_render_canvas(w, h, [&](M5Canvas& c) {
+        c.drawRect(0, 0, w, h, TFT_WHITE);
+
+        // Identicon from username hash
+        uint32_t hash = 0;
+        for (int i = 0; i < (int)login.length(); i++) hash = hash * 31 + login[i];
+        int gridSz = 5, cellW = h/2 / gridSz;
+        int iconX = 4, iconY = 4;
+        for (int gy = 0; gy < gridSz; gy++) {
+            for (int gx = 0; gx < (gridSz+1)/2; gx++) {
+                if ((hash >> ((gy * 3 + gx) % 24)) & 1) {
+                    c.fillRect(iconX + gx * cellW, iconY + gy * cellW, cellW-1, cellW-1, TFT_WHITE);
+                    c.fillRect(iconX + (gridSz-1-gx) * cellW, iconY + gy * cellW, cellW-1, cellW-1, TFT_WHITE);
+                }
+            }
+        }
+
+        int tx = iconX + gridSz * cellW + 6;
+        c.setTextSize(2); c.setCursor(tx, 4); c.print(name);
+        c.setTextSize(1); c.setCursor(tx, 22); c.print("@"); c.print(login);
+
+        if (bio.length() > 0) {
+            c.setTextSize(1); c.setTextWrap(true, true);
+            c.setCursor(tx, 36);
+            String shortBio = bio.substring(0, 60);
+            c.print(shortBio);
+        }
+
+        int infoY = h/2 + 4;
+        c.drawLine(2, infoY - 2, w - 3, infoY - 2, TFT_WHITE);
+        c.setTextSize(1);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Followers: %d  Repos: %d", followers, repos);
+        c.setCursor(4, infoY); c.print(buf);
+        snprintf(buf, sizeof(buf), "Contributions: %d (last year)", contribs);
+        c.setCursor(4, infoY + 12); c.print(buf);
+
+        // Mini heatmap bar
+        int hx = 4, hy = infoY + 28, hw = w - 8, hh = 6;
+        c.drawRect(hx, hy, hw, hh, TFT_WHITE);
+        if (contribs > 0) {
+            int filled = contribs * hw / 2000;
+            if (filled > hw - 2) filled = hw - 2;
+            if (filled < 2) filled = 2;
+            c.fillRect(hx + 1, hy + 1, filled, hh - 2, TFT_WHITE);
+        }
+    });
+    if (!pixels) { tt_show_error("Memory"); return; }
+    tt_online_send(pixels, w, h, plid, hasColor);
+    free(pixels);
+}
+
+// --- DICEBEAR IDENTICON ---
+
+void tt_online_identicon(uint16_t w, uint16_t h, const uint8_t* plid, bool hasColor) {
+    String seed = tt_get_text_input("Seed (name/word)", false);
+    if (seed.length() == 0) return;
+
+    uint32_t hash = 5381;
+    for (int i = 0; i < (int)seed.length(); i++) hash = hash * 33 + seed[i];
+
+    uint8_t* pixels = tt_render_canvas(w, h, [&](M5Canvas& c) {
+        c.drawRect(0, 0, w, h, TFT_WHITE);
+
+        int gridSz = 8;
+        int cellW = (h - 20) / gridSz;
+        int totalW = cellW * gridSz;
+        int offX = (w - totalW) / 2;
+        int offY = 4;
+
+        for (int gy = 0; gy < gridSz; gy++) {
+            for (int gx = 0; gx < (gridSz + 1) / 2; gx++) {
+                uint32_t bit = (hash >> ((gy * 5 + gx * 3 + 7) % 32)) & 1;
+                bit ^= ((hash >> ((gy * 3 + gx * 7 + 13) % 32)) & 1);
+                if (bit) {
+                    c.fillRect(offX + gx * cellW, offY + gy * cellW, cellW - 1, cellW - 1, TFT_WHITE);
+                    c.fillRect(offX + (gridSz - 1 - gx) * cellW, offY + gy * cellW, cellW - 1, cellW - 1, TFT_WHITE);
+                }
+            }
+        }
+
+        c.setTextSize(1);
+        c.setCursor((w - seed.length() * 6) / 2, h - 14);
+        c.print(seed);
+    });
+    if (!pixels) { tt_show_error("Memory"); return; }
+    tt_online_send(pixels, w, h, plid, hasColor);
+    free(pixels);
+}
+
+// --- ONLINE CONTENT MENU ---
+
+void tt_online_content_with(const uint8_t* plid, uint16_t w, uint16_t h, bool hasColor) {
+    std::vector<TtMenuItem> menu;
+    menu.push_back(ttItem([](){ return String("Crypto Ticker"); }, [&](){ tt_online_crypto(w, h, plid, hasColor); }, true));
+    menu.push_back(ttItem([](){ return String("Weather"); }, [&](){ tt_online_weather(w, h, plid, hasColor); }, true));
+    menu.push_back(ttItem([](){ return String("Clock"); }, [&](){ tt_online_clock(w, h, plid, hasColor); }, true));
+    menu.push_back(ttItem([](){ return String("ISS Tracker"); }, [&](){ tt_online_iss(w, h, plid, hasColor); }, true));
+    menu.push_back(ttItem([](){ return String("Random Quote"); }, [&](){ tt_online_quote(w, h, plid, hasColor); }, true));
+    menu.push_back(ttItem([](){ return String("Fun Fact"); }, [&](){ tt_online_fact(w, h, plid, hasColor); }, true));
+    menu.push_back(ttItem([](){ return String("GitHub Profile"); }, [&](){ tt_online_github(w, h, plid, hasColor); }, true));
+    menu.push_back(ttItem([](){ return String("Identicon"); }, [&](){ tt_online_identicon(w, h, plid, hasColor); }, true));
+    tt_menu(menu, "Online Content");
+}
+
+void tt_online_content() {
+    String barcode = tt_get_barcode();
+    if (barcode.length() != TT_BC_LEN) return;
+    uint8_t plid[4];
+    if (!tt_barcode_to_plid(barcode.c_str(), plid)) { tt_show_error("Invalid barcode"); return; }
+    TtTagProfile profile;
+    tt_barcode_to_profile(barcode.c_str(), &profile);
+    uint16_t w = profile.known ? profile.width : 296;
+    uint16_t h = profile.known ? profile.height : 128;
+    if (w == 0 || h == 0) { tt_show_error("Segment - no gfx"); return; }
+    bool hasColor = profile.known && profile.color != TT_COLOR_MONO;
+    tt_online_content_with(plid, w, h, hasColor);
+}
+
+// ---------- WiFi Icon Control ----------
+
+void tt_wifi_icon_on() {
+    uint8_t buf[TT_MAX_FRAME_SIZE];
+    const uint8_t bc_plid[4] = {0};
+    size_t p = tt_raw_frame(buf, TT_PROTO_DM, bc_plid, 0x06);
+    buf[p++] = 0x59; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x00; buf[p++] = 0x05;
+    size_t len = tt_terminate(buf, p);
+    tt_ir_init();
+    tt_ir_transmit(buf, len, 100, 2);
+    tt_carrier_off(); tt_ir_deinit(); tt_ir_stop_requested = false;
+    tt_show_success("WiFi icon ON (broadcast)");
+}
+
+void tt_wifi_icon_off_all() {
+    tt_targets_load();
+    if (tt_target_count == 0) { tt_show_error("No saved tags"); return; }
+    int ok = 0;
+    for (uint8_t i = 0; i < tt_target_count; i++) {
+        uint8_t plid[4];
+        if (!tt_barcode_to_plid(tt_targets[i].barcode, plid)) continue;
+        M5.Display.fillScreen(TFT_BLACK);
+        M5.Display.setTextFont(1); M5.Display.setTextSize(1.5);
+        M5.Display.setCursor(5, 5); M5.Display.setTextColor(TFT_GREEN);
+        M5.Display.printf("Clear %d/%d", i+1, tt_target_count);
+        M5.Display.setCursor(5, 25); M5.Display.setTextColor(TFT_WHITE);
+        M5.Display.print(tt_targets[i].name[0] ? tt_targets[i].name : tt_targets[i].barcode);
+        M5.Display.display();
+        uint8_t pb[TT_MAX_FRAME_SIZE];
+        size_t pl = tt_make_ping_frame(pb, plid);
+        uint8_t clr[TT_MAX_FRAME_SIZE];
+        size_t cp = tt_raw_frame(clr, TT_PROTO_DM, plid, 0x06);
+        clr[cp++] = 0x58; clr[cp++] = 0x00; clr[cp++] = 0x00; clr[cp++] = 0x00; clr[cp++] = 0x05;
+        size_t cl = tt_terminate(clr, cp);
+        tt_ir_init();
+        // 3 waves: heavy targeted ping + 10x clear each
+        for (int wave = 0; wave < 3; wave++) {
+            tt_ir_transmit(pb, pl, 200, 2);
+            tt_ir_stop_requested = false;
+            for (int r = 0; r < 10; r++) {
+                tt_ir_transmit(clr, cl, 50, 2);
+                tt_ir_stop_requested = false;
+            }
+        }
+        tt_carrier_off(); tt_ir_deinit(); tt_ir_stop_requested = false;
+        ok++;
+    }
+    char msg[32]; snprintf(msg, sizeof(msg), "Cleared %d tags", ok);
+    tt_show_success(msg);
+}
+
+// ---------- NFC URL Decoder (LUT from TagTinker) ----------
+
+static const int8_t TT_NFC_LUT[128] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,35,-1,-1,
+    28,24,30,38,58, 5,23, 6, 3,40,-1,-1,-1,-1,-1,-1,
+    -1,20,15,54,16,44,46,63, 4,48,34,19,37, 0,26, 1,
+     8,41,31, 2,45,55,60,12,11,57,33,-1,-1,-1,-1,50,
+    -1,13,39, 9,43,18,29,52,59, 7,61,62,14,25,32,56,
+    42,47,53,22,36,49,10,21,17,27,51,-1,-1,-1,-1,-1,
+};
+
+int tt_nfc_alpha_idx(char c) {
+    uint8_t idx = (uint8_t)c;
+    if (idx >= 128) return -1;
+    return TT_NFC_LUT[idx];
+}
+
+uint32_t tt_nfc_decode_b64(const char* s, int len) {
+    uint32_t r = 0;
+    for (int i = 0; i < len; i++) {
+        int idx = tt_nfc_alpha_idx(s[(len-1)-i]);
+        if (idx < 0) return 0;
+        r = (r * 64) + (uint32_t)idx;
+    }
+    return r;
+}
+
+bool tt_nfc_to_barcode(const char* nfc10, char* out17) {
+    if (strlen(nfc10) != 10) return false;
+    for (int i = 0; i < 10; i++) if (tt_nfc_alpha_idx(nfc10[i]) < 0) return false;
+    uint32_t val1 = tt_nfc_decode_b64(nfc10 + 5, 5);
+    uint32_t val2 = tt_nfc_decode_b64(nfc10, 5);
+    char raw[20]; snprintf(raw, sizeof(raw), "%09lu%09lu", (unsigned long)val1, (unsigned long)val2);
+    int lc = (raw[0]-'0')*10 + (raw[1]-'0');
+    if (lc > 25) return false;
+    out17[0] = (char)(lc + 65);
+    memcpy(out17 + 1, raw + 2, 16);
+    out17[17] = '\0';
+    if (out17[1] != '4') return false;
+    int cs = 0;
+    for (int i = 0; i < 16; i++) { char c = out17[i]; cs += (c >= 'a' && c <= 'z') ? (c-32) : c; }
+    return (cs % 10) == (out17[16] - '0');
+}
+
+void tt_nfc_decoder_menu() {
+    String input = tt_get_text_input("NFC 10-char code", false);
+    if (input.length() == 0) return;
+    if (input.startsWith("http")) {
+        int last = input.lastIndexOf('/');
+        if (last >= 0) input = input.substring(last + 1);
+    }
+    char barcode[18] = {0};
+    if (tt_nfc_to_barcode(input.c_str(), barcode)) {
+        std::vector<TtMenuItem> info;
+        info.push_back(ttItem([input](){ return "NFC: " + input; }, [](){}, false));
+        info.push_back(ttItem([barcode](){ return String("Barcode: ") + barcode; }, [](){}, false));
+        uint8_t plid[4]; tt_barcode_to_plid(barcode, plid);
+        char ps[18]; snprintf(ps, sizeof(ps), "%02X:%02X:%02X:%02X", plid[0],plid[1],plid[2],plid[3]);
+        info.push_back(ttItem([ps](){ return String("PLID: ") + ps; }, [](){}, false));
+        TtTagProfile prof; tt_barcode_to_profile(barcode, &prof);
+        if (prof.known) info.push_back(ttItem([&](){ return String("Model: ") + (prof.model_name ? prof.model_name : "?"); }, [](){}, false));
+        info.push_back({[barcode](){ return String(">> Save Tag <<"); }, [barcode](){
+            tt_target_add(barcode, "NFC scan");
+            tt_show_success("Saved!");
+        }, true});
+        tt_menu(info, "NFC Decoded");
+    } else {
+        tt_show_error("Invalid NFC code");
+    }
+}
+
+// ---------- Fast TX helper (no display drawing) ----------
+
+void tt_fast_transmit(TtFrameSeq* seq) {
+    tt_ir_init();
+    for (size_t f = 0; f < seq->count; f++) {
+        tt_ir_transmit(seq->frames[f], seq->lengths[f], seq->repeats[f], 2);
+        delay(2);
+    }
+    tt_carrier_off();
+    tt_ir_deinit();
+    tt_ir_stop_requested = false;
+    tt_free_frame_seq(seq);
+}
+
+void tt_broadcast_wake() {
+    uint8_t pb[TT_MAX_FRAME_SIZE];
+    const uint8_t bc_plid[4] = {0};
+    size_t pl = tt_make_ping_frame(pb, bc_plid);
+    tt_ir_init();
+    tt_ir_transmit(pb, pl, 200, 2);
+    tt_carrier_off();
+    tt_ir_deinit();
+    tt_ir_stop_requested = false;
+    delay(50);
+}
+
+// ---------- Push Text ALL ----------
+
+void tt_push_text_all() {
+    tt_targets_load();
+    if (tt_target_count == 0) { tt_show_error("No saved tags"); return; }
+
+    String text = tt_get_text_input("Text for ALL", false);
+    if (text.length() == 0) return;
+
+    uint8_t textSize = 2;
+    bool colorClear = false;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([](){ return "Page: " + String(tt_page); }, [](){ tt_page = (tt_page + tt_dir + 8) % 8; }, false));
+    cfg.push_back(ttItem([&](){ return "Size: " + String(textSize); }, [&](){ textSize = (uint8_t)max(1, min(5, (int)textSize + tt_dir)); }, false));
+    cfg.push_back(ttItem([](){ return String("Font: ") + tt_font_names[tt_font_idx]; }, [](){ tt_font_idx = (tt_font_idx + tt_dir + TT_FONT_COUNT) % TT_FONT_COUNT; }, false));
+    cfg.push_back(ttItem([&](){ return String("Color clear: ") + (colorClear ? "ON" : "OFF"); }, [&](){ colorClear = !colorClear; }, false));
+    cfg.push_back({[](){ return String(">> SEND TO ALL <<"); }, [&](){
+        tt_broadcast_wake();
+        int ok = 0, fail = 0;
+        for (uint8_t i = 0; i < tt_target_count; i++) {
+            uint8_t plid[4];
+            if (!tt_barcode_to_plid(tt_targets[i].barcode, plid)) { fail++; continue; }
+            TtTagProfile prof;
+            tt_barcode_to_profile(tt_targets[i].barcode, &prof);
+            uint16_t tw = prof.known ? prof.width : 296;
+            uint16_t th = prof.known ? prof.height : 128;
+            bool hc = colorClear && prof.known && prof.color != TT_COLOR_MONO;
+
+            M5.Display.fillScreen(TFT_BLACK);
+            M5.Display.setTextFont(1); M5.Display.setTextSize(1.5);
+            M5.Display.setCursor(5, 5); M5.Display.setTextColor(TFT_GREEN);
+            M5.Display.printf("ALL %d/%d", i+1, tt_target_count);
+            M5.Display.setCursor(5, 25); M5.Display.setTextColor(TFT_WHITE);
+            M5.Display.print(tt_targets[i].name[0] ? tt_targets[i].name : tt_targets[i].barcode);
+            M5.Display.display();
+
+            uint8_t* px = tt_render_text(text.c_str(), tw, th, textSize, false, 0, 0);
+            if (!px) { fail++; continue; }
+            memset(&tt_current_seq, 0, sizeof(tt_current_seq));
+            if (!tt_build_image_sequence(&tt_current_seq, plid, px, tw, th, tt_page, 0, 0, 15, hc, tt_comp_mode)) {
+                free(px); fail++; continue;
+            }
+            free(px);
+            tt_fast_transmit(&tt_current_seq);
+            ok++;
+        }
+        char msg[32]; snprintf(msg, sizeof(msg), "%d OK, %d fail", ok, fail);
+        tt_result_screen(msg);
+    }, true});
+    char ttl[40]; snprintf(ttl, sizeof(ttl), "Text ALL (%d tags)", tt_target_count);
+    tt_menu(cfg, ttl);
+}
+
+// ---------- Push Image ALL ----------
+
+void tt_push_image_all() {
+    tt_targets_load();
+    if (tt_target_count == 0) { tt_show_error("No saved tags"); return; }
+
+    std::vector<String> bmpFiles;
+    File dir = SD.open("/evil/esl");
+    if (dir) {
+        File f = dir.openNextFile();
+        while (f) {
+            String fname = f.name();
+            if (fname.endsWith(".bmp") || fname.endsWith(".BMP")) {
+                if (fname.startsWith("/")) bmpFiles.push_back(fname);
+                else bmpFiles.push_back(String("/evil/esl/") + fname);
+            }
+            f = dir.openNextFile();
+        }
+        dir.close();
+    }
+    if (bmpFiles.empty()) { tt_show_error("No BMP on SD"); return; }
+
+    std::vector<String> labels;
+    for (size_t j = 0; j < bmpFiles.size(); j++) {
+        String sn = bmpFiles[j];
+        if (sn.startsWith("/evil/esl/")) sn = sn.substring(10);
+        labels.push_back(sn);
+    }
+    int sel = tt_menu_select(labels, "Select BMP for ALL");
+    if (sel < 0) return;
+
+    bool imgInvert = true;
+    std::vector<TtMenuItem> cfg;
+    cfg.push_back(ttItem([](){ return "Page: " + String(tt_page); }, [](){ tt_page = (tt_page + tt_dir + 8) % 8; }, false));
+    cfg.push_back(ttItem([&](){ return String("Invert: ") + (imgInvert ? "OFF" : "ON"); }, [&](){ imgInvert = !imgInvert; }, false));
+    cfg.push_back({[](){ return String(">> SEND TO ALL <<"); }, [&](){
+        tt_broadcast_wake();
+        int ok = 0, fail = 0;
+        for (uint8_t i = 0; i < tt_target_count; i++) {
+            uint8_t plid[4];
+            if (!tt_barcode_to_plid(tt_targets[i].barcode, plid)) { fail++; continue; }
+            TtTagProfile prof;
+            tt_barcode_to_profile(tt_targets[i].barcode, &prof);
+            uint16_t tw = prof.known ? prof.width : 208;
+            uint16_t th = prof.known ? prof.height : 112;
+            bool hc = prof.known && prof.color != TT_COLOR_MONO;
+
+            M5.Display.fillScreen(TFT_BLACK);
+            M5.Display.setTextFont(1); M5.Display.setTextSize(1.5);
+            M5.Display.setCursor(5, 5); M5.Display.setTextColor(TFT_GREEN);
+            M5.Display.printf("ALL %d/%d", i+1, tt_target_count);
+            M5.Display.setCursor(5, 25); M5.Display.setTextColor(TFT_WHITE);
+            M5.Display.print(tt_targets[i].name[0] ? tt_targets[i].name : tt_targets[i].barcode);
+            M5.Display.display();
+
+            size_t pixelCount = (size_t)tw * th;
+            size_t pixPackedSz = (pixelCount + 7) / 8;
+            File bmpFile = SD.open(bmpFiles[sel]);
+            if (!bmpFile) { fail++; continue; }
+            uint8_t hdr[54]; bmpFile.read(hdr, 54);
+            int bmpW = *(int32_t*)&hdr[18], bmpH = abs(*(int32_t*)&hdr[22]);
+            int bmpBpp = *(uint16_t*)&hdr[28];
+            uint32_t dataOffset = *(uint32_t*)&hdr[10];
+            bool bottomUp = (*(int32_t*)&hdr[22]) > 0;
+            bool dpA = hc && bmpBpp == 24;
+            size_t bufSzA = dpA ? (1 + 2*pixPackedSz) : (1 + pixPackedSz);
+            uint8_t* pixels = (uint8_t*)calloc(bufSzA, 1);
+            if (!pixels) { bmpFile.close(); fail++; continue; }
+            pixels[0] = dpA ? 0xFD : 0xFE;
+            if (dpA) memset(pixels + 1 + pixPackedSz, 0xFF, pixPackedSz);
+            int rowBytes = ((bmpW * bmpBpp + 31) / 32) * 4;
+            float scale = min((float)bmpW / tw, (float)bmpH / th);
+            uint8_t* rowBuf = (uint8_t*)malloc(rowBytes);
+            if (!rowBuf) { free(pixels); bmpFile.close(); fail++; continue; }
+            for (int dy = 0; dy < th; dy++) {
+                int srcY = (int)(dy * scale);
+                int fileRow = bottomUp ? (bmpH - 1 - srcY) : srcY;
+                bmpFile.seek(dataOffset + (uint32_t)fileRow * rowBytes);
+                bmpFile.read(rowBuf, rowBytes);
+                for (int dx = 0; dx < tw; dx++) {
+                    int srcX = (int)(dx * scale);
+                    if (srcX >= bmpW) srcX = bmpW - 1;
+                    size_t pidx = (size_t)dy * tw + dx;
+                    if (dpA) {
+                        uint8_t r = rowBuf[srcX*3+2], g = rowBuf[srcX*3+1], b = rowBuf[srcX*3];
+                        bool isRed = (r > 150 && g < 100 && b < 100);
+                        uint8_t lum = (r*77+g*150+b*29)>>8;
+                        if (isRed) {
+                            pixels[1 + pixPackedSz + pidx/8] &= ~(1 << (7 - (pidx%8)));
+                        } else if (lum < 128) {
+                            pixels[1 + pidx/8] |= (1 << (7 - (pidx%8)));
+                        }
+                    } else {
+                        uint8_t lum = 0;
+                        if (bmpBpp == 24) lum = (rowBuf[srcX*3+2]*77+rowBuf[srcX*3+1]*150+rowBuf[srcX*3]*29)>>8;
+                        else if (bmpBpp == 1) lum = (rowBuf[srcX/8] & (0x80>>(srcX%8))) ? 255 : 0;
+                        else if (bmpBpp == 8) lum = rowBuf[srcX];
+                        if (lum < 128) {
+                            pixels[1 + pidx/8] |= (1 << (7 - (pidx%8)));
+                        }
+                    }
+                }
+            }
+            free(rowBuf); bmpFile.close();
+            size_t spSzA = dpA ? (1 + 2*pixPackedSz) : (1 + pixPackedSz);
+            uint8_t* sp = (uint8_t*)malloc(spSzA);
+            if (!sp) { free(pixels); fail++; continue; }
+            sp[0] = pixels[0];
+            if (imgInvert) { for (size_t j = 0; j < pixPackedSz; j++) sp[1+j] = ~pixels[1+j]; }
+            else { memcpy(sp+1, pixels+1, pixPackedSz); }
+            if (dpA) memcpy(sp + 1 + pixPackedSz, pixels + 1 + pixPackedSz, pixPackedSz);
+            free(pixels);
+            bool sendOk = tt_stream_image(plid, sp, tw, th, tt_page, 15, dpA, tt_comp_mode, "ALL");
+            free(sp);
+            if (sendOk) ok++;
+            else fail++;
+        }
+        char msg[32]; snprintf(msg, sizeof(msg), "%d OK, %d fail", ok, fail);
+        tt_result_screen(msg);
+    }, true});
+    char ttl2[40]; snprintf(ttl2, sizeof(ttl2), "Image ALL (%d tags)", tt_target_count);
+    tt_menu(cfg, ttl2);
+}
+
+// =====================================================================
+
+// --- Web API helper ---
+
+String tt_get_tags_json() {
+    tt_targets_load();
+    String json = "[";
+    for (uint8_t i = 0; i < tt_target_count; i++) {
+        if (i > 0) json += ",";
+        TtTagProfile prof;
+        tt_barcode_to_profile(tt_targets[i].barcode, &prof);
+        json += "{\"name\":\"" + String(tt_targets[i].name) + "\",\"barcode\":\"" + String(tt_targets[i].barcode) + "\"";
+        if (prof.known) {
+            json += ",\"model\":\"" + String(prof.model_name ? prof.model_name : "") + "\"";
+            json += ",\"w\":" + String(prof.width) + ",\"h\":" + String(prof.height);
+            json += ",\"color\":\"" + String(prof.color == TT_COLOR_RED ? "red" : prof.color == TT_COLOR_YELLOW ? "yellow" : "mono") + "\"";
+        }
+        json += "}";
+    }
+    json += "]";
+    return json;
+}
+
+// --- Web image handler ---
+
+void ttWebImage(const String& bc, int imgW, int imgH, uint8_t* pixels, size_t pc, int page) {
+    uint8_t plid[4];
+    if (!tt_barcode_to_plid(bc.c_str(), plid)) { free(pixels); Serial.println("[TT] bad barcode"); return; }
+
+    TtTagProfile prof;
+    tt_barcode_to_profile(bc.c_str(), &prof);
+    bool hc = prof.known && prof.color != TT_COLOR_MONO;
+
+    Serial.printf("[TT] web image %dx%d pg%d heap=%d\n", imgW, imgH, page, ESP.getFreeHeap());
+
+    bool ok = tt_stream_image(plid, pixels, imgW, imgH, page, 80, hc, tt_comp_mode, "Web Image");
+    free(pixels);
+
+    if (ok) {
+        Serial.printf("[TT] web TX done, heap=%d\n", ESP.getFreeHeap());
+    } else {
+        Serial.printf("[TT] encode FAILED, heap=%d\n", ESP.getFreeHeap());
+    }
+}
+
+void ttWebSendBmp(const String& bc, const String& file, int pg) {
+    uint8_t plid[4];
+    if (!tt_barcode_to_plid(bc.c_str(), plid)) { Serial.println(F("[TT] bad barcode")); return; }
+    TtTagProfile prof;
+    tt_barcode_to_profile(bc.c_str(), &prof);
+    uint16_t w = prof.known ? prof.width : 296;
+    uint16_t h = prof.known ? prof.height : 128;
+    if (w == 0 || h == 0) { Serial.println(F("[TT] segment tag")); return; }
+    bool hc = prof.known && prof.color != TT_COLOR_MONO;
+
+    File bmpFile = SD.open(file, FILE_READ);
+    if (!bmpFile) { Serial.println(F("[TT] open failed")); return; }
+    uint8_t header[54];
+    if (bmpFile.read(header, 54) != 54 || header[0] != 'B' || header[1] != 'M') {
+        bmpFile.close(); Serial.println(F("[TT] not BMP")); return;
+    }
+    int32_t bmpW = *(int32_t*)&header[18];
+    int32_t bmpH = *(int32_t*)&header[22];
+    uint16_t bmpBpp = *(uint16_t*)&header[28];
+    uint32_t dataOffset = *(uint32_t*)&header[10];
+    bool bottomUp = (bmpH > 0);
+    if (bmpH < 0) bmpH = -bmpH;
+
+    size_t pc = (size_t)w * h;
+    size_t packed_sz = (pc + 7) / 8;
+    uint8_t* pixels = (uint8_t*)calloc(packed_sz + 1, 1);
+    if (!pixels) { bmpFile.close(); Serial.println(F("[TT] oom")); return; }
+    pixels[0] = 0xFE;
+
+    int rowBytes = ((bmpW * bmpBpp / 8) + 3) & ~3;
+    uint8_t* rowBuf = (uint8_t*)malloc(rowBytes);
+    if (!rowBuf) { free(pixels); bmpFile.close(); Serial.println(F("[TT] oom row")); return; }
+
+    float scaleW = (float)w / bmpW, scaleH = (float)h / bmpH;
+    float scale = (scaleW < scaleH) ? scaleW : scaleH;
+    int dstW = (int)(bmpW * scale), dstH = (int)(bmpH * scale);
+    int offX = (w - dstW) / 2, offY = (h - dstH) / 2;
+    for (int dy = 0; dy < dstH; dy++) {
+        int srcY = (int)(dy / scale); if (srcY >= bmpH) srcY = bmpH - 1;
+        int fileRow = bottomUp ? (bmpH - 1 - srcY) : srcY;
+        bmpFile.seek(dataOffset + (uint32_t)fileRow * rowBytes);
+        bmpFile.read(rowBuf, rowBytes);
+        for (int dx = 0; dx < dstW; dx++) {
+            int srcX = (int)(dx / scale); if (srcX >= bmpW) srcX = bmpW - 1;
+            uint8_t lum = 0;
+            if (bmpBpp == 24) { lum = (rowBuf[srcX*3+2]*77+rowBuf[srcX*3+1]*150+rowBuf[srcX*3]*29)>>8; }
+            else if (bmpBpp == 1) { lum = (rowBuf[srcX/8] & (0x80>>(srcX%8))) ? 255 : 0; }
+            else if (bmpBpp == 8) { lum = rowBuf[srcX]; }
+            int px2 = offX + dx, py2 = offY + dy;
+            if (px2 >= 0 && px2 < w && py2 >= 0 && py2 < h && lum < 128) {
+                size_t idx = (size_t)py2 * w + px2;
+                pixels[1 + idx/8] |= (1 << (7 - (idx%8)));
+            }
+        }
+    }
+    free(rowBuf); bmpFile.close();
+
+    Serial.printf("[TT] Web BMP %dx%d→%dx%d to %s heap=%d\n", bmpW, bmpH, w, h, bc.c_str(), ESP.getFreeHeap());
+    bool ok = tt_stream_image(plid, pixels, w, h, pg, 80, hc, tt_comp_mode, "Web Image");
+    free(pixels);
+    Serial.println(ok ? F("[TT] Web send OK") : F("[TT] Web send FAILED"));
+}
+
+void ttAddTag(const String& bc, const String& name) {
+    String n = name;
+    if (n.length() == 0) {
+        TtTagProfile prof;
+        tt_barcode_to_profile(bc.c_str(), &prof);
+        if (prof.model_name) n = String(prof.model_name);
+        else n = bc;
+    }
+    tt_target_add(bc.c_str(), n.c_str());
+    Serial.printf("[TT] Tag added: %s = %s\n", bc.c_str(), n.c_str());
+}
+
+void ttDeleteTag(const String& bc) {
+    tt_targets_load();
+    for (uint8_t i = 0; i < tt_target_count; i++) {
+        if (String(tt_targets[i].barcode) == bc) { tt_target_delete(i); Serial.printf("[TT] Tag deleted: %s\n", bc.c_str()); return; }
+    }
+}
+
+void ttRenameTag(const String& bc, const String& name) {
+    tt_targets_load();
+    for (uint8_t i = 0; i < tt_target_count; i++) {
+        if (String(tt_targets[i].barcode) == bc) {
+            strncpy(tt_targets[i].name, name.c_str(), 31); tt_targets[i].name[31] = 0;
+            tt_targets_save(); Serial.printf("[TT] Tag renamed: %s = %s\n", bc.c_str(), name.c_str()); return;
+        }
+    }
+}
+
+void ttAddPreset(const String& nm, const String& tx) {
+    tt_preset_add(nm.c_str(), tx.c_str());
+    Serial.printf("[TT] Preset added: %s\n", nm.c_str());
+}
+
+void ttDeletePreset(int idx) {
+    tt_presets_load();
+    if (idx >= 0 && idx < tt_preset_count) { tt_preset_delete(idx); Serial.printf("[TT] Preset deleted: %d\n", idx); }
+}
+
+String tt_get_presets_json() {
+    tt_presets_load();
+    String json = "[";
+    for (uint8_t i = 0; i < tt_preset_count; i++) {
+        if (i > 0) json += ",";
+        json += "{\"name\":\"" + String(tt_presets[i].name) + "\",\"text\":\"" + String(tt_presets[i].text) + "\"}";
+    }
+    return json + "]";
+}
+
+String tt_get_settings_json() {
+    char key[8]; snprintf(key, sizeof(key), "0x%04X", tt_store_key);
+    return "{\"comp\":" + String(tt_comp_mode) + ",\"data_rep\":" + String(tt_data_repeats) +
+           ",\"wake_rep\":" + String(tt_wake_repeats_val) + ",\"page\":" + String(tt_page) +
+           ",\"store_key\":\"" + String(key) + "\",\"pp16\":" + String(tt_use_pp16 ? "true" : "false") + "}";
+}
+
+void tt_run_online_web(const String& plugin, const String& barcode) {
+    uint8_t plid[4];
+    if (!tt_barcode_to_plid(barcode.c_str(), plid)) return;
+    TtTagProfile prof;
+    tt_barcode_to_profile(barcode.c_str(), &prof);
+    uint16_t w = prof.known ? prof.width : 296;
+    uint16_t h = prof.known ? prof.height : 128;
+    bool hc = prof.known && prof.color != TT_COLOR_MONO;
+
+    if (plugin == "crypto") tt_online_crypto(w, h, plid, hc);
+    else if (plugin == "weather") tt_online_weather(w, h, plid, hc);
+    else if (plugin == "clock") tt_online_clock(w, h, plid, hc);
+    else if (plugin == "iss") tt_online_iss(w, h, plid, hc);
+    else if (plugin == "quote") tt_online_quote(w, h, plid, hc);
+    else if (plugin == "fact") tt_online_fact(w, h, plid, hc);
+    else if (plugin == "github") tt_online_github(w, h, plid, hc);
+    else if (plugin == "identicon") tt_online_identicon(w, h, plid, hc);
+}
+
+// --- Serial command handler ---
+
+bool tt_handle_serial(const String& command) {
+    String tagCmd = command.substring(4);
+    tagCmd.trim();
+    tt_ir_init();
+
+    if (tagCmd == "blink") {
+        uint8_t f[TT_MAX_FRAME_SIZE];
+        const uint8_t plid[4] = {0};
+        size_t p = tt_raw_frame(f, TT_PROTO_DM, plid, 0x06);
+        f[p++]=0x49; f[p++]=0x00; f[p++]=0x00; f[p++]=0x00; f[p++]=0x01;
+        size_t len = tt_terminate(f, p);
+        tt_ir_transmit(f, len, 50, 2);
+        Serial.println(F("OK: broadcast blink"));
+    } else if (tagCmd == "blink_alert") {
+        uint8_t f[TT_MAX_FRAME_SIZE];
+        const uint8_t plid[4] = {0};
+        size_t p = tt_raw_frame(f, TT_PROTO_DM, plid, 0x06);
+        f[p++]=0x41; f[p++]=0x00; f[p++]=0x00; f[p++]=0x00; f[p++]=0x05;
+        size_t len = tt_terminate(f, p);
+        tt_ir_transmit(f, len, 50, 2);
+        Serial.println(F("OK: broadcast alert blink"));
+    } else if (tagCmd == "debug") {
+        uint8_t f[TT_MAX_FRAME_SIZE];
+        size_t len = tt_make_broadcast_debug_frame(f);
+        tt_ir_transmit(f, len, 200, 2);
+        Serial.println(F("OK: broadcast debug screen"));
+    } else if (tagCmd.startsWith("page ")) {
+        int pg = tagCmd.substring(5).toInt();
+        uint8_t f[TT_MAX_FRAME_SIZE];
+        size_t len = tt_make_broadcast_page_frame(f, pg, false, 10);
+        tt_ir_transmit(f, len, 100, 2);
+        Serial.printf("OK: broadcast page %d\n", pg);
+    } else if (tagCmd.startsWith("led ")) {
+        String args = tagCmd.substring(4); args.trim();
+        int sp = args.indexOf(' ');
+        String barcode = (sp > 0) ? args.substring(0, sp) : args;
+        int dur = (sp > 0) ? args.substring(sp+1).toInt() : 5;
+        uint8_t plid[4];
+        if (tt_barcode_to_plid(barcode.c_str(), plid)) {
+            tt_led_send(plid, 0xC9, dur);
+            Serial.printf("OK: LED on %s for %ds\n", barcode.c_str(), dur);
+        } else Serial.println(F("ERR: invalid barcode"));
+    } else if (tagCmd.startsWith("rawsend ")) {
+        String args = tagCmd.substring(8); args.trim();
+        int sp = args.indexOf(' ');
+        if (sp > 0) {
+            int fLen = args.substring(0, sp).toInt();
+            String hex = args.substring(sp+1); hex.trim();
+            uint8_t frame[TT_MAX_FRAME_SIZE];
+            int pos = 0;
+            for (int i = 0; i < (int)hex.length() && pos < fLen && pos < TT_MAX_FRAME_SIZE-2; i++) {
+                if (hex[i]==' ') continue;
+                if (i+1<(int)hex.length()) { char hx[3]={hex[i],hex[i+1],0}; frame[pos++]=(uint8_t)strtol(hx,NULL,16); i++; }
+            }
+            if (pos > 0) {
+                uint16_t crc = tt_crc16(frame, pos);
+                frame[pos]=crc&0xFF; frame[pos+1]=(crc>>8)&0xFF;
+                tt_ir_transmit(frame, pos+2, 50, 2);
+                Serial.printf("OK: rawsend %d bytes + CRC\n", pos);
+            } else Serial.println(F("ERR: no bytes parsed"));
+        } else Serial.println(F("ERR: usage: tag rawsend N HH HH..."));
+    } else if (tagCmd.startsWith("text ")) {
+        String args = tagCmd.substring(5); args.trim();
+        int sp = args.indexOf(' ');
+        if (sp > 0) {
+            String barcode = args.substring(0, sp);
+            String text = args.substring(sp+1);
+            uint8_t plid[4];
+            if (tt_barcode_to_plid(barcode.c_str(), plid)) {
+                TtTagProfile prof;
+                tt_barcode_to_profile(barcode.c_str(), &prof);
+                uint16_t tw = prof.known ? prof.width : 296;
+                uint16_t th = prof.known ? prof.height : 128;
+                bool hc = false; // BW mode via serial (use menu for BWR)
+                uint8_t* px = tt_render_text(text.c_str(), tw, th, 2, false, 0, 0);
+                if (px) {
+                    Serial.printf("OK: sending \"%s\" to %s (%dx%d %s)...\n", text.c_str(), barcode.c_str(), tw, th, prof.known && prof.color != TT_COLOR_MONO ? "BW(use menu for BWR)" : "BW");
+                    bool txOk = tt_stream_image(plid, px, tw, th, tt_page, 80, hc, tt_comp_mode, "Serial TX");
+                    free(px);
+                    if (txOk) Serial.println(F("OK: text sent"));
+                    else Serial.println(F("ERR: stream failed"));
+                } else Serial.println(F("ERR: render failed"));
+            } else Serial.println(F("ERR: invalid barcode"));
+        } else Serial.println(F("ERR: usage: tag text BARCODE your text here"));
+    } else if (tagCmd.startsWith("textall ")) {
+        String text = tagCmd.substring(8); text.trim();
+        if (text.length() == 0) { Serial.println(F("ERR: usage: tag textall your text")); }
+        else {
+            tt_targets_load();
+            if (tt_target_count == 0) { Serial.println(F("ERR: no saved tags")); }
+            else {
+                // 1. Broadcast wake ALL tags
+                Serial.printf("Waking all tags...\n");
+                uint8_t pb[TT_MAX_FRAME_SIZE];
+                const uint8_t bc_plid[4] = {0};
+                size_t pl = tt_make_ping_frame(pb, bc_plid);
+                tt_ir_transmit(pb, pl, 200, 2);
+                tt_ir_stop_requested = false;
+                delay(50);
+
+                unsigned long t0 = millis();
+                for (uint8_t i = 0; i < tt_target_count; i++) {
+                    uint8_t plid[4];
+                    if (!tt_barcode_to_plid(tt_targets[i].barcode, plid)) continue;
+                    TtTagProfile prof;
+                    tt_barcode_to_profile(tt_targets[i].barcode, &prof);
+                    uint16_t tw = prof.known ? prof.width : 296;
+                    uint16_t th = prof.known ? prof.height : 128;
+                    bool hc = prof.known && prof.color != TT_COLOR_MONO;
+                    uint8_t* px = tt_render_text(text.c_str(), tw, th, 2, false, 0, 0);
+                    if (!px) { Serial.printf("  %d: OOM\n", i); continue; }
+                    bool txOk = tt_stream_image(plid, px, tw, th, tt_page, 15, hc, tt_comp_mode, "Serial TX");
+                    free(px);
+                    if (txOk) Serial.printf("  %d: %s OK\n", i, tt_targets[i].name[0] ? tt_targets[i].name : tt_targets[i].barcode);
+                    else Serial.printf("  %d: stream fail\n", i);
+                }
+                Serial.printf("All done in %lus\n", (millis() - t0) / 1000);
+            }
+        }
+    } else if (tagCmd == "list") {
+        tt_targets_load();
+        Serial.printf("--- %d saved tags ---\n", tt_target_count);
+        for (uint8_t i = 0; i < tt_target_count; i++) {
+            TtTagProfile prof;
+            tt_barcode_to_profile(tt_targets[i].barcode, &prof);
+            Serial.printf("%d: %s [%s] %s %dx%d\n", i, tt_targets[i].barcode,
+                tt_targets[i].name[0] ? tt_targets[i].name : "?",
+                prof.model_name ? prof.model_name : "?",
+                prof.known ? prof.width : 0, prof.known ? prof.height : 0);
+        }
+    } else if (tagCmd.startsWith("add ")) {
+        String rest = tagCmd.substring(4); rest.trim();
+        int sp = rest.indexOf(' ');
+        String bc = (sp > 0) ? rest.substring(0, sp) : rest;
+        String nm = (sp > 0) ? rest.substring(sp + 1) : "";
+        bc.trim(); nm.trim();
+        if (bc.length() == 17) {
+            tt_target_add(bc.c_str(), nm.length() > 0 ? nm.c_str() : bc.c_str());
+            Serial.println("OK: tag added " + bc);
+        } else {
+            Serial.println(F("ERR: barcode must be 17 chars"));
+        }
+    } else if (tagCmd.startsWith("delete ")) {
+        String bc = tagCmd.substring(7); bc.trim();
+        tt_targets_load();
+        bool found = false;
+        for (uint8_t i = 0; i < tt_target_count; i++) {
+            if (String(tt_targets[i].barcode) == bc) {
+                tt_target_delete(i);
+                Serial.println("OK: tag deleted " + bc);
+                found = true; break;
+            }
+        }
+        if (!found) Serial.println("ERR: tag not found");
+    } else if (tagCmd.startsWith("rename ")) {
+        String rest = tagCmd.substring(7); rest.trim();
+        int sp = rest.indexOf(' ');
+        if (sp > 0) {
+            String bc = rest.substring(0, sp); bc.trim();
+            String nm = rest.substring(sp + 1); nm.trim();
+            tt_targets_load();
+            bool found = false;
+            for (uint8_t i = 0; i < tt_target_count; i++) {
+                if (String(tt_targets[i].barcode) == bc) {
+                    strncpy(tt_targets[i].name, nm.c_str(), 31);
+                    tt_targets[i].name[31] = 0;
+                    tt_targets_save();
+                    Serial.println("OK: tag renamed " + bc + " -> " + nm);
+                    found = true; break;
+                }
+            }
+            if (!found) Serial.println("ERR: tag not found");
+        } else {
+            Serial.println(F("ERR: tag rename BARCODE NAME"));
+        }
+    } else if (tagCmd.startsWith("bc_text ")) {
+        // Broadcast image test: send text with PLID=0000 to ALL tags
+        String args = tagCmd.substring(8); args.trim();
+        int sp = args.indexOf(' ');
+        if (sp > 0) {
+            int tw = args.substring(0, sp).toInt();
+            String text = args.substring(sp+1);
+            if (tw < 10) tw = 296;
+            int th = (tw == 152) ? 152 : (tw == 208) ? 112 : (tw == 296) ? 128 : (tw == 400) ? 300 : (tw == 648) ? 480 : 128;
+            uint8_t plid[4] = {0, 0, 0, 0}; // BROADCAST
+            uint8_t* px = tt_render_text(text.c_str(), tw, th, 2, false, 0, 0);
+            if (px) {
+                Serial.printf("OK: BROADCAST text \"%s\" %dx%d to ALL tags...\n", text.c_str(), tw, th);
+                bool ok = tt_stream_image(plid, px, tw, th, 1, 80, false, tt_comp_mode, "Broadcast TX");
+                free(px);
+                Serial.println(ok ? F("OK: broadcast sent") : F("ERR: broadcast failed"));
+            } else Serial.println(F("ERR: render failed"));
+        } else Serial.println(F("ERR: usage: tag bc_text WIDTH text here"));
+    } else if (tagCmd == "help") {
+        Serial.println(F("--- TagTinker Serial Commands ---"));
+        Serial.println(F("tag blink              - broadcast LED blink 1s"));
+        Serial.println(F("tag blink_alert        - broadcast slow blink 5s"));
+        Serial.println(F("tag debug              - broadcast debug screen"));
+        Serial.println(F("tag page N             - broadcast page flip to N"));
+        Serial.println(F("tag led BARCODE [DUR]  - LED on targeted tag"));
+        Serial.println(F("tag text BARCODE msg   - push text to tag"));
+        Serial.println(F("tag rawsend N HH HH.. - raw frame (N=byte count)"));
+        Serial.println(F("tag textall TEXT        - push text to ALL saved tags (fast)"));
+        Serial.println(F("tag list               - list saved tags"));
+        Serial.println(F("tag add BARCODE [NAME] - add tag to saved list"));
+        Serial.println(F("tag delete BARCODE     - delete tag from saved list"));
+        Serial.println(F("tag rename BARCODE NAME- rename saved tag"));
+        Serial.println(F("tag help               - this help"));
+        Serial.println(F("---------------------------------"));
+    } else {
+        Serial.println(F("ERR: unknown tag command. Use 'tag help'"));
+    }
+
+    tt_ir_deinit();
+    return true;
+}
+
+void tagTinkerMenu() {
+    std::vector<TtMenuItem> menu;
+    // --- Tags ---
+    menu.push_back(ttItem([](){ return String("Saved Tags"); }, [](){ tt_saved_targets_menu(); }, true));
+    menu.push_back(ttItem([](){ return String("Tag Info"); }, [](){ tt_show_tag_info(); }, true));
+    menu.push_back(ttItem([](){ return String("NFC Decoder"); }, [](){ tt_nfc_decoder_menu(); }, true));
+    // --- Push Content ---
+    menu.push_back(ttItem([](){ return String("Push Text"); }, [](){ tt_push_text(); }, true));
+    menu.push_back(ttItem([](){ return String("Push Text ALL"); }, [](){ tt_push_text_all(); }, true));
+    menu.push_back(ttItem([](){ return String("Push Image"); }, [](){ tt_push_image(); }, true));
+    menu.push_back(ttItem([](){ return String("Push Image ALL"); }, [](){ tt_push_image_all(); }, true));
+    menu.push_back(ttItem([](){ return String("Online Content"); }, [](){ tt_online_content(); }, true));
+    menu.push_back(ttItem([](){ return String("Text Presets"); }, [](){ tt_presets_menu(); }, true));
+    // --- LED ---
+    menu.push_back(ttItem([](){ return String("LED Test"); }, [](){ tt_led_test(); }, true));
+    // --- Broadcast ---
+    menu.push_back(ttItem([](){ return String("Broadcast Page Flip"); }, [](){ tt_broadcast_page_flip(); }, true));
+    menu.push_back(ttItem([](){ return String("Broadcast Debug"); }, [](){ tt_broadcast_debug(); }, true));
+    menu.push_back(ttItem([](){ return String("Broadcast LED"); }, [](){ tt_broadcast_led(); }, true));
+    menu.push_back(ttItem([](){ return String("WiFi Icon ON (Broadcast)"); }, [](){ tt_wifi_icon_on(); }, true));
+    menu.push_back(ttItem([](){ return String("WiFi Icon OFF (All)"); }, [](){ tt_wifi_icon_off_all(); }, true));
+    // --- Tools ---
+    menu.push_back(ttItem([](){ return String("Raw Frame"); }, [](){ tt_raw_frame_sender(); }, true));
+    menu.push_back(ttItem([](){ return String("LED Explorer"); }, [](){ tt_led_explorer(); }, true));
+    menu.push_back(ttItem([](){ return String("Protocol Lab"); }, [](){ tt_protocol_lab(); }, true));
+    menu.push_back(ttItem([](){ return String("Settings"); }, [](){ tt_settings_menu(); }, true));
+    tt_menu(menu, "TagTinker ESL IR");
+    inMenu = true;
+}
+
+// =====================================================================
+// ====================== END TAGTINKER ESL IR =========================
+// =====================================================================
