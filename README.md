@@ -156,7 +156,7 @@ https://github.com/7h30th3r0n3/Evil-M5Project/wiki
 ---
 
 Features may vary depending on the firmware/device you are using:
-| Feature                       | Evil-Cardputer v1.5.1 | Evil-M5Core2 1.3.9 | Evil-M5Core3 1.1.9 | Evil-AtomS3 v1.1.7 | Evil-Face v1.0 |
+| Feature                       | Evil-Cardputer v1.5.4 | Evil-M5Core2 1.3.9 | Evil-M5Core3 1.1.9 | Evil-AtomS3 v1.1.7 | Evil-Face v1.0 |
 |-------------------------------|-----------------------|--------------------|--------------------|--------------------|----------------|
 | WiFi Network Scanning         | ✅                     | ✅                  | ✅                  | ✅                  | ❌              |
 | Network Cloning               | ✅                     | ✅                  | ✅                  | ✅                  | ❌              |
@@ -229,6 +229,9 @@ Features may vary depending on the firmware/device you are using:
 | Aircrack (WPA2 Cracking)      | ✅                     | ❌                  | ❌                  | ❌                  | ❌              |
 | Autodiscover Abuse            | ✅                     | ❌                  | ❌                  | ❌                  | ❌              |
 | Evil Navigator WebUI          | ✅                     | ❌                  | ❌                  | ❌                  | ❌              |
+| CIW ZeroClick                | ✅                     | ❌                  | ❌                  | ❌                  | ❌              |
+| TagTinker ESL               | ✅                     | ❌                  | ❌                  | ❌                  | ❌              |
+| CSI Radar                   | ✅                     | ❌                  | ❌                  | ❌                  | ❌              |
 | Settings                      | ✅                     | ✅                  | ✅                  | ✅                  | ❌              |
 
 
@@ -262,6 +265,24 @@ Features may vary depending on the firmware/device you are using:
 
 Warning : for Cardputer you need to change the Flash size to 8MB and the Partition Scheme to 8M with spiffs (3MB APP/1.5MB SPIFFS) or space error may occur.
 It's your first time with arduino IDE or something not working correctly? You should check out video section or ask help on the discord ! 
+
+### Compile with arduino-cli
+If you prefer the command line over the Arduino IDE:
+```bash
+# Install M5Stack core if not already done
+arduino-cli core install m5stack:esp32
+
+# Compile
+arduino-cli compile --fqbn m5stack:esp32:m5stack_cardputer \
+  --build-property "build.partitions=huge_app" \
+  --build-property "upload.maximum_size=3145728" \
+  Evil-Cardputer-v1-5-4.ino
+
+# Flash
+arduino-cli upload --fqbn m5stack:esp32:m5stack_cardputer --port COMXX \
+  Evil-Cardputer-v1-5-4.ino
+```
+Replace `COMXX` with your actual serial port.
 
 ----------------------------------------------------------
 
