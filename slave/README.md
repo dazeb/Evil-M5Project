@@ -4,16 +4,16 @@
 
 These firmwares run on ESP32 devices to operate as **slaves** (paired with the Cardputer) or as **stand-alone** tools alongside Evil-M5Project.
 
-- **Wardriving Slave** — scan APs on static or hopping channels, forward via ESP-NOW to Wardriving Master
-- **Sniffer Slave** — capture EAPOL handshakes and forward to Handshake Master
-- **Auto-Deauther** — continuous deauth on static or hopping channels, can stimulate EAPOL capture
-- **Evil Twin** — standalone captive portal with deauth (ESP32-C5 supports 2.4/5 GHz)
-- **EvilChatMesh Relay** — ESP-NOW repeater to extend the mesh chat network
-- **Portal** — standalone captive portal with WebUI configuration
-- **NTLM Sniffer** — capture NTLM hashes and forward via webhook
-- **FindMyEvil** — FindMy/OpenHaystack BLE advertiser
-- **CSI-Beacon** — WiFi CSI transmitter for presence detection with CSI Radar
-- **Serial Deauther** — UART-controlled deauther bridged to Cardputer
+- **Wardriving Slave** - scan APs on static or hopping channels, forward via ESP-NOW to Wardriving Master
+- **Sniffer Slave** - capture EAPOL handshakes and forward to Handshake Master
+- **Auto-Deauther** - continuous deauth on static or hopping channels, can stimulate EAPOL capture
+- **Evil Twin** - standalone captive portal with deauth (ESP32-C5 supports 2.4/5 GHz)
+- **EvilChatMesh Relay** - ESP-NOW repeater to extend the mesh chat network
+- **Portal** - standalone captive portal with WebUI configuration
+- **NTLM Sniffer** - capture NTLM hashes and forward via webhook
+- **FindMyEvil** - FindMy/OpenHaystack BLE advertiser
+- **CSI-Beacon** - WiFi CSI transmitter for presence detection with CSI Radar
+- **Serial Deauther** - UART-controlled deauther bridged to Cardputer
 
 Multiple ESP32 devices improve coverage. Static slaves locked to one channel prevent packet loss during hopping. Devices with **external antennas** outperform stock modules.
 
@@ -31,12 +31,12 @@ Multiple ESP32 devices improve coverage. Static slaves locked to one channel pre
 | `slave_gps_hopping_atoms3.ino` | Wardriving slave (hopping) | Wardriving Master | AtomS3 with display + avatar |
 | `slave_sniffer_channel_static.ino` | EAPOL sniffer (static) | Handshake Master | Fragments via ESP-NOW |
 | `slave_unified_C3.ino` | Multi-mode (deauth/ward/multi) | Master (serial) | ESP32-C3, UART1 GPIO6/7, serial-controlled |
-| `slave_portal.ino` | Standalone captive portal | — | LittleFS + WebUI config |
+| `slave_portal.ino` | Standalone captive portal | - | LittleFS + WebUI config |
 | `EvilChatMesh-Relay.ino` | Mesh relay | EvilChatMesh | ESP-NOW repeater, dedup |
 | `EvilChatMesh-Relay-atomS3.ino` | Mesh relay | EvilChatMesh | AtomS3 with display |
-| `FindMyEsp.ino` | FindMy BLE advertiser | — | ESP32-S3, configurable TX power |
-| `NTLM-Sniffer-WebHook-ESP32.ino` | NTLM hash sniffer + webhook | — | LittleFS config, WebUI |
-| `NTLM-Sniffer-WebHook-NanoC6.ino` | NTLM hash sniffer + webhook | — | NanoC6 with NeoPixel LED |
+| `FindMyEsp.ino` | FindMy BLE advertiser | - | ESP32-S3, configurable TX power |
+| `NTLM-Sniffer-WebHook-ESP32.ino` | NTLM hash sniffer + webhook | - | LittleFS config, WebUI |
+| `NTLM-Sniffer-WebHook-NanoC6.ino` | NTLM hash sniffer + webhook | - | NanoC6 with NeoPixel LED |
 | `2-4ghz-deauther-serial.ino` | Serial-controlled deauther | Cardputer (UART) | UART1 GPIO6/7, full CLI |
 | `CSI-Beacon.ino` | CSI presence detection beacon | CSI Radar | Fixed MAC, ESP-NOW 100Hz, HT40 |
 
@@ -44,7 +44,7 @@ Multiple ESP32 devices improve coverage. Static slaves locked to one channel pre
 
 | Sketch | Role | Pairs With | Notes |
 |--------|------|-----------|-------|
-| `C5-Slave/Evil-Twin-C5.ino` | Standalone Evil Twin | — | Dual-band portal + deauth |
+| `C5-Slave/Evil-Twin-C5.ino` | Standalone Evil Twin | - | Dual-band portal + deauth |
 | `C5-Slave/slave_deauther_C5.ino` | Standalone deauther | Optional Sniffer | WS2812 LED, serial control |
 | `C5-Slave/slave_gps_channel_multi_C5_5GHz.ino` | Wardriving slave (dual-band) | Wardriving Master | Predefined 2.4+5GHz channels |
 | `C5-Slave/slave_multi_C5.ino` | Multi-mode (scan/deauth/sniff) | Master (Evil) | All-in-one with LED status |
