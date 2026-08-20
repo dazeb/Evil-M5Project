@@ -38,10 +38,10 @@
 <!-- AliExpress -->
 <div style="text-align:center; margin: 2em 0;">
   <a href="https://s.click.aliexpress.com/e/_c4CfjBAR" target="_blank">
-    <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3b/Aliexpress_logo.svg/204px-Aliexpress_logo.svg.png" alt="AliExpress Logo" width="120" style="margin-bottom: 0.5em;" />
+    <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3b/Aliexpress_logo.svg/3840px-Aliexpress_logo.svg.png" alt="AliExpress Logo" width="120" style="margin-bottom: 0.5em;" />
   </a>
   <p>
-    <a href="https://s.click.aliexpress.com/e/_oBMaZol" target="_blank"><strong>Buy anything on AliExpress</strong></a><br />
+    <a href="https://s.click.aliexpress.com/e/_c4CfjBAR" target="_blank"><strong>Buy anything on AliExpress</strong></a><br />
     <span>Just by using this link before searching, you're directly supporting the project 🙌</span>
   </p>
 </div>
